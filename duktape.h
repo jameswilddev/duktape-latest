@@ -1,13 +1,13 @@
 /*
- *  Duktape public API for Duktape 1.7.0.
+ *  Duktape public API for Duktape 1.8.0.
  *
  *  See the API reference for documentation on call semantics.
  *  The exposed API is inside the DUK_API_PUBLIC_H_INCLUDED
  *  include guard.  Other parts of the header are Duktape
  *  internal and related to platform/compiler/feature detection.
  *
- *  Git commit 2a454a23ab829e445b848957beb597720534999a (v1.7.0).
- *  Git branch v1-maintenance.
+ *  Git commit 0a70d7e4c5227c84e3fed5209828973117d02849 (v1.8.0).
+ *  Git branch v1.8-maintenance.
  *
  *  See Duktape AUTHORS.rst and LICENSE.txt for copyright and
  *  licensing information.
@@ -21,7 +21,7 @@
  *  
  *  (http://opensource.org/licenses/MIT)
  *  
- *  Copyright (c) 2013-2016 by Duktape authors (see AUTHORS.rst)
+ *  Copyright (c) 2013-2017 by Duktape authors (see AUTHORS.rst)
  *  
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -228,16 +228,16 @@ struct duk_number_list_entry {
  * have 99 for patch level (e.g. 0.10.99 would be a development version
  * after 0.10.0 but before the next official release).
  */
-#define DUK_VERSION                       10700L
+#define DUK_VERSION                       10800L
 
 /* Git commit, describe, and branch for Duktape build.  Useful for
  * non-official snapshot builds so that application code can easily log
  * which Duktape snapshot was used.  Not available in the Ecmascript
  * environment.
  */
-#define DUK_GIT_COMMIT                    "2a454a23ab829e445b848957beb597720534999a"
-#define DUK_GIT_DESCRIBE                  "v1.7.0"
-#define DUK_GIT_BRANCH                    "v1-maintenance"
+#define DUK_GIT_COMMIT                    "0a70d7e4c5227c84e3fed5209828973117d02849"
+#define DUK_GIT_DESCRIBE                  "v1.8.0"
+#define DUK_GIT_BRANCH                    "v1.8-maintenance"
 
 /* Duktape debug protocol version used by this build. */
 #define DUK_DEBUG_PROTOCOL_VERSION        1
