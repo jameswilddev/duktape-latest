@@ -10,36 +10,52 @@
 #define DUK_INTERNAL_H_INCLUDED
 
 /*
- *  Feature selection defines (e.g. _XOPEN_SOURCE) must appear before any
- *  system headers are included.  On the other hand, some platform detection
- *  requires header inclusion (like <endian.h>).  The current approach is
- *  that duk_features.h is included first, and it is responsible for doing
- *  feature selection before including any other headers it needs.
- *
- *  In any case, all implementation files include duk_internal.h first, so
- *  feature selection defines get set correctly.
+ *  Platform specific handling: detection of features, system headers are
+ *  included etc.  Duktape.h contains its own feature detection which must
+ *  match duk_features.h, so duk_features_sanity.h is included to check for
+ *  consistency.
  */
 
 #line 1 "duk_features.h"
 /*
  *  Determine platform features, select feature selection defines
- *  (e.g. _XOPEN_SOURCE), and define DUK_USE_XXX defines which are
- *  (only) checked in Duktape internal code for activated features.
- *  Duktape feature selection is based on DUK_PROFILE, other user
- *  supplied defines, and automatic feature detection.
+ *  (e.g. _XOPEN_SOURCE), include system headers, and define DUK_USE_XXX
+ *  defines which are (only) checked in Duktape internal code for
+ *  activated features.  Duktape feature selection is based on DUK_PROFILE,
+ *  other user supplied defines, and automatic feature detection.
  *
- *  This is included before anything else.  Feature selection defines
- *  (e.g. _XOPEN_SOURCE) must be defined before any system headers
- *  are included.  This file is included by duk_internal.h before it
- *  includes anything else.  We're responsible for first setting feature
- *  selection defines but after that we can include other headers as
- *  needed.
+ *  This file is included by duk_internal.h before anything else is
+ *  included.  Feature selection defines (e.g. _XOPEN_SOURCE) are defined
+ *  here before any system headers are included (which is a requirement for
+ *  system headers to work correctly).  This file is responsible for including
+ *  all system headers and contains all platform dependent cruft in general.
+ *
+ *  The public duktape.h has minimal feature detection required by the public
+ *  API (for instance use of variadic macros is detected there).  Duktape.h
+ *  exposes its detection results as DUK_API_xxx.  The public header and the
+ *  implementation must agree on e.g. names and argument lists of exposed
+ *  calls; these are checked by duk_features_sanity.h (duktape.h is not yet
+ *  included when this file is included to avoid fouling up feature selection
+ *  defines).
+ *
+ *  The general order of handling:
+ *    - Compiler feature detection (require no includes)
+ *    - Intermediate platform detection (-> easier platform defines)
+ *    - Platform detection, system includes, byte order detection, etc
+ *    - ANSI C wrappers (e.g. DUK_MEMCMP), wrappers for constants, etc
+ *    - Duktape profile handling, DUK_USE_xxx constants are set
+ *    - Duktape Date provider settings
+ *    - Final sanity checks
+ *
+ *  DUK_F_XXX are internal feature detection macros which should not
+ *  be used outside this header.
  *
  *  Useful resources:
  *
  *    http://sourceforge.net/p/predef/wiki/Home/
  *    http://sourceforge.net/p/predef/wiki/Architectures/
  *    http://stackoverflow.com/questions/5919996/how-to-detect-reliably-mac-os-x-ios-linux-windows-in-c-preprocessor
+ *    http://en.wikipedia.org/wiki/C_data_types#Fixed-width_integer_types
  *
  *  FIXME: at the moment there is no direct way of configuring
  *  or overriding individual settings.
@@ -48,24 +64,39 @@
 #ifndef DUK_FEATURES_H_INCLUDED
 #define DUK_FEATURES_H_INCLUDED
 
-#line 1 "duk_rdtsc.h"
+/* FIXME: platform detection and all includes and defines in one big
+ * if-else ladder (now e.g. datetime providers is a separate ladder).
+ */
+
 /*
- *  Provides the duk_rdtsc() inline function (if available).
+ *  Compiler features
+ */
+
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)
+#define  DUK_F_C99
+#else
+#undef   DUK_F_C99
+#endif
+
+/*
+ *  Provides the duk_rdtsc() inline function (if available)
  *
  *  See: http://www.mcs.anl.gov/~kazutomo/rdtsc.html
  */
 
-#ifndef DUK_RDTSC_H_INCLUDED
-#define DUK_RDTSC_H_INCLUDED
-
-#if defined(__i386__)
+/* XXX: more accurate detection of what gcc versions work; more inline
+ * asm versions for other compilers.
+ */
+#if defined(__GNUC__) && defined(__i386__) && \
+    !defined(__cplusplus) /* unsigned long long not standard */
 static __inline__ unsigned long long duk_rdtsc(void) {
 	unsigned long long int x;
 	__asm__ volatile (".byte 0x0f, 0x31" : "=A" (x));
 	return x;
 }
 #define  DUK_RDTSC_AVAILABLE 1
-#elif defined(__x86_64__)
+#elif defined(__GNUC__) && defined(__x86_64__) && \
+    !defined(__cplusplus) /* unsigned long long not standard */
 static __inline__ unsigned long long duk_rdtsc(void) {
 	unsigned hi, lo;
 	__asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
@@ -77,44 +108,213 @@ static __inline__ unsigned long long duk_rdtsc(void) {
 #undef  DUK_RDTSC_AVAILABLE
 #endif
 
-#endif  /* DUK_RDTSC_H_INCLUDED */
-
-#line 29 "duk_features.h"
-
-/* FIXME: remove _DUK_C99 and _DUK_BSD, prefer no names beginning with
- * underscore.
- */
-
 /*
- *  Compiler features
+ *  Intermediate platform, architecture, and compiler detection.  These are
+ *  hopelessly intertwined - e.g. architecture defines depend on compiler etc.
+ *
+ *  Provide easier defines for platforms and compilers which are often tricky
+ *  or verbose to detect.  The intent is not to provide intermediate defines for
+ *  all features; only if existing feature defines are inconvenient.
  */
 
-#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)
-#define  _DUK_C99
-#else
-#undef   _DUK_C99
+/* Intel x86 (32-bit) */
+#if defined(i386) || defined(__i386) || defined(__i386__) || \
+    defined(__i486__) || defined(__i586__) || defined(__i686__) || \
+    defined(__IA32__) || defined(_M_IX86) || defined(__X86__) || \
+    defined(_X86_) || defined(__THW_INTEL__) || defined(__I86__)
+#define  DUK_F_X86
 #endif
 
-/*
- *  Intermediate platform detection
- */
+/* AMD64 (64-bit) */
+#if defined(__amd64__) || defined(__amd64) || \
+    defined(__x86_64__) || defined(__x86_64) || \
+    defined(_M_X64) || defined(_M_AMD64)
+#define  DUK_F_X64
+#endif
 
-/* FIXME: reconcile with direct detection below */
+/* FIXME: X32: pointers are 32-bit so packed format can be used */
+
+/* MIPS */
+#if defined(__mips__) || defined(mips) || defined(_MIPS_ISA) || \
+    defined(_R3000) || defined(_R4000) || defined(_R5900) || \
+    defined(_MIPS_ISA_MIPS1) || defined(_MIPS_ISA_MIPS2) || \
+    defined(_MIPS_ISA_MIPS3) || defined(_MIPS_ISA_MIPS4) || \
+    defined(__mips) || defined(__MIPS__)
+#define  DUK_F_MIPS
+#endif
+
+/* Motorola 68K.  Not defined by VBCC, so user must define one of these
+ * manually when using VBCC.
+ */
+#if defined(__m68k__) || defined(M68000) || defined(__MC68K__)
+#define  DUK_F_M68K
+#endif
+
+/* BSD variant */
 #if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD) || \
     defined(__bsdi__) || defined(__DragonFly__)
-#define  _DUK_BSD
+#define  DUK_F_BSD
+#endif
+
+/* Atari ST TOS. __TOS__ defined by PureC (which doesn't work as a target now
+ * because int is 16-bit, to be fixed).  No platform define in VBCC apparently,
+ * so to use with VBCC, user must define '__TOS__' manually.
+  */
+#if defined(__TOS__)
+#define  DUK_F_TOS
+#endif
+
+/* AmigaOS.  Neither AMIGA nor __amigaos__ is defined on VBCC, so user must
+ * define 'AMIGA' manually.
+ */
+#if defined(AMIGA) || defined(__amigaos__)
+#define  DUK_F_AMIGAOS
 #endif
 
 /*
- *  Feature selection defines (e.g. _XOPEN_SOURCE)
+ *  Platform detection and system includes
  *
- *  MUST be set before ANY system headers are included!
+ *  Feature selection (e.g. _XOPEN_SOURCE) must happen before any system
+ *  headers are included.
+ *
+ *  Can trigger standard byte order detection (later in this file) or
+ *  specify byte order explicitly on more exotic platforms.
  */
 
 #if defined(__linux)
+#ifndef  _POSIX_C_SOURCE
 #define  _POSIX_C_SOURCE  200809L
+#endif
+#ifndef  _GNU_SOURCE
 #define  _GNU_SOURCE      /* e.g. getdate_r */
+#endif
+#ifndef  _XOPEN_SOURCE
 #define  _XOPEN_SOURCE    /* e.g. strptime */
+#endif
+#endif
+
+#if defined(__APPLE__)
+/* Apple OSX */
+#define  DUK_F_STD_BYTEORDER_DETECT
+#include <architecture/byte_order.h>
+#include <limits.h>
+#include <sys/param.h>
+#elif defined(DUK_F_BSD)
+/* BSD */
+#define  DUK_F_STD_BYTEORDER_DETECT
+#include <sys/endian.h>
+#include <limits.h>
+#include <sys/param.h>
+#elif defined(DUK_F_TOS)
+/* Atari ST TOS */
+#define  DUK_USE_DOUBLE_BE
+#include <limits.h>
+#elif defined(DUK_F_AMIGAOS)
+#if defined(DUK_F_M68K)
+/* AmigaOS on M68k */
+#define  DUK_USE_DOUBLE_BE
+#include <limits.h>
+#else
+#error AmigaOS but not M68K, not supported now
+#endif
+#else
+/* Linux and hopefully others */
+#define  DUK_F_STD_BYTEORDER_DETECT
+#include <endian.h>
+#include <limits.h>
+#include <sys/param.h>
+#endif
+
+/* Shared includes */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>  /* varargs */
+#include <setjmp.h>
+#include <stddef.h>  /* e.g. ptrdiff_t */
+
+#ifdef DUK_F_TOS
+/*FIXME*/
+#else
+#include <stdint.h>
+#endif
+
+#include <math.h>
+
+/*
+ *  Sanity check types and define bit types such as duk_u32
+ */
+
+/* FIXME: Is there a reason not to rely on C99 types only, and only fall
+ * back to guessing if C99 types are not available?
+ */
+
+/* FIXME: How to do reasonable automatic detection on older compilers,
+ * and how to allow user override?
+ */
+
+#ifdef INT_MAX
+#if INT_MAX < 2147483647
+#error INT_MAX too small, expected int to be 32 bits at least
+#endif
+#else
+#error INT_MAX not defined
+#endif
+
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L) && \
+    !(defined(DUK_F_AMIGAOS) && defined(__VBCC__)) /* vbcc + AmigaOS has C99 but no inttypes.h */
+/* C99 */
+#include <inttypes.h>
+typedef uint8_t duk_u8;
+typedef int8_t duk_i8;
+typedef uint16_t duk_u16;
+typedef int16_t duk_i16;
+typedef uint32_t duk_u32;
+typedef int32_t duk_i32;
+#else
+/* FIXME: need actual detection here */
+typedef unsigned char duk_u8;
+typedef signed char duk_i8;
+typedef unsigned short duk_u16;
+typedef signed short duk_i16;
+typedef unsigned int duk_u32;
+typedef signed int duk_i32;
+#endif
+
+/*
+ *  Check whether we should use 64-bit integers
+ */
+
+/* Quite incomplete now: require C99, avoid 64-bit types on VBCC because
+ * they seem to misbehave.  Should use 64-bit operations at least on 64-bit
+ * platforms even when C99 not available (perhaps integrate to bit type
+ * detection?).
+ */
+#if defined(DUK_F_C99) && !defined(__VBCC__)
+#define  DUK_USE_64BIT_OPS
+#else
+#undef  DUK_USE_64BIT_OPS
+#endif
+
+/*
+ *  Support for unaligned accesses
+ *
+ *  Assume unaligned accesses are not supported unless specifically allowed
+ *  in the target platform.
+ */
+
+/* FIXME: alignment is now only guaranteed to 4 bytes in any case, so doubles
+ * are not guaranteed to be aligned.
+ */
+
+#if defined(__arm__) || defined(__thumb__) || defined(_ARM) || defined(_M_ARM)
+#undef   DUK_USE_UNALIGNED_ACCESSES_POSSIBLE
+#elif defined(DUK_F_MIPS)
+#undef   DUK_USE_UNALIGNED_ACCESSES_POSSIBLE
+#elif defined(DUK_F_X86) || defined(DUK_F_X64)
+#define  DUK_USE_UNALIGNED_ACCESSES_POSSIBLE
+#else
+#undef   DUK_USE_UNALIGNED_ACCESSES_POSSIBLE
 #endif
 
 /*
@@ -130,18 +330,7 @@ static __inline__ unsigned long long duk_rdtsc(void) {
  * detection for unhandled cases.
  */
 
-#if defined(__APPLE__)
-#include <architecture/byte_order.h>
-#elif defined(_DUK_BSD)
-#include <sys/endian.h>
-#else
-/* Linux and hopefully others */
-#include <endian.h>
-#endif
-
-#include <limits.h>
-#include <sys/param.h>
-
+#if defined(DUK_F_STD_BYTEORDER_DETECT)
 /* determine endianness variant: little-endian (LE), big-endian (BE), or "middle-endian" (ME) i.e. ARM */
 #if (defined(__BYTE_ORDER) && defined(__LITTLE_ENDIAN) && (__BYTE_ORDER == __LITTLE_ENDIAN)) || \
     (defined(__LITTLE_ENDIAN__))
@@ -165,33 +354,259 @@ static __inline__ unsigned long long duk_rdtsc(void) {
 #else
 #error unsupported: cannot determine byte order
 #endif
+#endif  /* DUK_F_STD_BYTEORDER_DETECT */
 
 #if !defined(DUK_USE_DOUBLE_LE) && !defined(DUK_USE_DOUBLE_ME) && !defined(DUK_USE_DOUBLE_BE)
 #error unsupported: cannot determine IEEE double byte order variant
 #endif
 
 /*
+ *  Union to access IEEE double memory representation and indexes for double
+ *  memory representation.
+ *
+ *  The double union is almost the same as a packed duk_tval, but only for
+ *  accessing doubles e.g. for numconv and replacemenf functions, which are
+ *  needed regardless of duk_tval representation.
+ */
+
+/* indexes of various types with respect to big endian (logical) layout */
+#if defined(DUK_USE_DOUBLE_LE)
+#ifdef DUK_USE_64BIT_OPS
+#define  DUK_DBL_IDX_ULL0   0
+#endif
+#define  DUK_DBL_IDX_UI0    1
+#define  DUK_DBL_IDX_UI1    0
+#define  DUK_DBL_IDX_US0    3
+#define  DUK_DBL_IDX_US1    2
+#define  DUK_DBL_IDX_US2    1
+#define  DUK_DBL_IDX_US3    0
+#define  DUK_DBL_IDX_UC0    7
+#define  DUK_DBL_IDX_UC1    6
+#define  DUK_DBL_IDX_UC2    5
+#define  DUK_DBL_IDX_UC3    4
+#define  DUK_DBL_IDX_UC4    3
+#define  DUK_DBL_IDX_UC5    2
+#define  DUK_DBL_IDX_UC6    1
+#define  DUK_DBL_IDX_UC7    0
+#define  DUK_DBL_IDX_VP0    DUK_DBL_IDX_UI0  /* packed tval */
+#define  DUK_DBL_IDX_VP1    DUK_DBL_IDX_UI1  /* packed tval */
+#elif defined(DUK_USE_DOUBLE_BE)
+#ifdef DUK_USE_64BIT_OPS
+#define  DUK_DBL_IDX_ULL0   0
+#endif
+#define  DUK_DBL_IDX_UI0    0
+#define  DUK_DBL_IDX_UI1    1
+#define  DUK_DBL_IDX_US0    0
+#define  DUK_DBL_IDX_US1    1
+#define  DUK_DBL_IDX_US2    2
+#define  DUK_DBL_IDX_US3    3
+#define  DUK_DBL_IDX_UC0    0
+#define  DUK_DBL_IDX_UC1    1
+#define  DUK_DBL_IDX_UC2    2
+#define  DUK_DBL_IDX_UC3    3
+#define  DUK_DBL_IDX_UC4    4
+#define  DUK_DBL_IDX_UC5    5
+#define  DUK_DBL_IDX_UC6    6
+#define  DUK_DBL_IDX_UC7    7
+#define  DUK_DBL_IDX_VP0    DUK_DBL_IDX_UI0  /* packed tval */
+#define  DUK_DBL_IDX_VP1    DUK_DBL_IDX_UI1  /* packed tval */
+#elif defined(DUK_USE_DOUBLE_ME)
+#ifdef DUK_USE_64BIT_OPS
+#define  DUK_DBL_IDX_ULL0   0  /* not directly applicable, byte order differs from a double */
+#endif
+#define  DUK_DBL_IDX_UI0    0
+#define  DUK_DBL_IDX_UI1    1
+#define  DUK_DBL_IDX_US0    1
+#define  DUK_DBL_IDX_US1    0
+#define  DUK_DBL_IDX_US2    3
+#define  DUK_DBL_IDX_US3    2
+#define  DUK_DBL_IDX_UC0    3
+#define  DUK_DBL_IDX_UC1    2
+#define  DUK_DBL_IDX_UC2    1
+#define  DUK_DBL_IDX_UC3    0
+#define  DUK_DBL_IDX_UC4    7
+#define  DUK_DBL_IDX_UC5    6
+#define  DUK_DBL_IDX_UC6    5
+#define  DUK_DBL_IDX_UC7    4
+#define  DUK_DBL_IDX_VP0    DUK_DBL_IDX_UI0  /* packed tval */
+#define  DUK_DBL_IDX_VP1    DUK_DBL_IDX_UI1  /* packed tval */
+#else
+#error internal error
+#endif
+
+union duk_double_union {
+	double d;
+	/* FIXME: type size assumptions, fix */
+#ifdef DUK_USE_64BIT_OPS
+	unsigned long long ull[1];
+#endif
+	unsigned int ui[2];
+	unsigned short us[4];
+	unsigned char uc[8];
+};
+typedef union duk_double_union duk_double_union;
+
+/* macros for duk_numconv.c */
+#define  DUK_DBLUNION_SET_DOUBLE(u,v)  do {  \
+		(u)->d = (v); \
+	} while (0)
+#define  DUK_DBLUNION_SET_HIGH32(u,v)  do {  \
+		(u)->ui[DUK_DBL_IDX_UI0] = (unsigned int) (v); \
+	} while (0)
+#define  DUK_DBLUNION_SET_LOW32(u,v)  do {  \
+		(u)->ui[DUK_DBL_IDX_UI1] = (unsigned int) (v); \
+	} while (0)
+#define  DUK_DBLUNION_GET_DOUBLE(u)  ((u)->d)
+#define  DUK_DBLUNION_GET_HIGH32(u)  ((u)->ui[DUK_DBL_IDX_UI0])
+#define  DUK_DBLUNION_GET_LOW32(u)   ((u)->ui[DUK_DBL_IDX_UI1])
+
+/*
  *  Check whether or not a packed duk_tval representation is possible
  */
 
 /* best effort viability checks, not particularly accurate */
+#undef  DUK_USE_PACKED_TVAL_POSSIBLE
 #if (defined(__WORDSIZE) && (__WORDSIZE == 32)) && \
     (defined(UINT_MAX) && (UINT_MAX == 4294967295))
 #define DUK_USE_PACKED_TVAL_POSSIBLE
-#else
-#undef  DUK_USE_PACKED_TVAL_POSSIBLE
+#elif defined(DUK_F_AMIGAOS) /* FIXME: M68K */
+#define DUK_USE_PACKED_TVAL_POSSIBLE
 #endif
 
 /*
- *  Support for unaligned accesses
+ *  Detection of double constants and math related functions.  Availability
+ *  of constants and math functions is a significant porting concern.
+ *
+ *  INFINITY/HUGE_VAL is problematic on GCC-3.3: it causes an overflow warning
+ *  and there is no pragma in GCC-3.3 to disable it.  Using __builtin_inf()
+ *  avoids this problem for some reason.
  */
 
-/* FIXME: currently just a hack for ARM, what would be a good way to detect? */
-#if defined(__arm__) || defined(__thumb__) || defined(_ARM) || defined(_M_ARM)
-#undef   DUK_USE_UNALIGNED_ACCESSES_POSSIBLE
+#define  DUK_DOUBLE_2TO32     4294967296.0
+#define  DUK_DOUBLE_2TO31     2147483648.0
+
+#undef  DUK_USE_COMPUTED_INFINITY
+#if defined(__GNUC__) && defined(__GNUC_MINOR__) && \
+    (((__GNUC__ == 4) && (__GNUC_MINOR__ < 6)) || (__GNUC__ < 4))
+/* GCC older than 4.6: avoid overflow warnings related to using INFINITY */
+#define  DUK_DOUBLE_INFINITY  (__builtin_inf())
+#elif defined(INFINITY)
+#define  DUK_DOUBLE_INFINITY  ((double) INFINITY)
+#elif !defined(__VBCC__)
+#define  DUK_DOUBLE_INFINITY  (1.0 / 0.0)
 #else
-#define  DUK_USE_UNALIGNED_ACCESSES_POSSIBLE
+/* In VBCC (1.0 / 0.0) results in a warning and 0.0 instead of infinity.
+ * Use a computed infinity(initialized when a heap is created at the
+ * latest).
+ */
+extern double duk_computed_infinity;
+#define  DUK_USE_COMPUTED_INFINITY
+#define  DUK_DOUBLE_INFINITY  duk_computed_infinity
 #endif
+
+#undef  DUK_USE_COMPUTED_NAN
+#if defined(NAN)
+#define  DUK_DOUBLE_NAN       NAN
+#elif !defined(__VBCC__)
+#define  DUK_DOUBLE_NAN       (0.0 / 0.0)
+#else
+/* In VBCC (0.0 / 0.0) results in a warning and 0.0 instead of NaN.
+ * Use a computed NaN (initialized when a heap is created at the
+ * latest).
+ */
+extern double duk_computed_nan;
+#define  DUK_USE_COMPUTED_NAN
+#define  DUK_DOUBLE_NAN       duk_computed_nan
+#endif
+
+/* Many platforms are missing fpclassify() and friends, so use replacements
+ * if necessary.  The replacement constants (FP_NAN etc) can be anything but
+ * match Linux constants now.
+ */
+#undef  DUK_USE_REPL_FPCLASSIFY
+#undef  DUK_USE_REPL_SIGNBIT
+#undef  DUK_USE_REPL_ISFINITE
+#undef  DUK_USE_REPL_ISNAN
+#if !(defined(FP_NAN) && defined(FP_INFINITE) && defined(FP_ZERO) && \
+      defined(FP_SUBNORMAL) && defined(FP_NORMAL)) || \
+    (defined(DUK_F_AMIGAOS) && defined(__VBCC__))
+#define  DUK_USE_REPL_FPCLASSIFY
+#define  DUK_USE_REPL_SIGNBIT
+#define  DUK_USE_REPL_ISFINITE
+#define  DUK_USE_REPL_ISNAN
+#define  DUK_FPCLASSIFY       duk_repl_fpclassify
+#define  DUK_SIGNBIT          duk_repl_signbit
+#define  DUK_ISFINITE         duk_repl_isfinite
+#define  DUK_ISNAN            duk_repl_isnan
+#define  DUK_FP_NAN           0
+#define  DUK_FP_INFINITE      1
+#define  DUK_FP_ZERO          2
+#define  DUK_FP_SUBNORMAL     3
+#define  DUK_FP_NORMAL        4
+#else
+#define  DUK_FPCLASSIFY       fpclassify
+#define  DUK_SIGNBIT          signbit
+#define  DUK_ISFINITE         isfinite
+#define  DUK_ISNAN            isnan
+#define  DUK_FP_NAN           FP_NAN
+#define  DUK_FP_INFINITE      FP_INFINITE
+#define  DUK_FP_ZERO          FP_ZERO
+#define  DUK_FP_SUBNORMAL     FP_SUBNORMAL
+#define  DUK_FP_NORMAL        FP_NORMAL
+#endif
+
+/* Some math functions are C99 only.  This is also an issue with some
+ * embedded environments using uclibc where uclibc has been configured
+ * not to provide some functions.  For now, use replacements whenever
+ * using uclibc.
+ */
+#if defined(DUK_F_C99) && \
+    !defined(__UCLIBC__) /* uclibc may be missing these */ && \
+    !(defined(DUK_F_AMIGAOS) && defined(__VBCC__)) /* vbcc + AmigaOS may be missing these */
+#define  DUK_USE_MATH_FMIN
+#define  DUK_USE_MATH_FMAX
+#define  DUK_USE_MATH_ROUND
+#else
+#undef  DUK_USE_MATH_FMIN
+#undef  DUK_USE_MATH_FMAX
+#undef  DUK_USE_MATH_ROUND
+#endif
+
+/*
+ *  ANSI C string/memory function wrapper defines to allow easier workarounds.
+ *
+ *  For instance, some platforms don't support zero-size memcpy correctly,
+ *  some arcane uclibc versions have a buggy memcpy (but working memmove)
+ *  and so on.  Such broken platforms can be dealt with here.
+ */
+
+/* Old uclibcs have a broken memcpy so use memmove instead (this is overly
+ * wide now on purpose):
+ * http://lists.uclibc.org/pipermail/uclibc-cvs/2008-October/025511.html
+ */
+#if defined(__UCLIBC__)
+#define  DUK_MEMCPY       memmove
+#else
+#define  DUK_MEMCPY       memcpy
+#endif
+
+#define  DUK_MEMMOVE      memmove
+#define  DUK_MEMCMP       memcmp
+#define  DUK_MEMSET       memset
+#define  DUK_STRCMP       strcmp
+#define  DUK_STRNCMP      strncmp
+#define  DUK_SPRINTF      sprintf
+#define  DUK_SNPRINTF     snprintf
+#define  DUK_VSPRINTF     vsprintf
+#define  DUK_VSNPRINTF    vsnprintf
+
+/*
+ *  Macro hackery to convert e.g. __LINE__ to a string without formatting,
+ *  see: http://stackoverflow.com/questions/240353/convert-a-preprocessor-token-to-a-string
+ */
+
+#define  DUK_F_STRINGIFY_HELPER(x)  #x
+#define  DUK_MACRO_STRINGIFY(x)  DUK_F_STRINGIFY_HELPER(x)
 
 /*
  *  Macro for suppressing warnings for potentially unreferenced variables.
@@ -205,6 +620,22 @@ static __inline__ unsigned long long duk_rdtsc(void) {
 #define  DUK_UNREF(x)  do { \
 		(void) (x); \
 	} while (0)
+
+/*
+ *  __FILE__, __LINE__, __func__ are wrapped.  Especially __func__ is a
+ *  problem because it is not available even in some compilers which try
+ *  to be C99 compatible (e.g. VBCC with -c99 option).
+ */
+
+#define  DUK_FILE_MACRO  __FILE__
+
+#define  DUK_LINE_MACRO  __LINE__
+
+#if !defined(__VBCC__)
+#define  DUK_FUNC_MACRO  __func__
+#else
+#define  DUK_FUNC_MACRO  "unknown"
+#endif
 
 /* 
  *  Profile processing
@@ -282,9 +713,10 @@ static __inline__ unsigned long long duk_rdtsc(void) {
 #define  DUK_USE_ASSERTIONS
 #elif (DUK_PROFILE == 200)
 /* MINIMAL */
-#undef   DUK_USE_VERBOSE_ERRORS
+#undef   DUK_USE_TRACEBACKS
 #elif (DUK_PROFILE == 201)
 /* MINIMAL_DEBUG */
+#undef   DUK_USE_TRACEBACKS
 #define  DUK_USE_DEBUG
 #undef   DUK_USE_DDEBUG
 #undef   DUK_USE_DDDEBUG
@@ -306,11 +738,11 @@ static __inline__ unsigned long long duk_rdtsc(void) {
 #define  DUK_USE_MARK_AND_SWEEP
 #undef   DUK_USE_AUGMENT_ERRORS
 #undef   DUK_USE_TRACEBACKS
+#undef   DUK_USE_VERBOSE_ERRORS
 #define  DUK_USE_DEBUG
 #undef   DUK_USE_DDEBUG
 #undef   DUK_USE_DDDEBUG
 #define  DUK_USE_ASSERTIONS
-#undef   DUK_USE_VERBOSE_ERRORS
 #elif (DUK_PROFILE == 400)
 #undef   DUK_USE_PACKED_TVAL
 #undef   DUK_USE_FULL_TVAL
@@ -318,12 +750,12 @@ static __inline__ unsigned long long duk_rdtsc(void) {
 #elif (DUK_PROFILE == 401)
 #undef   DUK_USE_PACKED_TVAL
 #undef   DUK_USE_FULL_TVAL
+#define  DUK_USE_EXPLICIT_NULL_INIT
 #undef   DUK_USE_GC_TORTURE
 #define  DUK_USE_DEBUG
 #undef   DUK_USE_DDEBUG
 #undef   DUK_USE_DDDEBUG
 #define  DUK_USE_ASSERTIONS
-#define  DUK_USE_EXPLICIT_NULL_INIT
 #elif (DUK_PROFILE == 500)
 #undef   DUK_USE_PACKED_TVAL
 #undef   DUK_USE_FULL_TVAL
@@ -355,17 +787,28 @@ static __inline__ unsigned long long duk_rdtsc(void) {
 #undef  DUK_USE_DPRINT_RDTSC
 #endif
 
-#ifdef _DUK_C99
+#ifdef DUK_F_C99
 #define  DUK_USE_VARIADIC_MACROS
 #else
 #undef  DUK_USE_VARIADIC_MACROS
 #endif
 
-/* zero-size array at end of struct (char buf[0]) instead of C99 version (char buf[]) */
-#ifdef _DUK_C99
-#undef  DUK_USE_STRUCT_HACK
+/* Variable size array at the end of a structure is nonportable.  There are
+ * three alternatives:
+ *  1) C99 (flexible array member): char buf[]
+ *  2) Compiler specific (e.g. GCC): char buf[0]
+ *  3) Portable but wastes memory / complicates allocation: char buf[1]
+ */
+/* FIXME: Currently unused, only hbuffer.h needed this at some point. */
+#undef  DUK_USE_FLEX_C99
+#undef  DUK_USE_FLEX_ZEROSIZE
+#undef  DUK_USE_FLEX_ONESIZE
+#if defined(DUK_F_C99)
+#define  DUK_USE_FLEX_C99
+#elif defined(__GNUC__)
+#define  DUK_USE_FLEX_ZEROSIZE
 #else
-#define  DUK_USE_STRUCT_HACK  /* non-portable */
+#define  DUK_USE_FLEX_ONESIZE
 #endif
 
 /* FIXME: GCC pragma inside a function fails in some earlier GCC versions (e.g. gcc 4.5).
@@ -376,21 +819,6 @@ static __inline__ unsigned long long duk_rdtsc(void) {
 #define  DUK_USE_GCC_PRAGMAS
 #else
 #undef  DUK_USE_GCC_PRAGMAS
-#endif
-
-/* Some math functions are C99 only.  This is also an issue with some
- * embedded environments using uclibc where uclibc has been configured
- * not to provide some functions.  For now, use replacements whenever
- * using uclibc.
- */
-#if defined(_DUK_C99) && !defined(__UCLIBC__)
-#define  DUK_USE_MATH_FMIN
-#define  DUK_USE_MATH_FMAX
-#define  DUK_USE_MATH_ROUND
-#else
-#undef  DUK_USE_MATH_FMIN
-#undef  DUK_USE_MATH_FMAX
-#undef  DUK_USE_MATH_ROUND
 #endif
 
 /*
@@ -420,26 +848,38 @@ static __inline__ unsigned long long duk_rdtsc(void) {
 #elif defined(__APPLE__)
 /* Mac OSX, iPhone, Darwin */
 #define  DUK_USE_DATE_NOW_GETTIMEOFDAY
-#define  DUK_USE_DATE_TZO_GMTIME
+#define  DUK_USE_DATE_TZO_GMTIME_R
 #define  DUK_USE_DATE_PRS_STRPTIME
 #define  DUK_USE_DATE_FMT_STRFTIME
 #elif defined(__linux)
 /* Linux (__unix also defined) */
 #define  DUK_USE_DATE_NOW_GETTIMEOFDAY
-#define  DUK_USE_DATE_TZO_GMTIME
+#define  DUK_USE_DATE_TZO_GMTIME_R
 #define  DUK_USE_DATE_PRS_STRPTIME
 #define  DUK_USE_DATE_FMT_STRFTIME
 #elif defined(__unix)
 /* Other Unix */
 #define  DUK_USE_DATE_NOW_GETTIMEOFDAY
-#define  DUK_USE_DATE_TZO_GMTIME
+#define  DUK_USE_DATE_TZO_GMTIME_R
 #define  DUK_USE_DATE_PRS_STRPTIME
 #define  DUK_USE_DATE_FMT_STRFTIME
 #elif defined(__posix)
 /* POSIX */
 #define  DUK_USE_DATE_NOW_GETTIMEOFDAY
-#define  DUK_USE_DATE_TZO_GMTIME
+#define  DUK_USE_DATE_TZO_GMTIME_R
 #define  DUK_USE_DATE_PRS_STRPTIME
+#define  DUK_USE_DATE_FMT_STRFTIME
+#elif defined(DUK_F_TOS)
+/* Atari ST TOS */
+#define  DUK_USE_DATE_NOW_TIME
+#define  DUK_USE_DATE_TZO_GMTIME
+/* no parsing (not an error) */
+#define  DUK_USE_DATE_FMT_STRFTIME
+#elif defined(DUK_F_AMIGAOS)
+/* AmigaOS */
+#define  DUK_USE_DATE_NOW_TIME
+#define  DUK_USE_DATE_TZO_GMTIME
+/* no parsing (not an error) */
 #define  DUK_USE_DATE_FMT_STRFTIME
 #else
 #error platform not supported
@@ -450,6 +890,7 @@ static __inline__ unsigned long long duk_rdtsc(void) {
 #endif
 
 #if defined(DUK_USE_DATE_TZO_GMTIME) || \
+    defined(DUK_USE_DATE_TZO_GMTIME_R) || \
     defined(DUK_USE_DATE_PRS_STRPTIME) || \
     defined(DUK_USE_DATE_FMT_STRFTIME)
 /* just a sanity check */
@@ -476,9 +917,20 @@ static __inline__ unsigned long long duk_rdtsc(void) {
  * #endif
  */
 
+#endif  /* DUK_FEATURES_H_INCLUDED */
+
+#line 19 "duk_internal.h"
+#include "duktape.h"
+#line 1 "duk_features_sanity.h"
 /*
- *  Sanity checks on defines
+ *  Sanity check of duk_features.h defines.  This is a separate file
+ *  because we also check for consistency between duktape.h and
+ *  duk_features.h defines.  Duktape.h cannot be included first
+ *  because feature selection macros would then be incorrect.
  */
+
+#ifndef DUK_FEATURES_SANITY_H_INCLUDED
+#define DUK_FEATURES_SANITY_H_INCLUDED
 
 #if defined(DUK_DDEBUG) && !defined(DUK_DEBUG)
 #error DUK_DEBUG and DUK_DDEBUG should not be defined (obsolete)
@@ -504,120 +956,44 @@ static __inline__ unsigned long long duk_rdtsc(void) {
 #error DUK_USE_GC_TORTURE defined without DUK_USE_MARK_AND_SWEEP
 #endif
 
-#endif  /* DUK_FEATURES_H_INCLUDED */
+#if (defined(DUK_USE_VARIADIC_MACROS) && !defined(DUK_API_VARIADIC_MACROS)) || \
+    (!defined(DUK_USE_VARIADIC_MACROS) && defined(DUK_API_VARIADIC_MACROS))
+#error DUK_USE_VARIADIC_MACROS and DUK_API_VARIADIC_MACROS must agree
+#endif
 
-#line 23 "duk_internal.h"
-
-/*
- *  System includes
- *
- *  This is currently the set of headers that we include on all platforms.
- *  Platform specific headers are included in duk_features.h.  The set of
- *  included files should be more precise, so perhaps these all should go
- *  to duk_features.h.
- */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <stdarg.h>  /* varargs */
-#include <setjmp.h>
-#include <stddef.h>  /* e.g. ptrdiff_t */
-#include <stdint.h>
+#endif  /* DUK_FEATURES_SANITY_H_INCLUDED */
+#line 21 "duk_internal.h"
 
 /*
  *  Duktape includes (other than duk_features.h)
- */
-
-#line 1 "duk_misc.h"
-/*
- *  Miscellaneous defines that don't fit elsewhere.
- */
-
-#ifndef DUK_MISC_H_INCLUDED
-#define DUK_MISC_H_INCLUDED
-
-/*
- *  Misc constants
- */
-
-#define  DUK_DOUBLE_2TO32  4294967296.0
-#define  DUK_DOUBLE_2TO31  2147483648.0
-
-/*
- *  Macro hackery to convert e.g. __LINE__ to a string without formatting,
- *  see: http://stackoverflow.com/questions/240353/convert-a-preprocessor-token-to-a-string
- */
-
-#define  _DUK_STRINGIFY_HELPER(x)  #x
-#define  DUK_MACRO_STRINGIFY(x)  _DUK_STRINGIFY_HELPER(x)
-
-/*
- *  GCC specific compile time messages
  *
- *  Note: no semicolon should be used after these because they may appear e.g. at top level:
- *
- *      DUK_FIXME("this needs fixing")
+ *  The header files expect to be included in an order which satisfies header
+ *  dependencies correctly (the headers themselves don't include any other
+ *  includes).  Forward declarations are used to break circular struct/typedef
+ *  dependencies.
  */
 
-/* FIXME: make these conditional to a specific compiler option (don't want to see these normally) */
+#line 1 "duk_replacements.h"
+#ifndef DUK_REPLACEMENTS_H_INCLUDED
+#define DUK_REPLACEMENTS_H_INCLUDED
 
-#if defined(__GNUC__) && defined(FIXME_COMMENTED_OUT)
-
-/* http://gcc.gnu.org/onlinedocs/gcc-4.6.0/gcc/Diagnostic-Pragmas.html */
-#define  _DUK_DO_PRAGMA(x)  _Pragma(#x)
-#define  DUK_FIXME(x)       _DUK_DO_PRAGMA(message ("FIXME: " DUK_MACRO_STRINGIFY(x)))
-#define  DUK_TODO(x)        _DUK_DO_PRAGMA(message ("TODO: " DUK_MACRO_STRINGIFY(x)))
-#define  DUK_XXX(x)         _DUK_DO_PRAGMA(message ("XXX: " DUK_MACRO_STRINGIFY(x)))
-
-#else
-
-#define  DUK_FIXME(x)
-#define  DUK_TODO(x)
-#define  DUK_XXX(x)
-
-#endif  /* __GNUC__ */
-
-#endif  /* DUK_MISC_H_INCLUDED */
-
-/* already included: duk_rdtsc.h */
-#line 1 "duk_bittypes.h"
-/*
- *  Bit types such as duk_u32.
- */
-
-#ifndef DUK_BITTYPES_H_INCLUDED
-#define DUK_BITTYPES_H_INCLUDED
-
-/* FIXME: Is there a reason not to rely on C99 types only, and only fall
- * back to guessing if C99 types are not available?
- */
-
-/* FIXME: How to do reasonable automatic detection on older compilers,
- * and how to allow user override?
- */
-
-#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 199901L)
-/* C99 */
-#include <inttypes.h>
-typedef uint8_t duk_u8;
-typedef int8_t duk_i8;
-typedef uint16_t duk_u16;
-typedef int16_t duk_i16;
-typedef uint32_t duk_u32;
-typedef int32_t duk_i32;
-#else
-/* FIXME: need actual detection here */
-typedef unsigned char duk_u8;
-typedef signed char duk_i8;
-typedef unsigned short duk_u16;
-typedef signed short duk_i16;
-typedef unsigned int duk_u32;
-typedef signed int duk_i32;
+#ifdef DUK_USE_REPL_FPCLASSIFY
+int duk_repl_fpclassify(double x);
 #endif
 
-#endif  /* DUK_BITTYPES_H_INCLUDED */
+#ifdef DUK_USE_REPL_SIGNBIT
+int duk_repl_signbit(double x);
+#endif
 
+#ifdef DUK_USE_REPL_ISFINITE
+int duk_repl_isfinite(double x);
+#endif
+
+#ifdef DUK_USE_REPL_ISNAN
+int duk_repl_isnan(double x);
+#endif
+	
+#endif  /* DUK_REPLACEMENTS_H_INCLUDED */
 #line 1 "duk_jmpbuf.h"
 /*
  *  Wrapper for jmp_buf.
@@ -631,8 +1007,6 @@ typedef signed int duk_i32;
 
 #ifndef DUK_JMPBUF_H_INCLUDED
 #define DUK_JMPBUF_H_INCLUDED
-
-#include <setjmp.h>
 
 struct duk_jmpbuf {
 	jmp_buf jb;
@@ -742,517 +1116,336 @@ typedef struct duk_re_compiler_ctx duk_re_compiler_ctx;
 	
 #endif  /* DUK_FORWDECL_H_INCLUDED */
 
-#line 1 "duk_js_bytecode.h"
+#line 1 "duk_builtins.h"
 /*
- *  Ecmascript bytecode
+ *  Automatically generated by genbuiltins.py, do not edit!
  */
 
-#ifndef DUK_JS_BYTECODE_H_INCLUDED
-#define DUK_JS_BYTECODE_H_INCLUDED
+#ifndef DUK_BUILTINS_H_INCLUDED
+#define DUK_BUILTINS_H_INCLUDED
 
-/* already included: duk_bittypes.h */
-
-/*
- *  Logical instruction layout
- *  ==========================
- *
- *  !3!3!2!2!2!2!2!2!2!2!2!2!1!1!1!1!1!1!1!1!1!1! ! ! ! ! ! ! ! ! ! !
- *  !1!0!9!8!7!6!5!4!3!2!1!0!9!8!7!6!5!4!3!2!1!0!9!8!7!6!5!4!3!2!1!0!
- *  +---------------------------------------------------+-----------+
- *  !       C         !       B         !      A        !    OP     !
- *  +---------------------------------------------------+-----------+
- *
- *  OP (6 bits):  opcode (DUK_OP_*), access should be fastest
- *  A (8 bits):   typically a target register number
- *  B (9 bits):   typically first source register/constant number
- *  C (9 bits):   typically second source register/constant number
- *
- *  Some instructions combine BC or ABC together for larger parameter values.
- *  Signed integers (e.g. jump offsets) are encoded as unsigned, with an opcode
- *  specific bias.  B and C may denote a register or a constant, see
- *  DUK_BC_ISREG() and DUK_BC_ISCONST().
- *
- *  Note: macro naming is a bit misleading, e.g. "ABC" in macro name but
- *  the field layout is logically "CBA".
- */ 
-
-typedef duk_u32 duk_instr;
-
-#define  DUK_DEC_OP(x)               ((x) & 0x3f)
-#define  DUK_DEC_A(x)                (((x) >> 6) & 0xff)
-#define  DUK_DEC_B(x)                (((x) >> 14) & 0x1ff)
-#define  DUK_DEC_C(x)                (((x) >> 23) & 0x1ff)
-#define  DUK_DEC_BC(x)               (((x) >> 14) & 0x3ffff)
-#define  DUK_DEC_ABC(x)              (((x) >> 6) & 0x3ffffff)
-
-#define  DUK_ENC_OP_ABC(op,abc)      ((duk_instr) (((abc) << 6) | (op)))
-#define  DUK_ENC_OP_A_BC(op,a,bc)    ((duk_instr) (((bc) << 14) | ((a) << 6) | (op)))
-#define  DUK_ENC_OP_A_B_C(op,a,b,c)  ((duk_instr) (((c) << 23) | ((b) << 14) | ((a) << 6) | (op)))
-#define  DUK_ENC_OP_A_B(op,a,b)      DUK_ENC_OP_A_B_C(op,a,b,0)
-#define  DUK_ENC_OP_A(op,a)          DUK_ENC_OP_A_B_C(op,a,0,0)
-
-#define  DUK_BC_OP_MIN               0
-#define  DUK_BC_OP_MAX               0x3f
-#define  DUK_BC_A_MIN                0
-#define  DUK_BC_A_MAX                0xff
-#define  DUK_BC_B_MIN                0
-#define  DUK_BC_B_MAX                0x1ff
-#define  DUK_BC_C_MIN                0
-#define  DUK_BC_C_MAX                0x1ff
-#define  DUK_BC_BC_MIN               0
-#define  DUK_BC_BC_MAX               0x3ffff
-#define  DUK_BC_ABC_MIN              0
-#define  DUK_BC_ABC_MAX              0x3ffffff
-#define  DUK_BC_EXTRAOP_MIN          DUK_BC_A_MIN
-#define  DUK_BC_EXTRAOP_MAX          DUK_BC_A_MAX
-
-#define  DUK_OP_LDREG                0 
-#define  DUK_OP_STREG                1  /* FIXME: UNUSED */
-#define  DUK_OP_LDCONST              2
-#define  DUK_OP_LDINT                3
-#define  DUK_OP_LDINTX               4  /* FIXME: UNUSED */
-#define  DUK_OP_MPUTOBJ              5
-#define  DUK_OP_MPUTARR              6
-#define  DUK_OP_NEW                  7
-#define  DUK_OP_REGEXP               8
-#define  DUK_OP_CSREG                9
-#define  DUK_OP_GETVAR               10
-#define  DUK_OP_PUTVAR               11
-#define  DUK_OP_DECLVAR              12
-#define  DUK_OP_DELVAR               13
-#define  DUK_OP_CSVAR                14
-#define  DUK_OP_CLOSURE              15
-#define  DUK_OP_GETPROP              16
-#define  DUK_OP_PUTPROP              17
-#define  DUK_OP_DELPROP              18
-#define  DUK_OP_CSPROP               19
-#define  DUK_OP_ADD                  20
-#define  DUK_OP_SUB                  21
-#define  DUK_OP_MUL                  22
-#define  DUK_OP_DIV                  23
-#define  DUK_OP_MOD                  24
-#define  DUK_OP_UNM                  25
-#define  DUK_OP_UNP                  26
-#define  DUK_OP_INC                  27
-#define  DUK_OP_DEC                  28
-#define  DUK_OP_BAND                 29
-#define  DUK_OP_BOR                  30
-#define  DUK_OP_BXOR                 31
-#define  DUK_OP_BASL                 32
-#define  DUK_OP_BLSR                 33
-#define  DUK_OP_BASR                 34
-#define  DUK_OP_BNOT                 35
-#define  DUK_OP_LNOT                 36
-#define  DUK_OP_EQ                   37
-#define  DUK_OP_NEQ                  38
-#define  DUK_OP_SEQ                  39
-#define  DUK_OP_SNEQ                 40
-#define  DUK_OP_GT                   41
-#define  DUK_OP_GE                   42
-#define  DUK_OP_LT                   43
-#define  DUK_OP_LE                   44
-#define  DUK_OP_IF                   45
-#define  DUK_OP_INSTOF               46
-#define  DUK_OP_IN                   47
-#define  DUK_OP_JUMP                 48
-#define  DUK_OP_RETURN               49
-#define  DUK_OP_CALL                 50
-#define  DUK_OP_LABEL                51
-#define  DUK_OP_ENDLABEL             52
-#define  DUK_OP_BREAK                53
-#define  DUK_OP_CONTINUE             54
-#define  DUK_OP_TRYCATCH             55
-#define  DUK_OP_56                   56
-#define  DUK_OP_57                   57
-#define  DUK_OP_58                   58
-#define  DUK_OP_59                   59
-#define  DUK_OP_60                   60
-#define  DUK_OP_EXTRA                61
-#define  DUK_OP_DEBUG                62
-#define  DUK_OP_INVALID              63
-
-/* DUK_OP_EXTRA, sub-operation in A */
-#define  DUK_EXTRAOP_NOP             0
-#define  DUK_EXTRAOP_LDTHIS          1
-#define  DUK_EXTRAOP_LDUNDEF         2
-#define  DUK_EXTRAOP_LDNULL          3
-#define  DUK_EXTRAOP_LDBOOL          4
-#define  DUK_EXTRAOP_NEWOBJ          5
-#define  DUK_EXTRAOP_NEWARR          6
-#define  DUK_EXTRAOP_SETALEN         7
-#define  DUK_EXTRAOP_TYPEOF          8
-#define  DUK_EXTRAOP_TYPEOFID        9
-#define  DUK_EXTRAOP_TONUM           10
-#define  DUK_EXTRAOP_INITENUM        11
-#define  DUK_EXTRAOP_NEXTENUM        12
-#define  DUK_EXTRAOP_INITSET         13
-#define  DUK_EXTRAOP_INITGET         14
-#define  DUK_EXTRAOP_ENDTRY          15
-#define  DUK_EXTRAOP_ENDCATCH        16
-#define  DUK_EXTRAOP_ENDFIN          17
-#define  DUK_EXTRAOP_THROW           18
-#define  DUK_EXTRAOP_INVLHS          19
-
-/* DUK_OP_DEBUG, sub-operation in A */
-#define  DUK_DEBUGOP_DUMPREG         0
-#define  DUK_DEBUGOP_DUMPREGS        1
-#define  DUK_DEBUGOP_DUMPTHREAD      2
-#define  DUK_DEBUGOP_LOGMARK         3
-
-/* DUK_OP_CALL flags in A */
-#define  DUK_BC_CALL_FLAG_TAILCALL           (1 << 0)
-#define  DUK_BC_CALL_FLAG_EVALCALL           (1 << 1)
-
-/* DUK_OP_TRYCATCH flags in A */
-#define  DUK_BC_TRYCATCH_FLAG_HAVE_CATCH     (1 << 0)
-#define  DUK_BC_TRYCATCH_FLAG_HAVE_FINALLY   (1 << 1)
-#define  DUK_BC_TRYCATCH_FLAG_CATCH_BINDING  (1 << 2)
-#define  DUK_BC_TRYCATCH_FLAG_WITH_BINDING   (1 << 3)
-
-/* DUK_OP_RETURN flags in A */
-#define  DUK_BC_RETURN_FLAG_FAST             (1 << 0)
-#define  DUK_BC_RETURN_FLAG_HAVE_RETVAL      (1 << 1)
-
-/* DUK_OP_DECLVAR flags in A; bottom bits are reserved for propdesc flags (DUK_PROPDESC_FLAG_XXX) */
-#define  DUK_BC_DECLVAR_FLAG_UNDEF_VALUE     (1 << 4)  /* use 'undefined' for value automatically */
-#define  DUK_BC_DECLVAR_FLAG_FUNC_DECL       (1 << 5)  /* function declaration */
-
-/* misc constants and helper macros */
-#define  DUK_BC_REGLIMIT             256  /* if B/C is >= this value, refers to a const */
-#define  DUK_BC_ISREG(x)             ((x) < DUK_BC_REGLIMIT)
-#define  DUK_BC_ISCONST(x)           ((x) >= DUK_BC_REGLIMIT)
-#define  DUK_BC_LDINT_BIAS           (1 << 17)
-#define  DUK_BC_LDINTX_SHIFT         18
-#define  DUK_BC_JUMP_BIAS            (1 << 25)
-
-#endif  /* DUK_JS_BYTECODE_H_INCLUDED */
-
-#line 1 "duk_lexer.h"
-/*
- *  Lexer defines.
- */
-
-#ifndef DUK_LEXER_H_INCLUDED
-#define DUK_LEXER_H_INCLUDED
-
-#line 1 "duk_strings.h"
-/*
- *  Automatically generated by genstrings.py, do not edit!
- */
-
-#ifndef __DUK_STRINGS_H
-#define __DUK_STRINGS_H 1
-
+#if defined(DUK_USE_DOUBLE_LE)
 extern char duk_strings_data[];
 
-#define  DUK_STRDATA_DATA_LENGTH                                       1770
+#define  DUK_STRDATA_DATA_LENGTH                                       1785
 #define  DUK_STRDATA_MAX_STRLEN                                        24
 
-#define  DUK_STRIDX_EMPTY_STRING                                       0                              /* '' */
-#define  DUK_STRIDX_GLOBAL                                             1                              /* 'global' */
-#define  DUK_STRIDX_UC_ARGUMENTS                                       2                              /* 'Arguments' */
-#define  DUK_STRIDX_JSON                                               3                              /* 'JSON' */
-#define  DUK_STRIDX_MATH                                               4                              /* 'Math' */
-#define  DUK_STRIDX_ERROR                                              5                              /* 'Error' */
-#define  DUK_STRIDX_REG_EXP                                            6                              /* 'RegExp' */
-#define  DUK_STRIDX_DATE                                               7                              /* 'Date' */
-#define  DUK_STRIDX_UC_NUMBER                                          8                              /* 'Number' */
-#define  DUK_STRIDX_UC_BOOLEAN                                         9                              /* 'Boolean' */
-#define  DUK_STRIDX_UC_STRING                                          10                             /* 'String' */
-#define  DUK_STRIDX_ARRAY                                              11                             /* 'Array' */
-#define  DUK_STRIDX_UC_FUNCTION                                        12                             /* 'Function' */
-#define  DUK_STRIDX_UC_OBJECT                                          13                             /* 'Object' */
-#define  DUK_STRIDX_JSON_EXT_NEGINF                                    14                             /* '{"_ninf":true}' */
-#define  DUK_STRIDX_JSON_EXT_POSINF                                    15                             /* '{"_inf":true}' */
-#define  DUK_STRIDX_JSON_EXT_NAN                                       16                             /* '{"_nan":true}' */
-#define  DUK_STRIDX_JSON_EXT_UNDEFINED                                 17                             /* '{"_undefined":true}' */
-#define  DUK_STRIDX_SLEEP                                              18                             /* 'sleep' */
-#define  DUK_STRIDX_BASE64                                             19                             /* 'base64' */
-#define  DUK_STRIDX_HEX                                                20                             /* 'hex' */
-#define  DUK_STRIDX_DEC                                                21                             /* 'dec' */
-#define  DUK_STRIDX_ENC                                                22                             /* 'enc' */
-#define  DUK_STRIDX_GET_FINALIZER                                      23                             /* 'getFinalizer' */
-#define  DUK_STRIDX_SET_FINALIZER                                      24                             /* 'setFinalizer' */
-#define  DUK_STRIDX_TIME                                               25                             /* 'time' */
-#define  DUK_STRIDX_GC                                                 26                             /* 'gc' */
-#define  DUK_STRIDX_CURR                                               27                             /* 'curr' */
-#define  DUK_STRIDX_RESUME                                             28                             /* 'resume' */
-#define  DUK_STRIDX_SPAWN                                              29                             /* 'spawn' */
-#define  DUK_STRIDX_REFC                                               30                             /* 'refc' */
-#define  DUK_STRIDX_ADDR                                               31                             /* 'addr' */
-#define  DUK_STRIDX_BUILD                                              32                             /* 'build' */
-#define  DUK_STRIDX_VERSION                                            33                             /* 'version' */
-#define  DUK_STRIDX_DUK                                                34                             /* '__duk__' */
-#define  DUK_STRIDX_INT_REGBASE                                        35                             /* '\x00regbase' */
-#define  DUK_STRIDX_INT_THREAD                                         36                             /* '\x00thread' */
-#define  DUK_STRIDX_INT_FINALIZER                                      37                             /* '\x00finalizer' */
-#define  DUK_STRIDX_INT_METATABLE                                      38                             /* '\x00metatable' */
-#define  DUK_STRIDX_INT_CALLEE                                         39                             /* '\x00callee' */
-#define  DUK_STRIDX_INT_MAP                                            40                             /* '\x00map' */
-#define  DUK_STRIDX_INT_ARGS                                           41                             /* '\x00args' */
-#define  DUK_STRIDX_INT_THIS                                           42                             /* '\x00this' */
-#define  DUK_STRIDX_INT_FILENAME                                       43                             /* '\x00filename' */
-#define  DUK_STRIDX_INT_PC2LINE                                        44                             /* '\x00pc2line' */
-#define  DUK_STRIDX_INT_SOURCE                                         45                             /* '\x00source' */
-#define  DUK_STRIDX_INT_VARENV                                         46                             /* '\x00varenv' */
-#define  DUK_STRIDX_INT_LEXENV                                         47                             /* '\x00lexenv' */
-#define  DUK_STRIDX_INT_VARMAP                                         48                             /* '\x00varmap' */
-#define  DUK_STRIDX_INT_FORMALS                                        49                             /* '\x00formals' */
-#define  DUK_STRIDX_INT_BYTECODE                                       50                             /* '\x00bytecode' */
-#define  DUK_STRIDX_INT_NEXT                                           51                             /* '\x00next' */
-#define  DUK_STRIDX_INT_TARGET                                         52                             /* '\x00target' */
-#define  DUK_STRIDX_INT_VALUE                                          53                             /* '\x00value' */
-#define  DUK_STRIDX_POINTER                                            54                             /* 'pointer' */
-#define  DUK_STRIDX_BUFFER                                             55                             /* 'buffer' */
-#define  DUK_STRIDX_TRUNC                                              56                             /* 'trunc' */
-#define  DUK_STRIDX_TRACEBACK                                          57                             /* 'traceback' */
-#define  DUK_STRIDX_CAUSE                                              58                             /* 'cause' */
-#define  DUK_STRIDX_CODE                                               59                             /* 'code' */
-#define  DUK_STRIDX_IS_NATIVE                                          60                             /* 'isNative' */
-#define  DUK_STRIDX_LINE_NUMBER                                        61                             /* 'lineNumber' */
-#define  DUK_STRIDX_FILE_NAME                                          62                             /* 'fileName' */
-#define  DUK_STRIDX_PC                                                 63                             /* 'pc' */
-#define  DUK_STRIDX_THROW_TYPE_ERROR                                   64                             /* 'ThrowTypeError' */
-#define  DUK_STRIDX_CALLEE                                             65                             /* 'callee' */
-#define  DUK_STRIDX_INVALID_DATE                                       66                             /* 'Invalid Date' */
-#define  DUK_STRIDX_SPACE                                              67                             /* ' ' */
-#define  DUK_STRIDX_COMMA                                              68                             /* ',' */
-#define  DUK_STRIDX_MINUS_ZERO                                         69                             /* '-0' */
-#define  DUK_STRIDX_PLUS_ZERO                                          70                             /* '+0' */
-#define  DUK_STRIDX_ZERO                                               71                             /* '0' */
-#define  DUK_STRIDX_MINUS_INFINITY                                     72                             /* '-Infinity' */
-#define  DUK_STRIDX_PLUS_INFINITY                                      73                             /* '+Infinity' */
-#define  DUK_STRIDX_INFINITY                                           74                             /* 'Infinity' */
-#define  DUK_STRIDX_LC_OBJECT                                          75                             /* 'object' */
-#define  DUK_STRIDX_LC_STRING                                          76                             /* 'string' */
-#define  DUK_STRIDX_LC_NUMBER                                          77                             /* 'number' */
-#define  DUK_STRIDX_LC_BOOLEAN                                         78                             /* 'boolean' */
-#define  DUK_STRIDX_UNDEFINED                                          79                             /* 'undefined' */
-#define  DUK_STRIDX_STRINGIFY                                          80                             /* 'stringify' */
-#define  DUK_STRIDX_TAN                                                81                             /* 'tan' */
-#define  DUK_STRIDX_SQRT                                               82                             /* 'sqrt' */
-#define  DUK_STRIDX_SIN                                                83                             /* 'sin' */
-#define  DUK_STRIDX_ROUND                                              84                             /* 'round' */
-#define  DUK_STRIDX_RANDOM                                             85                             /* 'random' */
-#define  DUK_STRIDX_POW                                                86                             /* 'pow' */
-#define  DUK_STRIDX_MIN                                                87                             /* 'min' */
-#define  DUK_STRIDX_MAX                                                88                             /* 'max' */
-#define  DUK_STRIDX_LOG                                                89                             /* 'log' */
-#define  DUK_STRIDX_FLOOR                                              90                             /* 'floor' */
-#define  DUK_STRIDX_EXP                                                91                             /* 'exp' */
-#define  DUK_STRIDX_COS                                                92                             /* 'cos' */
-#define  DUK_STRIDX_CEIL                                               93                             /* 'ceil' */
-#define  DUK_STRIDX_ATAN2                                              94                             /* 'atan2' */
-#define  DUK_STRIDX_ATAN                                               95                             /* 'atan' */
-#define  DUK_STRIDX_ASIN                                               96                             /* 'asin' */
-#define  DUK_STRIDX_ACOS                                               97                             /* 'acos' */
-#define  DUK_STRIDX_ABS                                                98                             /* 'abs' */
-#define  DUK_STRIDX_SQRT2                                              99                             /* 'SQRT2' */
-#define  DUK_STRIDX_SQRT1_2                                            100                            /* 'SQRT1_2' */
-#define  DUK_STRIDX_PI                                                 101                            /* 'PI' */
-#define  DUK_STRIDX_LOG10E                                             102                            /* 'LOG10E' */
-#define  DUK_STRIDX_LOG2E                                              103                            /* 'LOG2E' */
-#define  DUK_STRIDX_LN2                                                104                            /* 'LN2' */
-#define  DUK_STRIDX_LN10                                               105                            /* 'LN10' */
-#define  DUK_STRIDX_E                                                  106                            /* 'E' */
-#define  DUK_STRIDX_MESSAGE                                            107                            /* 'message' */
-#define  DUK_STRIDX_NAME                                               108                            /* 'name' */
-#define  DUK_STRIDX_INPUT                                              109                            /* 'input' */
-#define  DUK_STRIDX_INDEX                                              110                            /* 'index' */
-#define  DUK_STRIDX_ESCAPED_EMPTY_REGEXP                               111                            /* '(?:)' */
-#define  DUK_STRIDX_LAST_INDEX                                         112                            /* 'lastIndex' */
-#define  DUK_STRIDX_MULTILINE                                          113                            /* 'multiline' */
-#define  DUK_STRIDX_IGNORE_CASE                                        114                            /* 'ignoreCase' */
-#define  DUK_STRIDX_SOURCE                                             115                            /* 'source' */
-#define  DUK_STRIDX_TEST                                               116                            /* 'test' */
-#define  DUK_STRIDX_EXEC                                               117                            /* 'exec' */
-#define  DUK_STRIDX_TO_GMT_STRING                                      118                            /* 'toGMTString' */
-#define  DUK_STRIDX_SET_YEAR                                           119                            /* 'setYear' */
-#define  DUK_STRIDX_GET_YEAR                                           120                            /* 'getYear' */
-#define  DUK_STRIDX_TO_JSON                                            121                            /* 'toJSON' */
-#define  DUK_STRIDX_TO_ISO_STRING                                      122                            /* 'toISOString' */
-#define  DUK_STRIDX_TO_UTC_STRING                                      123                            /* 'toUTCString' */
-#define  DUK_STRIDX_SET_UTC_FULL_YEAR                                  124                            /* 'setUTCFullYear' */
-#define  DUK_STRIDX_SET_FULL_YEAR                                      125                            /* 'setFullYear' */
-#define  DUK_STRIDX_SET_UTC_MONTH                                      126                            /* 'setUTCMonth' */
-#define  DUK_STRIDX_SET_MONTH                                          127                            /* 'setMonth' */
-#define  DUK_STRIDX_SET_UTC_DATE                                       128                            /* 'setUTCDate' */
-#define  DUK_STRIDX_SET_DATE                                           129                            /* 'setDate' */
-#define  DUK_STRIDX_SET_UTC_HOURS                                      130                            /* 'setUTCHours' */
-#define  DUK_STRIDX_SET_HOURS                                          131                            /* 'setHours' */
-#define  DUK_STRIDX_SET_UTC_MINUTES                                    132                            /* 'setUTCMinutes' */
-#define  DUK_STRIDX_SET_MINUTES                                        133                            /* 'setMinutes' */
-#define  DUK_STRIDX_SET_UTC_SECONDS                                    134                            /* 'setUTCSeconds' */
-#define  DUK_STRIDX_SET_SECONDS                                        135                            /* 'setSeconds' */
-#define  DUK_STRIDX_SET_UTC_MILLISECONDS                               136                            /* 'setUTCMilliseconds' */
-#define  DUK_STRIDX_SET_MILLISECONDS                                   137                            /* 'setMilliseconds' */
-#define  DUK_STRIDX_SET_TIME                                           138                            /* 'setTime' */
-#define  DUK_STRIDX_GET_TIMEZONE_OFFSET                                139                            /* 'getTimezoneOffset' */
-#define  DUK_STRIDX_GET_UTC_MILLISECONDS                               140                            /* 'getUTCMilliseconds' */
-#define  DUK_STRIDX_GET_MILLISECONDS                                   141                            /* 'getMilliseconds' */
-#define  DUK_STRIDX_GET_UTC_SECONDS                                    142                            /* 'getUTCSeconds' */
-#define  DUK_STRIDX_GET_SECONDS                                        143                            /* 'getSeconds' */
-#define  DUK_STRIDX_GET_UTC_MINUTES                                    144                            /* 'getUTCMinutes' */
-#define  DUK_STRIDX_GET_MINUTES                                        145                            /* 'getMinutes' */
-#define  DUK_STRIDX_GET_UTC_HOURS                                      146                            /* 'getUTCHours' */
-#define  DUK_STRIDX_GET_HOURS                                          147                            /* 'getHours' */
-#define  DUK_STRIDX_GET_UTC_DAY                                        148                            /* 'getUTCDay' */
-#define  DUK_STRIDX_GET_DAY                                            149                            /* 'getDay' */
-#define  DUK_STRIDX_GET_UTC_DATE                                       150                            /* 'getUTCDate' */
-#define  DUK_STRIDX_GET_DATE                                           151                            /* 'getDate' */
-#define  DUK_STRIDX_GET_UTC_MONTH                                      152                            /* 'getUTCMonth' */
-#define  DUK_STRIDX_GET_MONTH                                          153                            /* 'getMonth' */
-#define  DUK_STRIDX_GET_UTC_FULL_YEAR                                  154                            /* 'getUTCFullYear' */
-#define  DUK_STRIDX_GET_FULL_YEAR                                      155                            /* 'getFullYear' */
-#define  DUK_STRIDX_GET_TIME                                           156                            /* 'getTime' */
-#define  DUK_STRIDX_TO_LOCALE_TIME_STRING                              157                            /* 'toLocaleTimeString' */
-#define  DUK_STRIDX_TO_LOCALE_DATE_STRING                              158                            /* 'toLocaleDateString' */
-#define  DUK_STRIDX_TO_TIME_STRING                                     159                            /* 'toTimeString' */
-#define  DUK_STRIDX_TO_DATE_STRING                                     160                            /* 'toDateString' */
-#define  DUK_STRIDX_NOW                                                161                            /* 'now' */
-#define  DUK_STRIDX_UTC                                                162                            /* 'UTC' */
-#define  DUK_STRIDX_PARSE                                              163                            /* 'parse' */
-#define  DUK_STRIDX_TO_PRECISION                                       164                            /* 'toPrecision' */
-#define  DUK_STRIDX_TO_EXPONENTIAL                                     165                            /* 'toExponential' */
-#define  DUK_STRIDX_TO_FIXED                                           166                            /* 'toFixed' */
-#define  DUK_STRIDX_POSITIVE_INFINITY                                  167                            /* 'POSITIVE_INFINITY' */
-#define  DUK_STRIDX_NEGATIVE_INFINITY                                  168                            /* 'NEGATIVE_INFINITY' */
-#define  DUK_STRIDX_NAN                                                169                            /* 'NaN' */
-#define  DUK_STRIDX_MIN_VALUE                                          170                            /* 'MIN_VALUE' */
-#define  DUK_STRIDX_MAX_VALUE                                          171                            /* 'MAX_VALUE' */
-#define  DUK_STRIDX_SUBSTR                                             172                            /* 'substr' */
-#define  DUK_STRIDX_TRIM                                               173                            /* 'trim' */
-#define  DUK_STRIDX_TO_LOCALE_UPPER_CASE                               174                            /* 'toLocaleUpperCase' */
-#define  DUK_STRIDX_TO_UPPER_CASE                                      175                            /* 'toUpperCase' */
-#define  DUK_STRIDX_TO_LOCALE_LOWER_CASE                               176                            /* 'toLocaleLowerCase' */
-#define  DUK_STRIDX_TO_LOWER_CASE                                      177                            /* 'toLowerCase' */
-#define  DUK_STRIDX_SUBSTRING                                          178                            /* 'substring' */
-#define  DUK_STRIDX_SPLIT                                              179                            /* 'split' */
-#define  DUK_STRIDX_SEARCH                                             180                            /* 'search' */
-#define  DUK_STRIDX_REPLACE                                            181                            /* 'replace' */
-#define  DUK_STRIDX_MATCH                                              182                            /* 'match' */
-#define  DUK_STRIDX_LOCALE_COMPARE                                     183                            /* 'localeCompare' */
-#define  DUK_STRIDX_CHAR_CODE_AT                                       184                            /* 'charCodeAt' */
-#define  DUK_STRIDX_CHAR_AT                                            185                            /* 'charAt' */
-#define  DUK_STRIDX_FROM_CHAR_CODE                                     186                            /* 'fromCharCode' */
-#define  DUK_STRIDX_REDUCE_RIGHT                                       187                            /* 'reduceRight' */
-#define  DUK_STRIDX_REDUCE                                             188                            /* 'reduce' */
-#define  DUK_STRIDX_FILTER                                             189                            /* 'filter' */
-#define  DUK_STRIDX_MAP                                                190                            /* 'map' */
-#define  DUK_STRIDX_FOR_EACH                                           191                            /* 'forEach' */
-#define  DUK_STRIDX_SOME                                               192                            /* 'some' */
-#define  DUK_STRIDX_EVERY                                              193                            /* 'every' */
-#define  DUK_STRIDX_LAST_INDEX_OF                                      194                            /* 'lastIndexOf' */
-#define  DUK_STRIDX_INDEX_OF                                           195                            /* 'indexOf' */
-#define  DUK_STRIDX_UNSHIFT                                            196                            /* 'unshift' */
-#define  DUK_STRIDX_SPLICE                                             197                            /* 'splice' */
-#define  DUK_STRIDX_SORT                                               198                            /* 'sort' */
-#define  DUK_STRIDX_SLICE                                              199                            /* 'slice' */
-#define  DUK_STRIDX_SHIFT                                              200                            /* 'shift' */
-#define  DUK_STRIDX_REVERSE                                            201                            /* 'reverse' */
-#define  DUK_STRIDX_PUSH                                               202                            /* 'push' */
-#define  DUK_STRIDX_POP                                                203                            /* 'pop' */
-#define  DUK_STRIDX_JOIN                                               204                            /* 'join' */
-#define  DUK_STRIDX_CONCAT                                             205                            /* 'concat' */
-#define  DUK_STRIDX_IS_ARRAY                                           206                            /* 'isArray' */
-#define  DUK_STRIDX_LC_ARGUMENTS                                       207                            /* 'arguments' */
-#define  DUK_STRIDX_CALLER                                             208                            /* 'caller' */
-#define  DUK_STRIDX_BIND                                               209                            /* 'bind' */
-#define  DUK_STRIDX_CALL                                               210                            /* 'call' */
-#define  DUK_STRIDX_APPLY                                              211                            /* 'apply' */
-#define  DUK_STRIDX_PROPERTY_IS_ENUMERABLE                             212                            /* 'propertyIsEnumerable' */
-#define  DUK_STRIDX_IS_PROTOTYPE_OF                                    213                            /* 'isPrototypeOf' */
-#define  DUK_STRIDX_HAS_OWN_PROPERTY                                   214                            /* 'hasOwnProperty' */
-#define  DUK_STRIDX_VALUE_OF                                           215                            /* 'valueOf' */
-#define  DUK_STRIDX_TO_LOCALE_STRING                                   216                            /* 'toLocaleString' */
-#define  DUK_STRIDX_TO_STRING                                          217                            /* 'toString' */
-#define  DUK_STRIDX_CONSTRUCTOR                                        218                            /* 'constructor' */
-#define  DUK_STRIDX_ENUMERABLE                                         219                            /* 'enumerable' */
-#define  DUK_STRIDX_CONFIGURABLE                                       220                            /* 'configurable' */
-#define  DUK_STRIDX_WRITABLE                                           221                            /* 'writable' */
-#define  DUK_STRIDX_VALUE                                              222                            /* 'value' */
-#define  DUK_STRIDX_KEYS                                               223                            /* 'keys' */
-#define  DUK_STRIDX_IS_EXTENSIBLE                                      224                            /* 'isExtensible' */
-#define  DUK_STRIDX_IS_FROZEN                                          225                            /* 'isFrozen' */
-#define  DUK_STRIDX_IS_SEALED                                          226                            /* 'isSealed' */
-#define  DUK_STRIDX_PREVENT_EXTENSIONS                                 227                            /* 'preventExtensions' */
-#define  DUK_STRIDX_FREEZE                                             228                            /* 'freeze' */
-#define  DUK_STRIDX_SEAL                                               229                            /* 'seal' */
-#define  DUK_STRIDX_DEFINE_PROPERTIES                                  230                            /* 'defineProperties' */
-#define  DUK_STRIDX_DEFINE_PROPERTY                                    231                            /* 'defineProperty' */
-#define  DUK_STRIDX_CREATE                                             232                            /* 'create' */
-#define  DUK_STRIDX_GET_OWN_PROPERTY_NAMES                             233                            /* 'getOwnPropertyNames' */
-#define  DUK_STRIDX_GET_OWN_PROPERTY_DESCRIPTOR                        234                            /* 'getOwnPropertyDescriptor' */
-#define  DUK_STRIDX_GET_PROTOTYPE_OF                                   235                            /* 'getPrototypeOf' */
-#define  DUK_STRIDX_PROTOTYPE                                          236                            /* 'prototype' */
-#define  DUK_STRIDX_LENGTH                                             237                            /* 'length' */
-#define  DUK_STRIDX_ALERT                                              238                            /* 'alert' */
-#define  DUK_STRIDX_PRINT                                              239                            /* 'print' */
-#define  DUK_STRIDX_UNESCAPE                                           240                            /* 'unescape' */
-#define  DUK_STRIDX_ESCAPE                                             241                            /* 'escape' */
-#define  DUK_STRIDX_ENCODE_URI_COMPONENT                               242                            /* 'encodeURIComponent' */
-#define  DUK_STRIDX_ENCODE_URI                                         243                            /* 'encodeURI' */
-#define  DUK_STRIDX_DECODE_URI_COMPONENT                               244                            /* 'decodeURIComponent' */
-#define  DUK_STRIDX_DECODE_URI                                         245                            /* 'decodeURI' */
-#define  DUK_STRIDX_IS_FINITE                                          246                            /* 'isFinite' */
-#define  DUK_STRIDX_IS_NAN                                             247                            /* 'isNaN' */
-#define  DUK_STRIDX_PARSE_FLOAT                                        248                            /* 'parseFloat' */
-#define  DUK_STRIDX_PARSE_INT                                          249                            /* 'parseInt' */
-#define  DUK_STRIDX_EVAL                                               250                            /* 'eval' */
-#define  DUK_STRIDX_URI_ERROR                                          251                            /* 'URIError' */
-#define  DUK_STRIDX_TYPE_ERROR                                         252                            /* 'TypeError' */
-#define  DUK_STRIDX_SYNTAX_ERROR                                       253                            /* 'SyntaxError' */
-#define  DUK_STRIDX_REFERENCE_ERROR                                    254                            /* 'ReferenceError' */
-#define  DUK_STRIDX_RANGE_ERROR                                        255                            /* 'RangeError' */
-#define  DUK_STRIDX_EVAL_ERROR                                         256                            /* 'EvalError' */
-#define  DUK_STRIDX_BREAK                                              257                            /* 'break' */
-#define  DUK_STRIDX_CASE                                               258                            /* 'case' */
-#define  DUK_STRIDX_CATCH                                              259                            /* 'catch' */
-#define  DUK_STRIDX_CONTINUE                                           260                            /* 'continue' */
-#define  DUK_STRIDX_DEBUGGER                                           261                            /* 'debugger' */
-#define  DUK_STRIDX_DEFAULT                                            262                            /* 'default' */
-#define  DUK_STRIDX_DELETE                                             263                            /* 'delete' */
-#define  DUK_STRIDX_DO                                                 264                            /* 'do' */
-#define  DUK_STRIDX_ELSE                                               265                            /* 'else' */
-#define  DUK_STRIDX_FINALLY                                            266                            /* 'finally' */
-#define  DUK_STRIDX_FOR                                                267                            /* 'for' */
-#define  DUK_STRIDX_LC_FUNCTION                                        268                            /* 'function' */
-#define  DUK_STRIDX_IF                                                 269                            /* 'if' */
-#define  DUK_STRIDX_IN                                                 270                            /* 'in' */
-#define  DUK_STRIDX_INSTANCEOF                                         271                            /* 'instanceof' */
-#define  DUK_STRIDX_NEW                                                272                            /* 'new' */
-#define  DUK_STRIDX_RETURN                                             273                            /* 'return' */
-#define  DUK_STRIDX_SWITCH                                             274                            /* 'switch' */
-#define  DUK_STRIDX_THIS                                               275                            /* 'this' */
-#define  DUK_STRIDX_THROW                                              276                            /* 'throw' */
-#define  DUK_STRIDX_TRY                                                277                            /* 'try' */
-#define  DUK_STRIDX_TYPEOF                                             278                            /* 'typeof' */
-#define  DUK_STRIDX_VAR                                                279                            /* 'var' */
-#define  DUK_STRIDX_VOID                                               280                            /* 'void' */
-#define  DUK_STRIDX_WHILE                                              281                            /* 'while' */
-#define  DUK_STRIDX_WITH                                               282                            /* 'with' */
-#define  DUK_STRIDX_CLASS                                              283                            /* 'class' */
-#define  DUK_STRIDX_CONST                                              284                            /* 'const' */
-#define  DUK_STRIDX_ENUM                                               285                            /* 'enum' */
-#define  DUK_STRIDX_EXPORT                                             286                            /* 'export' */
-#define  DUK_STRIDX_EXTENDS                                            287                            /* 'extends' */
-#define  DUK_STRIDX_IMPORT                                             288                            /* 'import' */
-#define  DUK_STRIDX_SUPER                                              289                            /* 'super' */
-#define  DUK_STRIDX_NULL                                               290                            /* 'null' */
-#define  DUK_STRIDX_TRUE                                               291                            /* 'true' */
-#define  DUK_STRIDX_FALSE                                              292                            /* 'false' */
-#define  DUK_STRIDX_GET                                                293                            /* 'get' */
-#define  DUK_STRIDX_SET                                                294                            /* 'set' */
-#define  DUK_STRIDX_IMPLEMENTS                                         295                            /* 'implements' */
-#define  DUK_STRIDX_INTERFACE                                          296                            /* 'interface' */
-#define  DUK_STRIDX_LET                                                297                            /* 'let' */
-#define  DUK_STRIDX_PACKAGE                                            298                            /* 'package' */
-#define  DUK_STRIDX_PRIVATE                                            299                            /* 'private' */
-#define  DUK_STRIDX_PROTECTED                                          300                            /* 'protected' */
-#define  DUK_STRIDX_PUBLIC                                             301                            /* 'public' */
-#define  DUK_STRIDX_STATIC                                             302                            /* 'static' */
-#define  DUK_STRIDX_YIELD                                              303                            /* 'yield' */
+#define  DUK_STRIDX_UC_THREAD                                          0                              /* 'Thread' */
+#define  DUK_STRIDX_UC_POINTER                                         1                              /* 'Pointer' */
+#define  DUK_STRIDX_UC_BUFFER                                          2                              /* 'Buffer' */
+#define  DUK_STRIDX_DEC_ENV                                            3                              /* 'DecEnv' */
+#define  DUK_STRIDX_OBJ_ENV                                            4                              /* 'ObjEnv' */
+#define  DUK_STRIDX_EMPTY_STRING                                       5                              /* '' */
+#define  DUK_STRIDX_GLOBAL                                             6                              /* 'global' */
+#define  DUK_STRIDX_UC_ARGUMENTS                                       7                              /* 'Arguments' */
+#define  DUK_STRIDX_JSON                                               8                              /* 'JSON' */
+#define  DUK_STRIDX_MATH                                               9                              /* 'Math' */
+#define  DUK_STRIDX_ERROR                                              10                             /* 'Error' */
+#define  DUK_STRIDX_REG_EXP                                            11                             /* 'RegExp' */
+#define  DUK_STRIDX_DATE                                               12                             /* 'Date' */
+#define  DUK_STRIDX_UC_NUMBER                                          13                             /* 'Number' */
+#define  DUK_STRIDX_UC_BOOLEAN                                         14                             /* 'Boolean' */
+#define  DUK_STRIDX_UC_STRING                                          15                             /* 'String' */
+#define  DUK_STRIDX_ARRAY                                              16                             /* 'Array' */
+#define  DUK_STRIDX_UC_FUNCTION                                        17                             /* 'Function' */
+#define  DUK_STRIDX_UC_OBJECT                                          18                             /* 'Object' */
+#define  DUK_STRIDX_JSON_EXT_NEGINF                                    19                             /* '{"_ninf":true}' */
+#define  DUK_STRIDX_JSON_EXT_POSINF                                    20                             /* '{"_inf":true}' */
+#define  DUK_STRIDX_JSON_EXT_NAN                                       21                             /* '{"_nan":true}' */
+#define  DUK_STRIDX_JSON_EXT_UNDEFINED                                 22                             /* '{"_undefined":true}' */
+#define  DUK_STRIDX_CURRENT                                            23                             /* 'current' */
+#define  DUK_STRIDX_RESUME                                             24                             /* 'resume' */
+#define  DUK_STRIDX_BASE64                                             25                             /* 'base64' */
+#define  DUK_STRIDX_HEX                                                26                             /* 'hex' */
+#define  DUK_STRIDX_DEC                                                27                             /* 'dec' */
+#define  DUK_STRIDX_ENC                                                28                             /* 'enc' */
+#define  DUK_STRIDX_GET_FINALIZER                                      29                             /* 'getFinalizer' */
+#define  DUK_STRIDX_SET_FINALIZER                                      30                             /* 'setFinalizer' */
+#define  DUK_STRIDX_GC                                                 31                             /* 'gc' */
+#define  DUK_STRIDX_REFC                                               32                             /* 'refc' */
+#define  DUK_STRIDX_ADDR                                               33                             /* 'addr' */
+#define  DUK_STRIDX_BUILD                                              34                             /* 'build' */
+#define  DUK_STRIDX_VERSION                                            35                             /* 'version' */
+#define  DUK_STRIDX_DUK                                                36                             /* '__duk__' */
+#define  DUK_STRIDX_COMPILE                                            37                             /* 'compile' */
+#define  DUK_STRIDX_INT_REGBASE                                        38                             /* '\x00regbase' */
+#define  DUK_STRIDX_INT_THREAD                                         39                             /* '\x00thread' */
+#define  DUK_STRIDX_INT_FINALIZER                                      40                             /* '\x00finalizer' */
+#define  DUK_STRIDX_INT_METATABLE                                      41                             /* '\x00metatable' */
+#define  DUK_STRIDX_INT_CALLEE                                         42                             /* '\x00callee' */
+#define  DUK_STRIDX_INT_MAP                                            43                             /* '\x00map' */
+#define  DUK_STRIDX_INT_ARGS                                           44                             /* '\x00args' */
+#define  DUK_STRIDX_INT_THIS                                           45                             /* '\x00this' */
+#define  DUK_STRIDX_INT_PC2LINE                                        46                             /* '\x00pc2line' */
+#define  DUK_STRIDX_INT_SOURCE                                         47                             /* '\x00source' */
+#define  DUK_STRIDX_INT_VARENV                                         48                             /* '\x00varenv' */
+#define  DUK_STRIDX_INT_LEXENV                                         49                             /* '\x00lexenv' */
+#define  DUK_STRIDX_INT_VARMAP                                         50                             /* '\x00varmap' */
+#define  DUK_STRIDX_INT_FORMALS                                        51                             /* '\x00formals' */
+#define  DUK_STRIDX_INT_BYTECODE                                       52                             /* '\x00bytecode' */
+#define  DUK_STRIDX_INT_NEXT                                           53                             /* '\x00next' */
+#define  DUK_STRIDX_INT_TARGET                                         54                             /* '\x00target' */
+#define  DUK_STRIDX_INT_VALUE                                          55                             /* '\x00value' */
+#define  DUK_STRIDX_LC_POINTER                                         56                             /* 'pointer' */
+#define  DUK_STRIDX_LC_BUFFER                                          57                             /* 'buffer' */
+#define  DUK_STRIDX_TRACEDATA                                          58                             /* 'tracedata' */
+#define  DUK_STRIDX_LINE_NUMBER                                        59                             /* 'lineNumber' */
+#define  DUK_STRIDX_FILE_NAME                                          60                             /* 'fileName' */
+#define  DUK_STRIDX_PC                                                 61                             /* 'pc' */
+#define  DUK_STRIDX_STACK                                              62                             /* 'stack' */
+#define  DUK_STRIDX_THROW_TYPE_ERROR                                   63                             /* 'ThrowTypeError' */
+#define  DUK_STRIDX_CALLEE                                             64                             /* 'callee' */
+#define  DUK_STRIDX_INVALID_DATE                                       65                             /* 'Invalid Date' */
+#define  DUK_STRIDX_BRACKETED_ELLIPSIS                                 66                             /* '[...]' */
+#define  DUK_STRIDX_NEWLINE_TAB                                        67                             /* '\n\t' */
+#define  DUK_STRIDX_SPACE                                              68                             /* ' ' */
+#define  DUK_STRIDX_COMMA                                              69                             /* ',' */
+#define  DUK_STRIDX_MINUS_ZERO                                         70                             /* '-0' */
+#define  DUK_STRIDX_PLUS_ZERO                                          71                             /* '+0' */
+#define  DUK_STRIDX_ZERO                                               72                             /* '0' */
+#define  DUK_STRIDX_MINUS_INFINITY                                     73                             /* '-Infinity' */
+#define  DUK_STRIDX_PLUS_INFINITY                                      74                             /* '+Infinity' */
+#define  DUK_STRIDX_INFINITY                                           75                             /* 'Infinity' */
+#define  DUK_STRIDX_LC_OBJECT                                          76                             /* 'object' */
+#define  DUK_STRIDX_LC_STRING                                          77                             /* 'string' */
+#define  DUK_STRIDX_LC_NUMBER                                          78                             /* 'number' */
+#define  DUK_STRIDX_LC_BOOLEAN                                         79                             /* 'boolean' */
+#define  DUK_STRIDX_UNDEFINED                                          80                             /* 'undefined' */
+#define  DUK_STRIDX_STRINGIFY                                          81                             /* 'stringify' */
+#define  DUK_STRIDX_TAN                                                82                             /* 'tan' */
+#define  DUK_STRIDX_SQRT                                               83                             /* 'sqrt' */
+#define  DUK_STRIDX_SIN                                                84                             /* 'sin' */
+#define  DUK_STRIDX_ROUND                                              85                             /* 'round' */
+#define  DUK_STRIDX_RANDOM                                             86                             /* 'random' */
+#define  DUK_STRIDX_POW                                                87                             /* 'pow' */
+#define  DUK_STRIDX_MIN                                                88                             /* 'min' */
+#define  DUK_STRIDX_MAX                                                89                             /* 'max' */
+#define  DUK_STRIDX_LOG                                                90                             /* 'log' */
+#define  DUK_STRIDX_FLOOR                                              91                             /* 'floor' */
+#define  DUK_STRIDX_EXP                                                92                             /* 'exp' */
+#define  DUK_STRIDX_COS                                                93                             /* 'cos' */
+#define  DUK_STRIDX_CEIL                                               94                             /* 'ceil' */
+#define  DUK_STRIDX_ATAN2                                              95                             /* 'atan2' */
+#define  DUK_STRIDX_ATAN                                               96                             /* 'atan' */
+#define  DUK_STRIDX_ASIN                                               97                             /* 'asin' */
+#define  DUK_STRIDX_ACOS                                               98                             /* 'acos' */
+#define  DUK_STRIDX_ABS                                                99                             /* 'abs' */
+#define  DUK_STRIDX_SQRT2                                              100                            /* 'SQRT2' */
+#define  DUK_STRIDX_SQRT1_2                                            101                            /* 'SQRT1_2' */
+#define  DUK_STRIDX_PI                                                 102                            /* 'PI' */
+#define  DUK_STRIDX_LOG10E                                             103                            /* 'LOG10E' */
+#define  DUK_STRIDX_LOG2E                                              104                            /* 'LOG2E' */
+#define  DUK_STRIDX_LN2                                                105                            /* 'LN2' */
+#define  DUK_STRIDX_LN10                                               106                            /* 'LN10' */
+#define  DUK_STRIDX_E                                                  107                            /* 'E' */
+#define  DUK_STRIDX_MESSAGE                                            108                            /* 'message' */
+#define  DUK_STRIDX_NAME                                               109                            /* 'name' */
+#define  DUK_STRIDX_INPUT                                              110                            /* 'input' */
+#define  DUK_STRIDX_INDEX                                              111                            /* 'index' */
+#define  DUK_STRIDX_ESCAPED_EMPTY_REGEXP                               112                            /* '(?:)' */
+#define  DUK_STRIDX_LAST_INDEX                                         113                            /* 'lastIndex' */
+#define  DUK_STRIDX_MULTILINE                                          114                            /* 'multiline' */
+#define  DUK_STRIDX_IGNORE_CASE                                        115                            /* 'ignoreCase' */
+#define  DUK_STRIDX_SOURCE                                             116                            /* 'source' */
+#define  DUK_STRIDX_TEST                                               117                            /* 'test' */
+#define  DUK_STRIDX_EXEC                                               118                            /* 'exec' */
+#define  DUK_STRIDX_TO_GMT_STRING                                      119                            /* 'toGMTString' */
+#define  DUK_STRIDX_SET_YEAR                                           120                            /* 'setYear' */
+#define  DUK_STRIDX_GET_YEAR                                           121                            /* 'getYear' */
+#define  DUK_STRIDX_TO_JSON                                            122                            /* 'toJSON' */
+#define  DUK_STRIDX_TO_ISO_STRING                                      123                            /* 'toISOString' */
+#define  DUK_STRIDX_TO_UTC_STRING                                      124                            /* 'toUTCString' */
+#define  DUK_STRIDX_SET_UTC_FULL_YEAR                                  125                            /* 'setUTCFullYear' */
+#define  DUK_STRIDX_SET_FULL_YEAR                                      126                            /* 'setFullYear' */
+#define  DUK_STRIDX_SET_UTC_MONTH                                      127                            /* 'setUTCMonth' */
+#define  DUK_STRIDX_SET_MONTH                                          128                            /* 'setMonth' */
+#define  DUK_STRIDX_SET_UTC_DATE                                       129                            /* 'setUTCDate' */
+#define  DUK_STRIDX_SET_DATE                                           130                            /* 'setDate' */
+#define  DUK_STRIDX_SET_UTC_HOURS                                      131                            /* 'setUTCHours' */
+#define  DUK_STRIDX_SET_HOURS                                          132                            /* 'setHours' */
+#define  DUK_STRIDX_SET_UTC_MINUTES                                    133                            /* 'setUTCMinutes' */
+#define  DUK_STRIDX_SET_MINUTES                                        134                            /* 'setMinutes' */
+#define  DUK_STRIDX_SET_UTC_SECONDS                                    135                            /* 'setUTCSeconds' */
+#define  DUK_STRIDX_SET_SECONDS                                        136                            /* 'setSeconds' */
+#define  DUK_STRIDX_SET_UTC_MILLISECONDS                               137                            /* 'setUTCMilliseconds' */
+#define  DUK_STRIDX_SET_MILLISECONDS                                   138                            /* 'setMilliseconds' */
+#define  DUK_STRIDX_SET_TIME                                           139                            /* 'setTime' */
+#define  DUK_STRIDX_GET_TIMEZONE_OFFSET                                140                            /* 'getTimezoneOffset' */
+#define  DUK_STRIDX_GET_UTC_MILLISECONDS                               141                            /* 'getUTCMilliseconds' */
+#define  DUK_STRIDX_GET_MILLISECONDS                                   142                            /* 'getMilliseconds' */
+#define  DUK_STRIDX_GET_UTC_SECONDS                                    143                            /* 'getUTCSeconds' */
+#define  DUK_STRIDX_GET_SECONDS                                        144                            /* 'getSeconds' */
+#define  DUK_STRIDX_GET_UTC_MINUTES                                    145                            /* 'getUTCMinutes' */
+#define  DUK_STRIDX_GET_MINUTES                                        146                            /* 'getMinutes' */
+#define  DUK_STRIDX_GET_UTC_HOURS                                      147                            /* 'getUTCHours' */
+#define  DUK_STRIDX_GET_HOURS                                          148                            /* 'getHours' */
+#define  DUK_STRIDX_GET_UTC_DAY                                        149                            /* 'getUTCDay' */
+#define  DUK_STRIDX_GET_DAY                                            150                            /* 'getDay' */
+#define  DUK_STRIDX_GET_UTC_DATE                                       151                            /* 'getUTCDate' */
+#define  DUK_STRIDX_GET_DATE                                           152                            /* 'getDate' */
+#define  DUK_STRIDX_GET_UTC_MONTH                                      153                            /* 'getUTCMonth' */
+#define  DUK_STRIDX_GET_MONTH                                          154                            /* 'getMonth' */
+#define  DUK_STRIDX_GET_UTC_FULL_YEAR                                  155                            /* 'getUTCFullYear' */
+#define  DUK_STRIDX_GET_FULL_YEAR                                      156                            /* 'getFullYear' */
+#define  DUK_STRIDX_GET_TIME                                           157                            /* 'getTime' */
+#define  DUK_STRIDX_TO_LOCALE_TIME_STRING                              158                            /* 'toLocaleTimeString' */
+#define  DUK_STRIDX_TO_LOCALE_DATE_STRING                              159                            /* 'toLocaleDateString' */
+#define  DUK_STRIDX_TO_TIME_STRING                                     160                            /* 'toTimeString' */
+#define  DUK_STRIDX_TO_DATE_STRING                                     161                            /* 'toDateString' */
+#define  DUK_STRIDX_NOW                                                162                            /* 'now' */
+#define  DUK_STRIDX_UTC                                                163                            /* 'UTC' */
+#define  DUK_STRIDX_PARSE                                              164                            /* 'parse' */
+#define  DUK_STRIDX_TO_PRECISION                                       165                            /* 'toPrecision' */
+#define  DUK_STRIDX_TO_EXPONENTIAL                                     166                            /* 'toExponential' */
+#define  DUK_STRIDX_TO_FIXED                                           167                            /* 'toFixed' */
+#define  DUK_STRIDX_POSITIVE_INFINITY                                  168                            /* 'POSITIVE_INFINITY' */
+#define  DUK_STRIDX_NEGATIVE_INFINITY                                  169                            /* 'NEGATIVE_INFINITY' */
+#define  DUK_STRIDX_NAN                                                170                            /* 'NaN' */
+#define  DUK_STRIDX_MIN_VALUE                                          171                            /* 'MIN_VALUE' */
+#define  DUK_STRIDX_MAX_VALUE                                          172                            /* 'MAX_VALUE' */
+#define  DUK_STRIDX_SUBSTR                                             173                            /* 'substr' */
+#define  DUK_STRIDX_TRIM                                               174                            /* 'trim' */
+#define  DUK_STRIDX_TO_LOCALE_UPPER_CASE                               175                            /* 'toLocaleUpperCase' */
+#define  DUK_STRIDX_TO_UPPER_CASE                                      176                            /* 'toUpperCase' */
+#define  DUK_STRIDX_TO_LOCALE_LOWER_CASE                               177                            /* 'toLocaleLowerCase' */
+#define  DUK_STRIDX_TO_LOWER_CASE                                      178                            /* 'toLowerCase' */
+#define  DUK_STRIDX_SUBSTRING                                          179                            /* 'substring' */
+#define  DUK_STRIDX_SPLIT                                              180                            /* 'split' */
+#define  DUK_STRIDX_SEARCH                                             181                            /* 'search' */
+#define  DUK_STRIDX_REPLACE                                            182                            /* 'replace' */
+#define  DUK_STRIDX_MATCH                                              183                            /* 'match' */
+#define  DUK_STRIDX_LOCALE_COMPARE                                     184                            /* 'localeCompare' */
+#define  DUK_STRIDX_CHAR_CODE_AT                                       185                            /* 'charCodeAt' */
+#define  DUK_STRIDX_CHAR_AT                                            186                            /* 'charAt' */
+#define  DUK_STRIDX_FROM_CHAR_CODE                                     187                            /* 'fromCharCode' */
+#define  DUK_STRIDX_REDUCE_RIGHT                                       188                            /* 'reduceRight' */
+#define  DUK_STRIDX_REDUCE                                             189                            /* 'reduce' */
+#define  DUK_STRIDX_FILTER                                             190                            /* 'filter' */
+#define  DUK_STRIDX_MAP                                                191                            /* 'map' */
+#define  DUK_STRIDX_FOR_EACH                                           192                            /* 'forEach' */
+#define  DUK_STRIDX_SOME                                               193                            /* 'some' */
+#define  DUK_STRIDX_EVERY                                              194                            /* 'every' */
+#define  DUK_STRIDX_LAST_INDEX_OF                                      195                            /* 'lastIndexOf' */
+#define  DUK_STRIDX_INDEX_OF                                           196                            /* 'indexOf' */
+#define  DUK_STRIDX_UNSHIFT                                            197                            /* 'unshift' */
+#define  DUK_STRIDX_SPLICE                                             198                            /* 'splice' */
+#define  DUK_STRIDX_SORT                                               199                            /* 'sort' */
+#define  DUK_STRIDX_SLICE                                              200                            /* 'slice' */
+#define  DUK_STRIDX_SHIFT                                              201                            /* 'shift' */
+#define  DUK_STRIDX_REVERSE                                            202                            /* 'reverse' */
+#define  DUK_STRIDX_PUSH                                               203                            /* 'push' */
+#define  DUK_STRIDX_POP                                                204                            /* 'pop' */
+#define  DUK_STRIDX_JOIN                                               205                            /* 'join' */
+#define  DUK_STRIDX_CONCAT                                             206                            /* 'concat' */
+#define  DUK_STRIDX_IS_ARRAY                                           207                            /* 'isArray' */
+#define  DUK_STRIDX_LC_ARGUMENTS                                       208                            /* 'arguments' */
+#define  DUK_STRIDX_CALLER                                             209                            /* 'caller' */
+#define  DUK_STRIDX_BIND                                               210                            /* 'bind' */
+#define  DUK_STRIDX_CALL                                               211                            /* 'call' */
+#define  DUK_STRIDX_APPLY                                              212                            /* 'apply' */
+#define  DUK_STRIDX_PROPERTY_IS_ENUMERABLE                             213                            /* 'propertyIsEnumerable' */
+#define  DUK_STRIDX_IS_PROTOTYPE_OF                                    214                            /* 'isPrototypeOf' */
+#define  DUK_STRIDX_HAS_OWN_PROPERTY                                   215                            /* 'hasOwnProperty' */
+#define  DUK_STRIDX_VALUE_OF                                           216                            /* 'valueOf' */
+#define  DUK_STRIDX_TO_LOCALE_STRING                                   217                            /* 'toLocaleString' */
+#define  DUK_STRIDX_TO_STRING                                          218                            /* 'toString' */
+#define  DUK_STRIDX_CONSTRUCTOR                                        219                            /* 'constructor' */
+#define  DUK_STRIDX_ENUMERABLE                                         220                            /* 'enumerable' */
+#define  DUK_STRIDX_CONFIGURABLE                                       221                            /* 'configurable' */
+#define  DUK_STRIDX_WRITABLE                                           222                            /* 'writable' */
+#define  DUK_STRIDX_VALUE                                              223                            /* 'value' */
+#define  DUK_STRIDX_KEYS                                               224                            /* 'keys' */
+#define  DUK_STRIDX_IS_EXTENSIBLE                                      225                            /* 'isExtensible' */
+#define  DUK_STRIDX_IS_FROZEN                                          226                            /* 'isFrozen' */
+#define  DUK_STRIDX_IS_SEALED                                          227                            /* 'isSealed' */
+#define  DUK_STRIDX_PREVENT_EXTENSIONS                                 228                            /* 'preventExtensions' */
+#define  DUK_STRIDX_FREEZE                                             229                            /* 'freeze' */
+#define  DUK_STRIDX_SEAL                                               230                            /* 'seal' */
+#define  DUK_STRIDX_DEFINE_PROPERTIES                                  231                            /* 'defineProperties' */
+#define  DUK_STRIDX_DEFINE_PROPERTY                                    232                            /* 'defineProperty' */
+#define  DUK_STRIDX_CREATE                                             233                            /* 'create' */
+#define  DUK_STRIDX_GET_OWN_PROPERTY_NAMES                             234                            /* 'getOwnPropertyNames' */
+#define  DUK_STRIDX_GET_OWN_PROPERTY_DESCRIPTOR                        235                            /* 'getOwnPropertyDescriptor' */
+#define  DUK_STRIDX_GET_PROTOTYPE_OF                                   236                            /* 'getPrototypeOf' */
+#define  DUK_STRIDX_PROTOTYPE                                          237                            /* 'prototype' */
+#define  DUK_STRIDX_LENGTH                                             238                            /* 'length' */
+#define  DUK_STRIDX_ALERT                                              239                            /* 'alert' */
+#define  DUK_STRIDX_PRINT                                              240                            /* 'print' */
+#define  DUK_STRIDX_UNESCAPE                                           241                            /* 'unescape' */
+#define  DUK_STRIDX_ESCAPE                                             242                            /* 'escape' */
+#define  DUK_STRIDX_ENCODE_URI_COMPONENT                               243                            /* 'encodeURIComponent' */
+#define  DUK_STRIDX_ENCODE_URI                                         244                            /* 'encodeURI' */
+#define  DUK_STRIDX_DECODE_URI_COMPONENT                               245                            /* 'decodeURIComponent' */
+#define  DUK_STRIDX_DECODE_URI                                         246                            /* 'decodeURI' */
+#define  DUK_STRIDX_IS_FINITE                                          247                            /* 'isFinite' */
+#define  DUK_STRIDX_IS_NAN                                             248                            /* 'isNaN' */
+#define  DUK_STRIDX_PARSE_FLOAT                                        249                            /* 'parseFloat' */
+#define  DUK_STRIDX_PARSE_INT                                          250                            /* 'parseInt' */
+#define  DUK_STRIDX_EVAL                                               251                            /* 'eval' */
+#define  DUK_STRIDX_URI_ERROR                                          252                            /* 'URIError' */
+#define  DUK_STRIDX_TYPE_ERROR                                         253                            /* 'TypeError' */
+#define  DUK_STRIDX_SYNTAX_ERROR                                       254                            /* 'SyntaxError' */
+#define  DUK_STRIDX_REFERENCE_ERROR                                    255                            /* 'ReferenceError' */
+#define  DUK_STRIDX_RANGE_ERROR                                        256                            /* 'RangeError' */
+#define  DUK_STRIDX_EVAL_ERROR                                         257                            /* 'EvalError' */
+#define  DUK_STRIDX_BREAK                                              258                            /* 'break' */
+#define  DUK_STRIDX_CASE                                               259                            /* 'case' */
+#define  DUK_STRIDX_CATCH                                              260                            /* 'catch' */
+#define  DUK_STRIDX_CONTINUE                                           261                            /* 'continue' */
+#define  DUK_STRIDX_DEBUGGER                                           262                            /* 'debugger' */
+#define  DUK_STRIDX_DEFAULT                                            263                            /* 'default' */
+#define  DUK_STRIDX_DELETE                                             264                            /* 'delete' */
+#define  DUK_STRIDX_DO                                                 265                            /* 'do' */
+#define  DUK_STRIDX_ELSE                                               266                            /* 'else' */
+#define  DUK_STRIDX_FINALLY                                            267                            /* 'finally' */
+#define  DUK_STRIDX_FOR                                                268                            /* 'for' */
+#define  DUK_STRIDX_LC_FUNCTION                                        269                            /* 'function' */
+#define  DUK_STRIDX_IF                                                 270                            /* 'if' */
+#define  DUK_STRIDX_IN                                                 271                            /* 'in' */
+#define  DUK_STRIDX_INSTANCEOF                                         272                            /* 'instanceof' */
+#define  DUK_STRIDX_NEW                                                273                            /* 'new' */
+#define  DUK_STRIDX_RETURN                                             274                            /* 'return' */
+#define  DUK_STRIDX_SWITCH                                             275                            /* 'switch' */
+#define  DUK_STRIDX_THIS                                               276                            /* 'this' */
+#define  DUK_STRIDX_THROW                                              277                            /* 'throw' */
+#define  DUK_STRIDX_TRY                                                278                            /* 'try' */
+#define  DUK_STRIDX_TYPEOF                                             279                            /* 'typeof' */
+#define  DUK_STRIDX_VAR                                                280                            /* 'var' */
+#define  DUK_STRIDX_VOID                                               281                            /* 'void' */
+#define  DUK_STRIDX_WHILE                                              282                            /* 'while' */
+#define  DUK_STRIDX_WITH                                               283                            /* 'with' */
+#define  DUK_STRIDX_CLASS                                              284                            /* 'class' */
+#define  DUK_STRIDX_CONST                                              285                            /* 'const' */
+#define  DUK_STRIDX_ENUM                                               286                            /* 'enum' */
+#define  DUK_STRIDX_EXPORT                                             287                            /* 'export' */
+#define  DUK_STRIDX_EXTENDS                                            288                            /* 'extends' */
+#define  DUK_STRIDX_IMPORT                                             289                            /* 'import' */
+#define  DUK_STRIDX_SUPER                                              290                            /* 'super' */
+#define  DUK_STRIDX_NULL                                               291                            /* 'null' */
+#define  DUK_STRIDX_TRUE                                               292                            /* 'true' */
+#define  DUK_STRIDX_FALSE                                              293                            /* 'false' */
+#define  DUK_STRIDX_GET                                                294                            /* 'get' */
+#define  DUK_STRIDX_SET                                                295                            /* 'set' */
+#define  DUK_STRIDX_IMPLEMENTS                                         296                            /* 'implements' */
+#define  DUK_STRIDX_INTERFACE                                          297                            /* 'interface' */
+#define  DUK_STRIDX_LET                                                298                            /* 'let' */
+#define  DUK_STRIDX_PACKAGE                                            299                            /* 'package' */
+#define  DUK_STRIDX_PRIVATE                                            300                            /* 'private' */
+#define  DUK_STRIDX_PROTECTED                                          301                            /* 'protected' */
+#define  DUK_STRIDX_PUBLIC                                             302                            /* 'public' */
+#define  DUK_STRIDX_STATIC                                             303                            /* 'static' */
+#define  DUK_STRIDX_YIELD                                              304                            /* 'yield' */
 
+#define  DUK_HEAP_STRING_UC_THREAD(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_THREAD)
+#define  DUK_HTHREAD_STRING_UC_THREAD(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_THREAD)
+#define  DUK_HEAP_STRING_UC_POINTER(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_POINTER)
+#define  DUK_HTHREAD_STRING_UC_POINTER(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_POINTER)
+#define  DUK_HEAP_STRING_UC_BUFFER(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_BUFFER)
+#define  DUK_HTHREAD_STRING_UC_BUFFER(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_BUFFER)
+#define  DUK_HEAP_STRING_DEC_ENV(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEC_ENV)
+#define  DUK_HTHREAD_STRING_DEC_ENV(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEC_ENV)
+#define  DUK_HEAP_STRING_OBJ_ENV(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_OBJ_ENV)
+#define  DUK_HTHREAD_STRING_OBJ_ENV(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_OBJ_ENV)
 #define  DUK_HEAP_STRING_EMPTY_STRING(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EMPTY_STRING)
 #define  DUK_HTHREAD_STRING_EMPTY_STRING(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EMPTY_STRING)
 #define  DUK_HEAP_STRING_GLOBAL(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GLOBAL)
@@ -1289,8 +1482,10 @@ extern char duk_strings_data[];
 #define  DUK_HTHREAD_STRING_JSON_EXT_NAN(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JSON_EXT_NAN)
 #define  DUK_HEAP_STRING_JSON_EXT_UNDEFINED(heap)                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JSON_EXT_UNDEFINED)
 #define  DUK_HTHREAD_STRING_JSON_EXT_UNDEFINED(thr)                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JSON_EXT_UNDEFINED)
-#define  DUK_HEAP_STRING_SLEEP(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SLEEP)
-#define  DUK_HTHREAD_STRING_SLEEP(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SLEEP)
+#define  DUK_HEAP_STRING_CURRENT(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CURRENT)
+#define  DUK_HTHREAD_STRING_CURRENT(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CURRENT)
+#define  DUK_HEAP_STRING_RESUME(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_RESUME)
+#define  DUK_HTHREAD_STRING_RESUME(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_RESUME)
 #define  DUK_HEAP_STRING_BASE64(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BASE64)
 #define  DUK_HTHREAD_STRING_BASE64(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BASE64)
 #define  DUK_HEAP_STRING_HEX(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_HEX)
@@ -1303,16 +1498,8 @@ extern char duk_strings_data[];
 #define  DUK_HTHREAD_STRING_GET_FINALIZER(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_FINALIZER)
 #define  DUK_HEAP_STRING_SET_FINALIZER(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_FINALIZER)
 #define  DUK_HTHREAD_STRING_SET_FINALIZER(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_FINALIZER)
-#define  DUK_HEAP_STRING_TIME(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TIME)
-#define  DUK_HTHREAD_STRING_TIME(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TIME)
 #define  DUK_HEAP_STRING_GC(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GC)
 #define  DUK_HTHREAD_STRING_GC(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GC)
-#define  DUK_HEAP_STRING_CURR(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CURR)
-#define  DUK_HTHREAD_STRING_CURR(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CURR)
-#define  DUK_HEAP_STRING_RESUME(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_RESUME)
-#define  DUK_HTHREAD_STRING_RESUME(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_RESUME)
-#define  DUK_HEAP_STRING_SPAWN(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SPAWN)
-#define  DUK_HTHREAD_STRING_SPAWN(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SPAWN)
 #define  DUK_HEAP_STRING_REFC(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REFC)
 #define  DUK_HTHREAD_STRING_REFC(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REFC)
 #define  DUK_HEAP_STRING_ADDR(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ADDR)
@@ -1323,6 +1510,8 @@ extern char duk_strings_data[];
 #define  DUK_HTHREAD_STRING_VERSION(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_VERSION)
 #define  DUK_HEAP_STRING_DUK(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DUK)
 #define  DUK_HTHREAD_STRING_DUK(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DUK)
+#define  DUK_HEAP_STRING_COMPILE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_COMPILE)
+#define  DUK_HTHREAD_STRING_COMPILE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_COMPILE)
 #define  DUK_HEAP_STRING_INT_REGBASE(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_REGBASE)
 #define  DUK_HTHREAD_STRING_INT_REGBASE(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_REGBASE)
 #define  DUK_HEAP_STRING_INT_THREAD(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_THREAD)
@@ -1339,8 +1528,6 @@ extern char duk_strings_data[];
 #define  DUK_HTHREAD_STRING_INT_ARGS(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_ARGS)
 #define  DUK_HEAP_STRING_INT_THIS(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_THIS)
 #define  DUK_HTHREAD_STRING_INT_THIS(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_THIS)
-#define  DUK_HEAP_STRING_INT_FILENAME(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_FILENAME)
-#define  DUK_HTHREAD_STRING_INT_FILENAME(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_FILENAME)
 #define  DUK_HEAP_STRING_INT_PC2LINE(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_PC2LINE)
 #define  DUK_HTHREAD_STRING_INT_PC2LINE(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_PC2LINE)
 #define  DUK_HEAP_STRING_INT_SOURCE(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_SOURCE)
@@ -1361,32 +1548,30 @@ extern char duk_strings_data[];
 #define  DUK_HTHREAD_STRING_INT_TARGET(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_TARGET)
 #define  DUK_HEAP_STRING_INT_VALUE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_VALUE)
 #define  DUK_HTHREAD_STRING_INT_VALUE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_VALUE)
-#define  DUK_HEAP_STRING_POINTER(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_POINTER)
-#define  DUK_HTHREAD_STRING_POINTER(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_POINTER)
-#define  DUK_HEAP_STRING_BUFFER(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BUFFER)
-#define  DUK_HTHREAD_STRING_BUFFER(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BUFFER)
-#define  DUK_HEAP_STRING_TRUNC(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TRUNC)
-#define  DUK_HTHREAD_STRING_TRUNC(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TRUNC)
-#define  DUK_HEAP_STRING_TRACEBACK(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TRACEBACK)
-#define  DUK_HTHREAD_STRING_TRACEBACK(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TRACEBACK)
-#define  DUK_HEAP_STRING_CAUSE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CAUSE)
-#define  DUK_HTHREAD_STRING_CAUSE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CAUSE)
-#define  DUK_HEAP_STRING_CODE(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CODE)
-#define  DUK_HTHREAD_STRING_CODE(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CODE)
-#define  DUK_HEAP_STRING_IS_NATIVE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_NATIVE)
-#define  DUK_HTHREAD_STRING_IS_NATIVE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_NATIVE)
+#define  DUK_HEAP_STRING_LC_POINTER(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_POINTER)
+#define  DUK_HTHREAD_STRING_LC_POINTER(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_POINTER)
+#define  DUK_HEAP_STRING_LC_BUFFER(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_BUFFER)
+#define  DUK_HTHREAD_STRING_LC_BUFFER(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_BUFFER)
+#define  DUK_HEAP_STRING_TRACEDATA(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TRACEDATA)
+#define  DUK_HTHREAD_STRING_TRACEDATA(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TRACEDATA)
 #define  DUK_HEAP_STRING_LINE_NUMBER(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LINE_NUMBER)
 #define  DUK_HTHREAD_STRING_LINE_NUMBER(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LINE_NUMBER)
 #define  DUK_HEAP_STRING_FILE_NAME(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FILE_NAME)
 #define  DUK_HTHREAD_STRING_FILE_NAME(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FILE_NAME)
 #define  DUK_HEAP_STRING_PC(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PC)
 #define  DUK_HTHREAD_STRING_PC(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PC)
+#define  DUK_HEAP_STRING_STACK(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_STACK)
+#define  DUK_HTHREAD_STRING_STACK(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_STACK)
 #define  DUK_HEAP_STRING_THROW_TYPE_ERROR(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_THROW_TYPE_ERROR)
 #define  DUK_HTHREAD_STRING_THROW_TYPE_ERROR(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_THROW_TYPE_ERROR)
 #define  DUK_HEAP_STRING_CALLEE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CALLEE)
 #define  DUK_HTHREAD_STRING_CALLEE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CALLEE)
 #define  DUK_HEAP_STRING_INVALID_DATE(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INVALID_DATE)
 #define  DUK_HTHREAD_STRING_INVALID_DATE(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INVALID_DATE)
+#define  DUK_HEAP_STRING_BRACKETED_ELLIPSIS(heap)                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BRACKETED_ELLIPSIS)
+#define  DUK_HTHREAD_STRING_BRACKETED_ELLIPSIS(thr)                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BRACKETED_ELLIPSIS)
+#define  DUK_HEAP_STRING_NEWLINE_TAB(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NEWLINE_TAB)
+#define  DUK_HTHREAD_STRING_NEWLINE_TAB(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NEWLINE_TAB)
 #define  DUK_HEAP_STRING_SPACE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SPACE)
 #define  DUK_HTHREAD_STRING_SPACE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SPACE)
 #define  DUK_HEAP_STRING_COMMA(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_COMMA)
@@ -1862,14 +2047,2223 @@ extern char duk_strings_data[];
 #define  DUK_HEAP_STRING_YIELD(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_YIELD)
 #define  DUK_HTHREAD_STRING_YIELD(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_YIELD)
 
-#define  DUK_HEAP_NUM_STRINGS                                          304
+#define  DUK_HEAP_NUM_STRINGS                                          305
 
-#define  DUK_STRIDX_START_RESERVED                                     257
-#define  DUK_STRIDX_START_STRICT_RESERVED                              295
-#define  DUK_STRIDX_END_RESERVED                                       304                            /* exclusive endpoint */
+#define  DUK_STRIDX_START_RESERVED                                     258
+#define  DUK_STRIDX_START_STRICT_RESERVED                              296
+#define  DUK_STRIDX_END_RESERVED                                       305                            /* exclusive endpoint */
 
-#endif  /* __DUK_STRINGS_H */
-#line 9 "duk_lexer.h"
+extern duk_c_function duk_builtin_native_functions[];
+
+extern char duk_builtins_data[];
+
+#define  DUK_BUILTINS_DATA_LENGTH                                      1228
+
+#define  DUK_BIDX_GLOBAL                                               0
+#define  DUK_BIDX_GLOBAL_ENV                                           1
+#define  DUK_BIDX_OBJECT_CONSTRUCTOR                                   2
+#define  DUK_BIDX_OBJECT_PROTOTYPE                                     3
+#define  DUK_BIDX_FUNCTION_CONSTRUCTOR                                 4
+#define  DUK_BIDX_FUNCTION_PROTOTYPE                                   5
+#define  DUK_BIDX_ARRAY_CONSTRUCTOR                                    6
+#define  DUK_BIDX_ARRAY_PROTOTYPE                                      7
+#define  DUK_BIDX_STRING_CONSTRUCTOR                                   8
+#define  DUK_BIDX_STRING_PROTOTYPE                                     9
+#define  DUK_BIDX_BOOLEAN_CONSTRUCTOR                                  10
+#define  DUK_BIDX_BOOLEAN_PROTOTYPE                                    11
+#define  DUK_BIDX_NUMBER_CONSTRUCTOR                                   12
+#define  DUK_BIDX_NUMBER_PROTOTYPE                                     13
+#define  DUK_BIDX_DATE_CONSTRUCTOR                                     14
+#define  DUK_BIDX_DATE_PROTOTYPE                                       15
+#define  DUK_BIDX_REGEXP_CONSTRUCTOR                                   16
+#define  DUK_BIDX_REGEXP_PROTOTYPE                                     17
+#define  DUK_BIDX_ERROR_CONSTRUCTOR                                    18
+#define  DUK_BIDX_ERROR_PROTOTYPE                                      19
+#define  DUK_BIDX_EVAL_ERROR_CONSTRUCTOR                               20
+#define  DUK_BIDX_EVAL_ERROR_PROTOTYPE                                 21
+#define  DUK_BIDX_RANGE_ERROR_CONSTRUCTOR                              22
+#define  DUK_BIDX_RANGE_ERROR_PROTOTYPE                                23
+#define  DUK_BIDX_REFERENCE_ERROR_CONSTRUCTOR                          24
+#define  DUK_BIDX_REFERENCE_ERROR_PROTOTYPE                            25
+#define  DUK_BIDX_SYNTAX_ERROR_CONSTRUCTOR                             26
+#define  DUK_BIDX_SYNTAX_ERROR_PROTOTYPE                               27
+#define  DUK_BIDX_TYPE_ERROR_CONSTRUCTOR                               28
+#define  DUK_BIDX_TYPE_ERROR_PROTOTYPE                                 29
+#define  DUK_BIDX_URI_ERROR_CONSTRUCTOR                                30
+#define  DUK_BIDX_URI_ERROR_PROTOTYPE                                  31
+#define  DUK_BIDX_MATH                                                 32
+#define  DUK_BIDX_JSON                                                 33
+#define  DUK_BIDX_TYPE_ERROR_THROWER                                   34
+#define  DUK_BIDX_DUK                                                  35
+#define  DUK_BIDX_THREAD_CONSTRUCTOR                                   36
+#define  DUK_BIDX_THREAD_PROTOTYPE                                     37
+#define  DUK_BIDX_BUFFER_CONSTRUCTOR                                   38
+#define  DUK_BIDX_BUFFER_PROTOTYPE                                     39
+#define  DUK_BIDX_POINTER_CONSTRUCTOR                                  40
+#define  DUK_BIDX_POINTER_PROTOTYPE                                    41
+#define  DUK_BIDX_DOUBLE_ERROR                                         42
+
+#define  DUK_NUM_BUILTINS                                              43
+
+#elif defined(DUK_USE_DOUBLE_BE)
+extern char duk_strings_data[];
+
+#define  DUK_STRDATA_DATA_LENGTH                                       1785
+#define  DUK_STRDATA_MAX_STRLEN                                        24
+
+#define  DUK_STRIDX_UC_THREAD                                          0                              /* 'Thread' */
+#define  DUK_STRIDX_UC_POINTER                                         1                              /* 'Pointer' */
+#define  DUK_STRIDX_UC_BUFFER                                          2                              /* 'Buffer' */
+#define  DUK_STRIDX_DEC_ENV                                            3                              /* 'DecEnv' */
+#define  DUK_STRIDX_OBJ_ENV                                            4                              /* 'ObjEnv' */
+#define  DUK_STRIDX_EMPTY_STRING                                       5                              /* '' */
+#define  DUK_STRIDX_GLOBAL                                             6                              /* 'global' */
+#define  DUK_STRIDX_UC_ARGUMENTS                                       7                              /* 'Arguments' */
+#define  DUK_STRIDX_JSON                                               8                              /* 'JSON' */
+#define  DUK_STRIDX_MATH                                               9                              /* 'Math' */
+#define  DUK_STRIDX_ERROR                                              10                             /* 'Error' */
+#define  DUK_STRIDX_REG_EXP                                            11                             /* 'RegExp' */
+#define  DUK_STRIDX_DATE                                               12                             /* 'Date' */
+#define  DUK_STRIDX_UC_NUMBER                                          13                             /* 'Number' */
+#define  DUK_STRIDX_UC_BOOLEAN                                         14                             /* 'Boolean' */
+#define  DUK_STRIDX_UC_STRING                                          15                             /* 'String' */
+#define  DUK_STRIDX_ARRAY                                              16                             /* 'Array' */
+#define  DUK_STRIDX_UC_FUNCTION                                        17                             /* 'Function' */
+#define  DUK_STRIDX_UC_OBJECT                                          18                             /* 'Object' */
+#define  DUK_STRIDX_JSON_EXT_NEGINF                                    19                             /* '{"_ninf":true}' */
+#define  DUK_STRIDX_JSON_EXT_POSINF                                    20                             /* '{"_inf":true}' */
+#define  DUK_STRIDX_JSON_EXT_NAN                                       21                             /* '{"_nan":true}' */
+#define  DUK_STRIDX_JSON_EXT_UNDEFINED                                 22                             /* '{"_undefined":true}' */
+#define  DUK_STRIDX_CURRENT                                            23                             /* 'current' */
+#define  DUK_STRIDX_RESUME                                             24                             /* 'resume' */
+#define  DUK_STRIDX_BASE64                                             25                             /* 'base64' */
+#define  DUK_STRIDX_HEX                                                26                             /* 'hex' */
+#define  DUK_STRIDX_DEC                                                27                             /* 'dec' */
+#define  DUK_STRIDX_ENC                                                28                             /* 'enc' */
+#define  DUK_STRIDX_GET_FINALIZER                                      29                             /* 'getFinalizer' */
+#define  DUK_STRIDX_SET_FINALIZER                                      30                             /* 'setFinalizer' */
+#define  DUK_STRIDX_GC                                                 31                             /* 'gc' */
+#define  DUK_STRIDX_REFC                                               32                             /* 'refc' */
+#define  DUK_STRIDX_ADDR                                               33                             /* 'addr' */
+#define  DUK_STRIDX_BUILD                                              34                             /* 'build' */
+#define  DUK_STRIDX_VERSION                                            35                             /* 'version' */
+#define  DUK_STRIDX_DUK                                                36                             /* '__duk__' */
+#define  DUK_STRIDX_COMPILE                                            37                             /* 'compile' */
+#define  DUK_STRIDX_INT_REGBASE                                        38                             /* '\x00regbase' */
+#define  DUK_STRIDX_INT_THREAD                                         39                             /* '\x00thread' */
+#define  DUK_STRIDX_INT_FINALIZER                                      40                             /* '\x00finalizer' */
+#define  DUK_STRIDX_INT_METATABLE                                      41                             /* '\x00metatable' */
+#define  DUK_STRIDX_INT_CALLEE                                         42                             /* '\x00callee' */
+#define  DUK_STRIDX_INT_MAP                                            43                             /* '\x00map' */
+#define  DUK_STRIDX_INT_ARGS                                           44                             /* '\x00args' */
+#define  DUK_STRIDX_INT_THIS                                           45                             /* '\x00this' */
+#define  DUK_STRIDX_INT_PC2LINE                                        46                             /* '\x00pc2line' */
+#define  DUK_STRIDX_INT_SOURCE                                         47                             /* '\x00source' */
+#define  DUK_STRIDX_INT_VARENV                                         48                             /* '\x00varenv' */
+#define  DUK_STRIDX_INT_LEXENV                                         49                             /* '\x00lexenv' */
+#define  DUK_STRIDX_INT_VARMAP                                         50                             /* '\x00varmap' */
+#define  DUK_STRIDX_INT_FORMALS                                        51                             /* '\x00formals' */
+#define  DUK_STRIDX_INT_BYTECODE                                       52                             /* '\x00bytecode' */
+#define  DUK_STRIDX_INT_NEXT                                           53                             /* '\x00next' */
+#define  DUK_STRIDX_INT_TARGET                                         54                             /* '\x00target' */
+#define  DUK_STRIDX_INT_VALUE                                          55                             /* '\x00value' */
+#define  DUK_STRIDX_LC_POINTER                                         56                             /* 'pointer' */
+#define  DUK_STRIDX_LC_BUFFER                                          57                             /* 'buffer' */
+#define  DUK_STRIDX_TRACEDATA                                          58                             /* 'tracedata' */
+#define  DUK_STRIDX_LINE_NUMBER                                        59                             /* 'lineNumber' */
+#define  DUK_STRIDX_FILE_NAME                                          60                             /* 'fileName' */
+#define  DUK_STRIDX_PC                                                 61                             /* 'pc' */
+#define  DUK_STRIDX_STACK                                              62                             /* 'stack' */
+#define  DUK_STRIDX_THROW_TYPE_ERROR                                   63                             /* 'ThrowTypeError' */
+#define  DUK_STRIDX_CALLEE                                             64                             /* 'callee' */
+#define  DUK_STRIDX_INVALID_DATE                                       65                             /* 'Invalid Date' */
+#define  DUK_STRIDX_BRACKETED_ELLIPSIS                                 66                             /* '[...]' */
+#define  DUK_STRIDX_NEWLINE_TAB                                        67                             /* '\n\t' */
+#define  DUK_STRIDX_SPACE                                              68                             /* ' ' */
+#define  DUK_STRIDX_COMMA                                              69                             /* ',' */
+#define  DUK_STRIDX_MINUS_ZERO                                         70                             /* '-0' */
+#define  DUK_STRIDX_PLUS_ZERO                                          71                             /* '+0' */
+#define  DUK_STRIDX_ZERO                                               72                             /* '0' */
+#define  DUK_STRIDX_MINUS_INFINITY                                     73                             /* '-Infinity' */
+#define  DUK_STRIDX_PLUS_INFINITY                                      74                             /* '+Infinity' */
+#define  DUK_STRIDX_INFINITY                                           75                             /* 'Infinity' */
+#define  DUK_STRIDX_LC_OBJECT                                          76                             /* 'object' */
+#define  DUK_STRIDX_LC_STRING                                          77                             /* 'string' */
+#define  DUK_STRIDX_LC_NUMBER                                          78                             /* 'number' */
+#define  DUK_STRIDX_LC_BOOLEAN                                         79                             /* 'boolean' */
+#define  DUK_STRIDX_UNDEFINED                                          80                             /* 'undefined' */
+#define  DUK_STRIDX_STRINGIFY                                          81                             /* 'stringify' */
+#define  DUK_STRIDX_TAN                                                82                             /* 'tan' */
+#define  DUK_STRIDX_SQRT                                               83                             /* 'sqrt' */
+#define  DUK_STRIDX_SIN                                                84                             /* 'sin' */
+#define  DUK_STRIDX_ROUND                                              85                             /* 'round' */
+#define  DUK_STRIDX_RANDOM                                             86                             /* 'random' */
+#define  DUK_STRIDX_POW                                                87                             /* 'pow' */
+#define  DUK_STRIDX_MIN                                                88                             /* 'min' */
+#define  DUK_STRIDX_MAX                                                89                             /* 'max' */
+#define  DUK_STRIDX_LOG                                                90                             /* 'log' */
+#define  DUK_STRIDX_FLOOR                                              91                             /* 'floor' */
+#define  DUK_STRIDX_EXP                                                92                             /* 'exp' */
+#define  DUK_STRIDX_COS                                                93                             /* 'cos' */
+#define  DUK_STRIDX_CEIL                                               94                             /* 'ceil' */
+#define  DUK_STRIDX_ATAN2                                              95                             /* 'atan2' */
+#define  DUK_STRIDX_ATAN                                               96                             /* 'atan' */
+#define  DUK_STRIDX_ASIN                                               97                             /* 'asin' */
+#define  DUK_STRIDX_ACOS                                               98                             /* 'acos' */
+#define  DUK_STRIDX_ABS                                                99                             /* 'abs' */
+#define  DUK_STRIDX_SQRT2                                              100                            /* 'SQRT2' */
+#define  DUK_STRIDX_SQRT1_2                                            101                            /* 'SQRT1_2' */
+#define  DUK_STRIDX_PI                                                 102                            /* 'PI' */
+#define  DUK_STRIDX_LOG10E                                             103                            /* 'LOG10E' */
+#define  DUK_STRIDX_LOG2E                                              104                            /* 'LOG2E' */
+#define  DUK_STRIDX_LN2                                                105                            /* 'LN2' */
+#define  DUK_STRIDX_LN10                                               106                            /* 'LN10' */
+#define  DUK_STRIDX_E                                                  107                            /* 'E' */
+#define  DUK_STRIDX_MESSAGE                                            108                            /* 'message' */
+#define  DUK_STRIDX_NAME                                               109                            /* 'name' */
+#define  DUK_STRIDX_INPUT                                              110                            /* 'input' */
+#define  DUK_STRIDX_INDEX                                              111                            /* 'index' */
+#define  DUK_STRIDX_ESCAPED_EMPTY_REGEXP                               112                            /* '(?:)' */
+#define  DUK_STRIDX_LAST_INDEX                                         113                            /* 'lastIndex' */
+#define  DUK_STRIDX_MULTILINE                                          114                            /* 'multiline' */
+#define  DUK_STRIDX_IGNORE_CASE                                        115                            /* 'ignoreCase' */
+#define  DUK_STRIDX_SOURCE                                             116                            /* 'source' */
+#define  DUK_STRIDX_TEST                                               117                            /* 'test' */
+#define  DUK_STRIDX_EXEC                                               118                            /* 'exec' */
+#define  DUK_STRIDX_TO_GMT_STRING                                      119                            /* 'toGMTString' */
+#define  DUK_STRIDX_SET_YEAR                                           120                            /* 'setYear' */
+#define  DUK_STRIDX_GET_YEAR                                           121                            /* 'getYear' */
+#define  DUK_STRIDX_TO_JSON                                            122                            /* 'toJSON' */
+#define  DUK_STRIDX_TO_ISO_STRING                                      123                            /* 'toISOString' */
+#define  DUK_STRIDX_TO_UTC_STRING                                      124                            /* 'toUTCString' */
+#define  DUK_STRIDX_SET_UTC_FULL_YEAR                                  125                            /* 'setUTCFullYear' */
+#define  DUK_STRIDX_SET_FULL_YEAR                                      126                            /* 'setFullYear' */
+#define  DUK_STRIDX_SET_UTC_MONTH                                      127                            /* 'setUTCMonth' */
+#define  DUK_STRIDX_SET_MONTH                                          128                            /* 'setMonth' */
+#define  DUK_STRIDX_SET_UTC_DATE                                       129                            /* 'setUTCDate' */
+#define  DUK_STRIDX_SET_DATE                                           130                            /* 'setDate' */
+#define  DUK_STRIDX_SET_UTC_HOURS                                      131                            /* 'setUTCHours' */
+#define  DUK_STRIDX_SET_HOURS                                          132                            /* 'setHours' */
+#define  DUK_STRIDX_SET_UTC_MINUTES                                    133                            /* 'setUTCMinutes' */
+#define  DUK_STRIDX_SET_MINUTES                                        134                            /* 'setMinutes' */
+#define  DUK_STRIDX_SET_UTC_SECONDS                                    135                            /* 'setUTCSeconds' */
+#define  DUK_STRIDX_SET_SECONDS                                        136                            /* 'setSeconds' */
+#define  DUK_STRIDX_SET_UTC_MILLISECONDS                               137                            /* 'setUTCMilliseconds' */
+#define  DUK_STRIDX_SET_MILLISECONDS                                   138                            /* 'setMilliseconds' */
+#define  DUK_STRIDX_SET_TIME                                           139                            /* 'setTime' */
+#define  DUK_STRIDX_GET_TIMEZONE_OFFSET                                140                            /* 'getTimezoneOffset' */
+#define  DUK_STRIDX_GET_UTC_MILLISECONDS                               141                            /* 'getUTCMilliseconds' */
+#define  DUK_STRIDX_GET_MILLISECONDS                                   142                            /* 'getMilliseconds' */
+#define  DUK_STRIDX_GET_UTC_SECONDS                                    143                            /* 'getUTCSeconds' */
+#define  DUK_STRIDX_GET_SECONDS                                        144                            /* 'getSeconds' */
+#define  DUK_STRIDX_GET_UTC_MINUTES                                    145                            /* 'getUTCMinutes' */
+#define  DUK_STRIDX_GET_MINUTES                                        146                            /* 'getMinutes' */
+#define  DUK_STRIDX_GET_UTC_HOURS                                      147                            /* 'getUTCHours' */
+#define  DUK_STRIDX_GET_HOURS                                          148                            /* 'getHours' */
+#define  DUK_STRIDX_GET_UTC_DAY                                        149                            /* 'getUTCDay' */
+#define  DUK_STRIDX_GET_DAY                                            150                            /* 'getDay' */
+#define  DUK_STRIDX_GET_UTC_DATE                                       151                            /* 'getUTCDate' */
+#define  DUK_STRIDX_GET_DATE                                           152                            /* 'getDate' */
+#define  DUK_STRIDX_GET_UTC_MONTH                                      153                            /* 'getUTCMonth' */
+#define  DUK_STRIDX_GET_MONTH                                          154                            /* 'getMonth' */
+#define  DUK_STRIDX_GET_UTC_FULL_YEAR                                  155                            /* 'getUTCFullYear' */
+#define  DUK_STRIDX_GET_FULL_YEAR                                      156                            /* 'getFullYear' */
+#define  DUK_STRIDX_GET_TIME                                           157                            /* 'getTime' */
+#define  DUK_STRIDX_TO_LOCALE_TIME_STRING                              158                            /* 'toLocaleTimeString' */
+#define  DUK_STRIDX_TO_LOCALE_DATE_STRING                              159                            /* 'toLocaleDateString' */
+#define  DUK_STRIDX_TO_TIME_STRING                                     160                            /* 'toTimeString' */
+#define  DUK_STRIDX_TO_DATE_STRING                                     161                            /* 'toDateString' */
+#define  DUK_STRIDX_NOW                                                162                            /* 'now' */
+#define  DUK_STRIDX_UTC                                                163                            /* 'UTC' */
+#define  DUK_STRIDX_PARSE                                              164                            /* 'parse' */
+#define  DUK_STRIDX_TO_PRECISION                                       165                            /* 'toPrecision' */
+#define  DUK_STRIDX_TO_EXPONENTIAL                                     166                            /* 'toExponential' */
+#define  DUK_STRIDX_TO_FIXED                                           167                            /* 'toFixed' */
+#define  DUK_STRIDX_POSITIVE_INFINITY                                  168                            /* 'POSITIVE_INFINITY' */
+#define  DUK_STRIDX_NEGATIVE_INFINITY                                  169                            /* 'NEGATIVE_INFINITY' */
+#define  DUK_STRIDX_NAN                                                170                            /* 'NaN' */
+#define  DUK_STRIDX_MIN_VALUE                                          171                            /* 'MIN_VALUE' */
+#define  DUK_STRIDX_MAX_VALUE                                          172                            /* 'MAX_VALUE' */
+#define  DUK_STRIDX_SUBSTR                                             173                            /* 'substr' */
+#define  DUK_STRIDX_TRIM                                               174                            /* 'trim' */
+#define  DUK_STRIDX_TO_LOCALE_UPPER_CASE                               175                            /* 'toLocaleUpperCase' */
+#define  DUK_STRIDX_TO_UPPER_CASE                                      176                            /* 'toUpperCase' */
+#define  DUK_STRIDX_TO_LOCALE_LOWER_CASE                               177                            /* 'toLocaleLowerCase' */
+#define  DUK_STRIDX_TO_LOWER_CASE                                      178                            /* 'toLowerCase' */
+#define  DUK_STRIDX_SUBSTRING                                          179                            /* 'substring' */
+#define  DUK_STRIDX_SPLIT                                              180                            /* 'split' */
+#define  DUK_STRIDX_SEARCH                                             181                            /* 'search' */
+#define  DUK_STRIDX_REPLACE                                            182                            /* 'replace' */
+#define  DUK_STRIDX_MATCH                                              183                            /* 'match' */
+#define  DUK_STRIDX_LOCALE_COMPARE                                     184                            /* 'localeCompare' */
+#define  DUK_STRIDX_CHAR_CODE_AT                                       185                            /* 'charCodeAt' */
+#define  DUK_STRIDX_CHAR_AT                                            186                            /* 'charAt' */
+#define  DUK_STRIDX_FROM_CHAR_CODE                                     187                            /* 'fromCharCode' */
+#define  DUK_STRIDX_REDUCE_RIGHT                                       188                            /* 'reduceRight' */
+#define  DUK_STRIDX_REDUCE                                             189                            /* 'reduce' */
+#define  DUK_STRIDX_FILTER                                             190                            /* 'filter' */
+#define  DUK_STRIDX_MAP                                                191                            /* 'map' */
+#define  DUK_STRIDX_FOR_EACH                                           192                            /* 'forEach' */
+#define  DUK_STRIDX_SOME                                               193                            /* 'some' */
+#define  DUK_STRIDX_EVERY                                              194                            /* 'every' */
+#define  DUK_STRIDX_LAST_INDEX_OF                                      195                            /* 'lastIndexOf' */
+#define  DUK_STRIDX_INDEX_OF                                           196                            /* 'indexOf' */
+#define  DUK_STRIDX_UNSHIFT                                            197                            /* 'unshift' */
+#define  DUK_STRIDX_SPLICE                                             198                            /* 'splice' */
+#define  DUK_STRIDX_SORT                                               199                            /* 'sort' */
+#define  DUK_STRIDX_SLICE                                              200                            /* 'slice' */
+#define  DUK_STRIDX_SHIFT                                              201                            /* 'shift' */
+#define  DUK_STRIDX_REVERSE                                            202                            /* 'reverse' */
+#define  DUK_STRIDX_PUSH                                               203                            /* 'push' */
+#define  DUK_STRIDX_POP                                                204                            /* 'pop' */
+#define  DUK_STRIDX_JOIN                                               205                            /* 'join' */
+#define  DUK_STRIDX_CONCAT                                             206                            /* 'concat' */
+#define  DUK_STRIDX_IS_ARRAY                                           207                            /* 'isArray' */
+#define  DUK_STRIDX_LC_ARGUMENTS                                       208                            /* 'arguments' */
+#define  DUK_STRIDX_CALLER                                             209                            /* 'caller' */
+#define  DUK_STRIDX_BIND                                               210                            /* 'bind' */
+#define  DUK_STRIDX_CALL                                               211                            /* 'call' */
+#define  DUK_STRIDX_APPLY                                              212                            /* 'apply' */
+#define  DUK_STRIDX_PROPERTY_IS_ENUMERABLE                             213                            /* 'propertyIsEnumerable' */
+#define  DUK_STRIDX_IS_PROTOTYPE_OF                                    214                            /* 'isPrototypeOf' */
+#define  DUK_STRIDX_HAS_OWN_PROPERTY                                   215                            /* 'hasOwnProperty' */
+#define  DUK_STRIDX_VALUE_OF                                           216                            /* 'valueOf' */
+#define  DUK_STRIDX_TO_LOCALE_STRING                                   217                            /* 'toLocaleString' */
+#define  DUK_STRIDX_TO_STRING                                          218                            /* 'toString' */
+#define  DUK_STRIDX_CONSTRUCTOR                                        219                            /* 'constructor' */
+#define  DUK_STRIDX_ENUMERABLE                                         220                            /* 'enumerable' */
+#define  DUK_STRIDX_CONFIGURABLE                                       221                            /* 'configurable' */
+#define  DUK_STRIDX_WRITABLE                                           222                            /* 'writable' */
+#define  DUK_STRIDX_VALUE                                              223                            /* 'value' */
+#define  DUK_STRIDX_KEYS                                               224                            /* 'keys' */
+#define  DUK_STRIDX_IS_EXTENSIBLE                                      225                            /* 'isExtensible' */
+#define  DUK_STRIDX_IS_FROZEN                                          226                            /* 'isFrozen' */
+#define  DUK_STRIDX_IS_SEALED                                          227                            /* 'isSealed' */
+#define  DUK_STRIDX_PREVENT_EXTENSIONS                                 228                            /* 'preventExtensions' */
+#define  DUK_STRIDX_FREEZE                                             229                            /* 'freeze' */
+#define  DUK_STRIDX_SEAL                                               230                            /* 'seal' */
+#define  DUK_STRIDX_DEFINE_PROPERTIES                                  231                            /* 'defineProperties' */
+#define  DUK_STRIDX_DEFINE_PROPERTY                                    232                            /* 'defineProperty' */
+#define  DUK_STRIDX_CREATE                                             233                            /* 'create' */
+#define  DUK_STRIDX_GET_OWN_PROPERTY_NAMES                             234                            /* 'getOwnPropertyNames' */
+#define  DUK_STRIDX_GET_OWN_PROPERTY_DESCRIPTOR                        235                            /* 'getOwnPropertyDescriptor' */
+#define  DUK_STRIDX_GET_PROTOTYPE_OF                                   236                            /* 'getPrototypeOf' */
+#define  DUK_STRIDX_PROTOTYPE                                          237                            /* 'prototype' */
+#define  DUK_STRIDX_LENGTH                                             238                            /* 'length' */
+#define  DUK_STRIDX_ALERT                                              239                            /* 'alert' */
+#define  DUK_STRIDX_PRINT                                              240                            /* 'print' */
+#define  DUK_STRIDX_UNESCAPE                                           241                            /* 'unescape' */
+#define  DUK_STRIDX_ESCAPE                                             242                            /* 'escape' */
+#define  DUK_STRIDX_ENCODE_URI_COMPONENT                               243                            /* 'encodeURIComponent' */
+#define  DUK_STRIDX_ENCODE_URI                                         244                            /* 'encodeURI' */
+#define  DUK_STRIDX_DECODE_URI_COMPONENT                               245                            /* 'decodeURIComponent' */
+#define  DUK_STRIDX_DECODE_URI                                         246                            /* 'decodeURI' */
+#define  DUK_STRIDX_IS_FINITE                                          247                            /* 'isFinite' */
+#define  DUK_STRIDX_IS_NAN                                             248                            /* 'isNaN' */
+#define  DUK_STRIDX_PARSE_FLOAT                                        249                            /* 'parseFloat' */
+#define  DUK_STRIDX_PARSE_INT                                          250                            /* 'parseInt' */
+#define  DUK_STRIDX_EVAL                                               251                            /* 'eval' */
+#define  DUK_STRIDX_URI_ERROR                                          252                            /* 'URIError' */
+#define  DUK_STRIDX_TYPE_ERROR                                         253                            /* 'TypeError' */
+#define  DUK_STRIDX_SYNTAX_ERROR                                       254                            /* 'SyntaxError' */
+#define  DUK_STRIDX_REFERENCE_ERROR                                    255                            /* 'ReferenceError' */
+#define  DUK_STRIDX_RANGE_ERROR                                        256                            /* 'RangeError' */
+#define  DUK_STRIDX_EVAL_ERROR                                         257                            /* 'EvalError' */
+#define  DUK_STRIDX_BREAK                                              258                            /* 'break' */
+#define  DUK_STRIDX_CASE                                               259                            /* 'case' */
+#define  DUK_STRIDX_CATCH                                              260                            /* 'catch' */
+#define  DUK_STRIDX_CONTINUE                                           261                            /* 'continue' */
+#define  DUK_STRIDX_DEBUGGER                                           262                            /* 'debugger' */
+#define  DUK_STRIDX_DEFAULT                                            263                            /* 'default' */
+#define  DUK_STRIDX_DELETE                                             264                            /* 'delete' */
+#define  DUK_STRIDX_DO                                                 265                            /* 'do' */
+#define  DUK_STRIDX_ELSE                                               266                            /* 'else' */
+#define  DUK_STRIDX_FINALLY                                            267                            /* 'finally' */
+#define  DUK_STRIDX_FOR                                                268                            /* 'for' */
+#define  DUK_STRIDX_LC_FUNCTION                                        269                            /* 'function' */
+#define  DUK_STRIDX_IF                                                 270                            /* 'if' */
+#define  DUK_STRIDX_IN                                                 271                            /* 'in' */
+#define  DUK_STRIDX_INSTANCEOF                                         272                            /* 'instanceof' */
+#define  DUK_STRIDX_NEW                                                273                            /* 'new' */
+#define  DUK_STRIDX_RETURN                                             274                            /* 'return' */
+#define  DUK_STRIDX_SWITCH                                             275                            /* 'switch' */
+#define  DUK_STRIDX_THIS                                               276                            /* 'this' */
+#define  DUK_STRIDX_THROW                                              277                            /* 'throw' */
+#define  DUK_STRIDX_TRY                                                278                            /* 'try' */
+#define  DUK_STRIDX_TYPEOF                                             279                            /* 'typeof' */
+#define  DUK_STRIDX_VAR                                                280                            /* 'var' */
+#define  DUK_STRIDX_VOID                                               281                            /* 'void' */
+#define  DUK_STRIDX_WHILE                                              282                            /* 'while' */
+#define  DUK_STRIDX_WITH                                               283                            /* 'with' */
+#define  DUK_STRIDX_CLASS                                              284                            /* 'class' */
+#define  DUK_STRIDX_CONST                                              285                            /* 'const' */
+#define  DUK_STRIDX_ENUM                                               286                            /* 'enum' */
+#define  DUK_STRIDX_EXPORT                                             287                            /* 'export' */
+#define  DUK_STRIDX_EXTENDS                                            288                            /* 'extends' */
+#define  DUK_STRIDX_IMPORT                                             289                            /* 'import' */
+#define  DUK_STRIDX_SUPER                                              290                            /* 'super' */
+#define  DUK_STRIDX_NULL                                               291                            /* 'null' */
+#define  DUK_STRIDX_TRUE                                               292                            /* 'true' */
+#define  DUK_STRIDX_FALSE                                              293                            /* 'false' */
+#define  DUK_STRIDX_GET                                                294                            /* 'get' */
+#define  DUK_STRIDX_SET                                                295                            /* 'set' */
+#define  DUK_STRIDX_IMPLEMENTS                                         296                            /* 'implements' */
+#define  DUK_STRIDX_INTERFACE                                          297                            /* 'interface' */
+#define  DUK_STRIDX_LET                                                298                            /* 'let' */
+#define  DUK_STRIDX_PACKAGE                                            299                            /* 'package' */
+#define  DUK_STRIDX_PRIVATE                                            300                            /* 'private' */
+#define  DUK_STRIDX_PROTECTED                                          301                            /* 'protected' */
+#define  DUK_STRIDX_PUBLIC                                             302                            /* 'public' */
+#define  DUK_STRIDX_STATIC                                             303                            /* 'static' */
+#define  DUK_STRIDX_YIELD                                              304                            /* 'yield' */
+
+#define  DUK_HEAP_STRING_UC_THREAD(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_THREAD)
+#define  DUK_HTHREAD_STRING_UC_THREAD(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_THREAD)
+#define  DUK_HEAP_STRING_UC_POINTER(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_POINTER)
+#define  DUK_HTHREAD_STRING_UC_POINTER(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_POINTER)
+#define  DUK_HEAP_STRING_UC_BUFFER(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_BUFFER)
+#define  DUK_HTHREAD_STRING_UC_BUFFER(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_BUFFER)
+#define  DUK_HEAP_STRING_DEC_ENV(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEC_ENV)
+#define  DUK_HTHREAD_STRING_DEC_ENV(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEC_ENV)
+#define  DUK_HEAP_STRING_OBJ_ENV(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_OBJ_ENV)
+#define  DUK_HTHREAD_STRING_OBJ_ENV(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_OBJ_ENV)
+#define  DUK_HEAP_STRING_EMPTY_STRING(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EMPTY_STRING)
+#define  DUK_HTHREAD_STRING_EMPTY_STRING(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EMPTY_STRING)
+#define  DUK_HEAP_STRING_GLOBAL(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GLOBAL)
+#define  DUK_HTHREAD_STRING_GLOBAL(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GLOBAL)
+#define  DUK_HEAP_STRING_UC_ARGUMENTS(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_ARGUMENTS)
+#define  DUK_HTHREAD_STRING_UC_ARGUMENTS(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_ARGUMENTS)
+#define  DUK_HEAP_STRING_JSON(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JSON)
+#define  DUK_HTHREAD_STRING_JSON(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JSON)
+#define  DUK_HEAP_STRING_MATH(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MATH)
+#define  DUK_HTHREAD_STRING_MATH(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MATH)
+#define  DUK_HEAP_STRING_ERROR(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ERROR)
+#define  DUK_HTHREAD_STRING_ERROR(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ERROR)
+#define  DUK_HEAP_STRING_REG_EXP(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REG_EXP)
+#define  DUK_HTHREAD_STRING_REG_EXP(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REG_EXP)
+#define  DUK_HEAP_STRING_DATE(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DATE)
+#define  DUK_HTHREAD_STRING_DATE(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DATE)
+#define  DUK_HEAP_STRING_UC_NUMBER(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_NUMBER)
+#define  DUK_HTHREAD_STRING_UC_NUMBER(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_NUMBER)
+#define  DUK_HEAP_STRING_UC_BOOLEAN(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_BOOLEAN)
+#define  DUK_HTHREAD_STRING_UC_BOOLEAN(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_BOOLEAN)
+#define  DUK_HEAP_STRING_UC_STRING(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_STRING)
+#define  DUK_HTHREAD_STRING_UC_STRING(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_STRING)
+#define  DUK_HEAP_STRING_ARRAY(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ARRAY)
+#define  DUK_HTHREAD_STRING_ARRAY(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ARRAY)
+#define  DUK_HEAP_STRING_UC_FUNCTION(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_FUNCTION)
+#define  DUK_HTHREAD_STRING_UC_FUNCTION(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_FUNCTION)
+#define  DUK_HEAP_STRING_UC_OBJECT(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_OBJECT)
+#define  DUK_HTHREAD_STRING_UC_OBJECT(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_OBJECT)
+#define  DUK_HEAP_STRING_JSON_EXT_NEGINF(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JSON_EXT_NEGINF)
+#define  DUK_HTHREAD_STRING_JSON_EXT_NEGINF(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JSON_EXT_NEGINF)
+#define  DUK_HEAP_STRING_JSON_EXT_POSINF(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JSON_EXT_POSINF)
+#define  DUK_HTHREAD_STRING_JSON_EXT_POSINF(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JSON_EXT_POSINF)
+#define  DUK_HEAP_STRING_JSON_EXT_NAN(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JSON_EXT_NAN)
+#define  DUK_HTHREAD_STRING_JSON_EXT_NAN(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JSON_EXT_NAN)
+#define  DUK_HEAP_STRING_JSON_EXT_UNDEFINED(heap)                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JSON_EXT_UNDEFINED)
+#define  DUK_HTHREAD_STRING_JSON_EXT_UNDEFINED(thr)                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JSON_EXT_UNDEFINED)
+#define  DUK_HEAP_STRING_CURRENT(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CURRENT)
+#define  DUK_HTHREAD_STRING_CURRENT(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CURRENT)
+#define  DUK_HEAP_STRING_RESUME(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_RESUME)
+#define  DUK_HTHREAD_STRING_RESUME(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_RESUME)
+#define  DUK_HEAP_STRING_BASE64(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BASE64)
+#define  DUK_HTHREAD_STRING_BASE64(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BASE64)
+#define  DUK_HEAP_STRING_HEX(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_HEX)
+#define  DUK_HTHREAD_STRING_HEX(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_HEX)
+#define  DUK_HEAP_STRING_DEC(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEC)
+#define  DUK_HTHREAD_STRING_DEC(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEC)
+#define  DUK_HEAP_STRING_ENC(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ENC)
+#define  DUK_HTHREAD_STRING_ENC(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ENC)
+#define  DUK_HEAP_STRING_GET_FINALIZER(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_FINALIZER)
+#define  DUK_HTHREAD_STRING_GET_FINALIZER(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_FINALIZER)
+#define  DUK_HEAP_STRING_SET_FINALIZER(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_FINALIZER)
+#define  DUK_HTHREAD_STRING_SET_FINALIZER(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_FINALIZER)
+#define  DUK_HEAP_STRING_GC(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GC)
+#define  DUK_HTHREAD_STRING_GC(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GC)
+#define  DUK_HEAP_STRING_REFC(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REFC)
+#define  DUK_HTHREAD_STRING_REFC(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REFC)
+#define  DUK_HEAP_STRING_ADDR(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ADDR)
+#define  DUK_HTHREAD_STRING_ADDR(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ADDR)
+#define  DUK_HEAP_STRING_BUILD(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BUILD)
+#define  DUK_HTHREAD_STRING_BUILD(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BUILD)
+#define  DUK_HEAP_STRING_VERSION(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_VERSION)
+#define  DUK_HTHREAD_STRING_VERSION(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_VERSION)
+#define  DUK_HEAP_STRING_DUK(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DUK)
+#define  DUK_HTHREAD_STRING_DUK(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DUK)
+#define  DUK_HEAP_STRING_COMPILE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_COMPILE)
+#define  DUK_HTHREAD_STRING_COMPILE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_COMPILE)
+#define  DUK_HEAP_STRING_INT_REGBASE(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_REGBASE)
+#define  DUK_HTHREAD_STRING_INT_REGBASE(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_REGBASE)
+#define  DUK_HEAP_STRING_INT_THREAD(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_THREAD)
+#define  DUK_HTHREAD_STRING_INT_THREAD(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_THREAD)
+#define  DUK_HEAP_STRING_INT_FINALIZER(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_FINALIZER)
+#define  DUK_HTHREAD_STRING_INT_FINALIZER(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_FINALIZER)
+#define  DUK_HEAP_STRING_INT_METATABLE(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_METATABLE)
+#define  DUK_HTHREAD_STRING_INT_METATABLE(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_METATABLE)
+#define  DUK_HEAP_STRING_INT_CALLEE(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_CALLEE)
+#define  DUK_HTHREAD_STRING_INT_CALLEE(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_CALLEE)
+#define  DUK_HEAP_STRING_INT_MAP(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_MAP)
+#define  DUK_HTHREAD_STRING_INT_MAP(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_MAP)
+#define  DUK_HEAP_STRING_INT_ARGS(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_ARGS)
+#define  DUK_HTHREAD_STRING_INT_ARGS(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_ARGS)
+#define  DUK_HEAP_STRING_INT_THIS(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_THIS)
+#define  DUK_HTHREAD_STRING_INT_THIS(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_THIS)
+#define  DUK_HEAP_STRING_INT_PC2LINE(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_PC2LINE)
+#define  DUK_HTHREAD_STRING_INT_PC2LINE(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_PC2LINE)
+#define  DUK_HEAP_STRING_INT_SOURCE(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_SOURCE)
+#define  DUK_HTHREAD_STRING_INT_SOURCE(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_SOURCE)
+#define  DUK_HEAP_STRING_INT_VARENV(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_VARENV)
+#define  DUK_HTHREAD_STRING_INT_VARENV(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_VARENV)
+#define  DUK_HEAP_STRING_INT_LEXENV(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_LEXENV)
+#define  DUK_HTHREAD_STRING_INT_LEXENV(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_LEXENV)
+#define  DUK_HEAP_STRING_INT_VARMAP(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_VARMAP)
+#define  DUK_HTHREAD_STRING_INT_VARMAP(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_VARMAP)
+#define  DUK_HEAP_STRING_INT_FORMALS(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_FORMALS)
+#define  DUK_HTHREAD_STRING_INT_FORMALS(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_FORMALS)
+#define  DUK_HEAP_STRING_INT_BYTECODE(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_BYTECODE)
+#define  DUK_HTHREAD_STRING_INT_BYTECODE(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_BYTECODE)
+#define  DUK_HEAP_STRING_INT_NEXT(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_NEXT)
+#define  DUK_HTHREAD_STRING_INT_NEXT(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_NEXT)
+#define  DUK_HEAP_STRING_INT_TARGET(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_TARGET)
+#define  DUK_HTHREAD_STRING_INT_TARGET(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_TARGET)
+#define  DUK_HEAP_STRING_INT_VALUE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_VALUE)
+#define  DUK_HTHREAD_STRING_INT_VALUE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_VALUE)
+#define  DUK_HEAP_STRING_LC_POINTER(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_POINTER)
+#define  DUK_HTHREAD_STRING_LC_POINTER(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_POINTER)
+#define  DUK_HEAP_STRING_LC_BUFFER(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_BUFFER)
+#define  DUK_HTHREAD_STRING_LC_BUFFER(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_BUFFER)
+#define  DUK_HEAP_STRING_TRACEDATA(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TRACEDATA)
+#define  DUK_HTHREAD_STRING_TRACEDATA(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TRACEDATA)
+#define  DUK_HEAP_STRING_LINE_NUMBER(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LINE_NUMBER)
+#define  DUK_HTHREAD_STRING_LINE_NUMBER(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LINE_NUMBER)
+#define  DUK_HEAP_STRING_FILE_NAME(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FILE_NAME)
+#define  DUK_HTHREAD_STRING_FILE_NAME(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FILE_NAME)
+#define  DUK_HEAP_STRING_PC(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PC)
+#define  DUK_HTHREAD_STRING_PC(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PC)
+#define  DUK_HEAP_STRING_STACK(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_STACK)
+#define  DUK_HTHREAD_STRING_STACK(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_STACK)
+#define  DUK_HEAP_STRING_THROW_TYPE_ERROR(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_THROW_TYPE_ERROR)
+#define  DUK_HTHREAD_STRING_THROW_TYPE_ERROR(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_THROW_TYPE_ERROR)
+#define  DUK_HEAP_STRING_CALLEE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CALLEE)
+#define  DUK_HTHREAD_STRING_CALLEE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CALLEE)
+#define  DUK_HEAP_STRING_INVALID_DATE(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INVALID_DATE)
+#define  DUK_HTHREAD_STRING_INVALID_DATE(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INVALID_DATE)
+#define  DUK_HEAP_STRING_BRACKETED_ELLIPSIS(heap)                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BRACKETED_ELLIPSIS)
+#define  DUK_HTHREAD_STRING_BRACKETED_ELLIPSIS(thr)                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BRACKETED_ELLIPSIS)
+#define  DUK_HEAP_STRING_NEWLINE_TAB(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NEWLINE_TAB)
+#define  DUK_HTHREAD_STRING_NEWLINE_TAB(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NEWLINE_TAB)
+#define  DUK_HEAP_STRING_SPACE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SPACE)
+#define  DUK_HTHREAD_STRING_SPACE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SPACE)
+#define  DUK_HEAP_STRING_COMMA(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_COMMA)
+#define  DUK_HTHREAD_STRING_COMMA(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_COMMA)
+#define  DUK_HEAP_STRING_MINUS_ZERO(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MINUS_ZERO)
+#define  DUK_HTHREAD_STRING_MINUS_ZERO(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MINUS_ZERO)
+#define  DUK_HEAP_STRING_PLUS_ZERO(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PLUS_ZERO)
+#define  DUK_HTHREAD_STRING_PLUS_ZERO(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PLUS_ZERO)
+#define  DUK_HEAP_STRING_ZERO(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ZERO)
+#define  DUK_HTHREAD_STRING_ZERO(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ZERO)
+#define  DUK_HEAP_STRING_MINUS_INFINITY(heap)                          DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MINUS_INFINITY)
+#define  DUK_HTHREAD_STRING_MINUS_INFINITY(thr)                        DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MINUS_INFINITY)
+#define  DUK_HEAP_STRING_PLUS_INFINITY(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PLUS_INFINITY)
+#define  DUK_HTHREAD_STRING_PLUS_INFINITY(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PLUS_INFINITY)
+#define  DUK_HEAP_STRING_INFINITY(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INFINITY)
+#define  DUK_HTHREAD_STRING_INFINITY(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INFINITY)
+#define  DUK_HEAP_STRING_LC_OBJECT(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_OBJECT)
+#define  DUK_HTHREAD_STRING_LC_OBJECT(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_OBJECT)
+#define  DUK_HEAP_STRING_LC_STRING(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_STRING)
+#define  DUK_HTHREAD_STRING_LC_STRING(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_STRING)
+#define  DUK_HEAP_STRING_LC_NUMBER(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_NUMBER)
+#define  DUK_HTHREAD_STRING_LC_NUMBER(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_NUMBER)
+#define  DUK_HEAP_STRING_LC_BOOLEAN(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_BOOLEAN)
+#define  DUK_HTHREAD_STRING_LC_BOOLEAN(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_BOOLEAN)
+#define  DUK_HEAP_STRING_UNDEFINED(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UNDEFINED)
+#define  DUK_HTHREAD_STRING_UNDEFINED(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UNDEFINED)
+#define  DUK_HEAP_STRING_STRINGIFY(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_STRINGIFY)
+#define  DUK_HTHREAD_STRING_STRINGIFY(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_STRINGIFY)
+#define  DUK_HEAP_STRING_TAN(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TAN)
+#define  DUK_HTHREAD_STRING_TAN(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TAN)
+#define  DUK_HEAP_STRING_SQRT(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SQRT)
+#define  DUK_HTHREAD_STRING_SQRT(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SQRT)
+#define  DUK_HEAP_STRING_SIN(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SIN)
+#define  DUK_HTHREAD_STRING_SIN(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SIN)
+#define  DUK_HEAP_STRING_ROUND(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ROUND)
+#define  DUK_HTHREAD_STRING_ROUND(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ROUND)
+#define  DUK_HEAP_STRING_RANDOM(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_RANDOM)
+#define  DUK_HTHREAD_STRING_RANDOM(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_RANDOM)
+#define  DUK_HEAP_STRING_POW(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_POW)
+#define  DUK_HTHREAD_STRING_POW(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_POW)
+#define  DUK_HEAP_STRING_MIN(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MIN)
+#define  DUK_HTHREAD_STRING_MIN(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MIN)
+#define  DUK_HEAP_STRING_MAX(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MAX)
+#define  DUK_HTHREAD_STRING_MAX(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MAX)
+#define  DUK_HEAP_STRING_LOG(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LOG)
+#define  DUK_HTHREAD_STRING_LOG(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LOG)
+#define  DUK_HEAP_STRING_FLOOR(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FLOOR)
+#define  DUK_HTHREAD_STRING_FLOOR(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FLOOR)
+#define  DUK_HEAP_STRING_EXP(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EXP)
+#define  DUK_HTHREAD_STRING_EXP(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EXP)
+#define  DUK_HEAP_STRING_COS(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_COS)
+#define  DUK_HTHREAD_STRING_COS(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_COS)
+#define  DUK_HEAP_STRING_CEIL(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CEIL)
+#define  DUK_HTHREAD_STRING_CEIL(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CEIL)
+#define  DUK_HEAP_STRING_ATAN2(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ATAN2)
+#define  DUK_HTHREAD_STRING_ATAN2(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ATAN2)
+#define  DUK_HEAP_STRING_ATAN(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ATAN)
+#define  DUK_HTHREAD_STRING_ATAN(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ATAN)
+#define  DUK_HEAP_STRING_ASIN(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ASIN)
+#define  DUK_HTHREAD_STRING_ASIN(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ASIN)
+#define  DUK_HEAP_STRING_ACOS(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ACOS)
+#define  DUK_HTHREAD_STRING_ACOS(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ACOS)
+#define  DUK_HEAP_STRING_ABS(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ABS)
+#define  DUK_HTHREAD_STRING_ABS(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ABS)
+#define  DUK_HEAP_STRING_SQRT2(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SQRT2)
+#define  DUK_HTHREAD_STRING_SQRT2(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SQRT2)
+#define  DUK_HEAP_STRING_SQRT1_2(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SQRT1_2)
+#define  DUK_HTHREAD_STRING_SQRT1_2(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SQRT1_2)
+#define  DUK_HEAP_STRING_PI(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PI)
+#define  DUK_HTHREAD_STRING_PI(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PI)
+#define  DUK_HEAP_STRING_LOG10E(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LOG10E)
+#define  DUK_HTHREAD_STRING_LOG10E(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LOG10E)
+#define  DUK_HEAP_STRING_LOG2E(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LOG2E)
+#define  DUK_HTHREAD_STRING_LOG2E(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LOG2E)
+#define  DUK_HEAP_STRING_LN2(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LN2)
+#define  DUK_HTHREAD_STRING_LN2(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LN2)
+#define  DUK_HEAP_STRING_LN10(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LN10)
+#define  DUK_HTHREAD_STRING_LN10(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LN10)
+#define  DUK_HEAP_STRING_E(heap)                                       DUK_HEAP_GET_STRING((heap),DUK_STRIDX_E)
+#define  DUK_HTHREAD_STRING_E(thr)                                     DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_E)
+#define  DUK_HEAP_STRING_MESSAGE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MESSAGE)
+#define  DUK_HTHREAD_STRING_MESSAGE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MESSAGE)
+#define  DUK_HEAP_STRING_NAME(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NAME)
+#define  DUK_HTHREAD_STRING_NAME(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NAME)
+#define  DUK_HEAP_STRING_INPUT(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INPUT)
+#define  DUK_HTHREAD_STRING_INPUT(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INPUT)
+#define  DUK_HEAP_STRING_INDEX(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INDEX)
+#define  DUK_HTHREAD_STRING_INDEX(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INDEX)
+#define  DUK_HEAP_STRING_ESCAPED_EMPTY_REGEXP(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ESCAPED_EMPTY_REGEXP)
+#define  DUK_HTHREAD_STRING_ESCAPED_EMPTY_REGEXP(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ESCAPED_EMPTY_REGEXP)
+#define  DUK_HEAP_STRING_LAST_INDEX(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LAST_INDEX)
+#define  DUK_HTHREAD_STRING_LAST_INDEX(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LAST_INDEX)
+#define  DUK_HEAP_STRING_MULTILINE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MULTILINE)
+#define  DUK_HTHREAD_STRING_MULTILINE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MULTILINE)
+#define  DUK_HEAP_STRING_IGNORE_CASE(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IGNORE_CASE)
+#define  DUK_HTHREAD_STRING_IGNORE_CASE(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IGNORE_CASE)
+#define  DUK_HEAP_STRING_SOURCE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SOURCE)
+#define  DUK_HTHREAD_STRING_SOURCE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SOURCE)
+#define  DUK_HEAP_STRING_TEST(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TEST)
+#define  DUK_HTHREAD_STRING_TEST(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TEST)
+#define  DUK_HEAP_STRING_EXEC(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EXEC)
+#define  DUK_HTHREAD_STRING_EXEC(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EXEC)
+#define  DUK_HEAP_STRING_TO_GMT_STRING(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_GMT_STRING)
+#define  DUK_HTHREAD_STRING_TO_GMT_STRING(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_GMT_STRING)
+#define  DUK_HEAP_STRING_SET_YEAR(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_YEAR)
+#define  DUK_HTHREAD_STRING_SET_YEAR(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_YEAR)
+#define  DUK_HEAP_STRING_GET_YEAR(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_YEAR)
+#define  DUK_HTHREAD_STRING_GET_YEAR(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_YEAR)
+#define  DUK_HEAP_STRING_TO_JSON(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_JSON)
+#define  DUK_HTHREAD_STRING_TO_JSON(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_JSON)
+#define  DUK_HEAP_STRING_TO_ISO_STRING(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_ISO_STRING)
+#define  DUK_HTHREAD_STRING_TO_ISO_STRING(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_ISO_STRING)
+#define  DUK_HEAP_STRING_TO_UTC_STRING(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_UTC_STRING)
+#define  DUK_HTHREAD_STRING_TO_UTC_STRING(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_UTC_STRING)
+#define  DUK_HEAP_STRING_SET_UTC_FULL_YEAR(heap)                       DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_FULL_YEAR)
+#define  DUK_HTHREAD_STRING_SET_UTC_FULL_YEAR(thr)                     DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_FULL_YEAR)
+#define  DUK_HEAP_STRING_SET_FULL_YEAR(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_FULL_YEAR)
+#define  DUK_HTHREAD_STRING_SET_FULL_YEAR(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_FULL_YEAR)
+#define  DUK_HEAP_STRING_SET_UTC_MONTH(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_MONTH)
+#define  DUK_HTHREAD_STRING_SET_UTC_MONTH(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_MONTH)
+#define  DUK_HEAP_STRING_SET_MONTH(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_MONTH)
+#define  DUK_HTHREAD_STRING_SET_MONTH(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_MONTH)
+#define  DUK_HEAP_STRING_SET_UTC_DATE(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_DATE)
+#define  DUK_HTHREAD_STRING_SET_UTC_DATE(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_DATE)
+#define  DUK_HEAP_STRING_SET_DATE(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_DATE)
+#define  DUK_HTHREAD_STRING_SET_DATE(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_DATE)
+#define  DUK_HEAP_STRING_SET_UTC_HOURS(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_HOURS)
+#define  DUK_HTHREAD_STRING_SET_UTC_HOURS(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_HOURS)
+#define  DUK_HEAP_STRING_SET_HOURS(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_HOURS)
+#define  DUK_HTHREAD_STRING_SET_HOURS(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_HOURS)
+#define  DUK_HEAP_STRING_SET_UTC_MINUTES(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_MINUTES)
+#define  DUK_HTHREAD_STRING_SET_UTC_MINUTES(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_MINUTES)
+#define  DUK_HEAP_STRING_SET_MINUTES(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_MINUTES)
+#define  DUK_HTHREAD_STRING_SET_MINUTES(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_MINUTES)
+#define  DUK_HEAP_STRING_SET_UTC_SECONDS(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_SECONDS)
+#define  DUK_HTHREAD_STRING_SET_UTC_SECONDS(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_SECONDS)
+#define  DUK_HEAP_STRING_SET_SECONDS(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_SECONDS)
+#define  DUK_HTHREAD_STRING_SET_SECONDS(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_SECONDS)
+#define  DUK_HEAP_STRING_SET_UTC_MILLISECONDS(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_MILLISECONDS)
+#define  DUK_HTHREAD_STRING_SET_UTC_MILLISECONDS(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_MILLISECONDS)
+#define  DUK_HEAP_STRING_SET_MILLISECONDS(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_MILLISECONDS)
+#define  DUK_HTHREAD_STRING_SET_MILLISECONDS(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_MILLISECONDS)
+#define  DUK_HEAP_STRING_SET_TIME(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_TIME)
+#define  DUK_HTHREAD_STRING_SET_TIME(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_TIME)
+#define  DUK_HEAP_STRING_GET_TIMEZONE_OFFSET(heap)                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_TIMEZONE_OFFSET)
+#define  DUK_HTHREAD_STRING_GET_TIMEZONE_OFFSET(thr)                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_TIMEZONE_OFFSET)
+#define  DUK_HEAP_STRING_GET_UTC_MILLISECONDS(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_MILLISECONDS)
+#define  DUK_HTHREAD_STRING_GET_UTC_MILLISECONDS(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_MILLISECONDS)
+#define  DUK_HEAP_STRING_GET_MILLISECONDS(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_MILLISECONDS)
+#define  DUK_HTHREAD_STRING_GET_MILLISECONDS(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_MILLISECONDS)
+#define  DUK_HEAP_STRING_GET_UTC_SECONDS(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_SECONDS)
+#define  DUK_HTHREAD_STRING_GET_UTC_SECONDS(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_SECONDS)
+#define  DUK_HEAP_STRING_GET_SECONDS(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_SECONDS)
+#define  DUK_HTHREAD_STRING_GET_SECONDS(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_SECONDS)
+#define  DUK_HEAP_STRING_GET_UTC_MINUTES(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_MINUTES)
+#define  DUK_HTHREAD_STRING_GET_UTC_MINUTES(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_MINUTES)
+#define  DUK_HEAP_STRING_GET_MINUTES(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_MINUTES)
+#define  DUK_HTHREAD_STRING_GET_MINUTES(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_MINUTES)
+#define  DUK_HEAP_STRING_GET_UTC_HOURS(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_HOURS)
+#define  DUK_HTHREAD_STRING_GET_UTC_HOURS(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_HOURS)
+#define  DUK_HEAP_STRING_GET_HOURS(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_HOURS)
+#define  DUK_HTHREAD_STRING_GET_HOURS(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_HOURS)
+#define  DUK_HEAP_STRING_GET_UTC_DAY(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_DAY)
+#define  DUK_HTHREAD_STRING_GET_UTC_DAY(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_DAY)
+#define  DUK_HEAP_STRING_GET_DAY(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_DAY)
+#define  DUK_HTHREAD_STRING_GET_DAY(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_DAY)
+#define  DUK_HEAP_STRING_GET_UTC_DATE(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_DATE)
+#define  DUK_HTHREAD_STRING_GET_UTC_DATE(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_DATE)
+#define  DUK_HEAP_STRING_GET_DATE(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_DATE)
+#define  DUK_HTHREAD_STRING_GET_DATE(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_DATE)
+#define  DUK_HEAP_STRING_GET_UTC_MONTH(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_MONTH)
+#define  DUK_HTHREAD_STRING_GET_UTC_MONTH(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_MONTH)
+#define  DUK_HEAP_STRING_GET_MONTH(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_MONTH)
+#define  DUK_HTHREAD_STRING_GET_MONTH(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_MONTH)
+#define  DUK_HEAP_STRING_GET_UTC_FULL_YEAR(heap)                       DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_FULL_YEAR)
+#define  DUK_HTHREAD_STRING_GET_UTC_FULL_YEAR(thr)                     DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_FULL_YEAR)
+#define  DUK_HEAP_STRING_GET_FULL_YEAR(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_FULL_YEAR)
+#define  DUK_HTHREAD_STRING_GET_FULL_YEAR(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_FULL_YEAR)
+#define  DUK_HEAP_STRING_GET_TIME(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_TIME)
+#define  DUK_HTHREAD_STRING_GET_TIME(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_TIME)
+#define  DUK_HEAP_STRING_TO_LOCALE_TIME_STRING(heap)                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_LOCALE_TIME_STRING)
+#define  DUK_HTHREAD_STRING_TO_LOCALE_TIME_STRING(thr)                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_LOCALE_TIME_STRING)
+#define  DUK_HEAP_STRING_TO_LOCALE_DATE_STRING(heap)                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_LOCALE_DATE_STRING)
+#define  DUK_HTHREAD_STRING_TO_LOCALE_DATE_STRING(thr)                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_LOCALE_DATE_STRING)
+#define  DUK_HEAP_STRING_TO_TIME_STRING(heap)                          DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_TIME_STRING)
+#define  DUK_HTHREAD_STRING_TO_TIME_STRING(thr)                        DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_TIME_STRING)
+#define  DUK_HEAP_STRING_TO_DATE_STRING(heap)                          DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_DATE_STRING)
+#define  DUK_HTHREAD_STRING_TO_DATE_STRING(thr)                        DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_DATE_STRING)
+#define  DUK_HEAP_STRING_NOW(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NOW)
+#define  DUK_HTHREAD_STRING_NOW(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NOW)
+#define  DUK_HEAP_STRING_UTC(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UTC)
+#define  DUK_HTHREAD_STRING_UTC(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UTC)
+#define  DUK_HEAP_STRING_PARSE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PARSE)
+#define  DUK_HTHREAD_STRING_PARSE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PARSE)
+#define  DUK_HEAP_STRING_TO_PRECISION(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_PRECISION)
+#define  DUK_HTHREAD_STRING_TO_PRECISION(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_PRECISION)
+#define  DUK_HEAP_STRING_TO_EXPONENTIAL(heap)                          DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_EXPONENTIAL)
+#define  DUK_HTHREAD_STRING_TO_EXPONENTIAL(thr)                        DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_EXPONENTIAL)
+#define  DUK_HEAP_STRING_TO_FIXED(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_FIXED)
+#define  DUK_HTHREAD_STRING_TO_FIXED(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_FIXED)
+#define  DUK_HEAP_STRING_POSITIVE_INFINITY(heap)                       DUK_HEAP_GET_STRING((heap),DUK_STRIDX_POSITIVE_INFINITY)
+#define  DUK_HTHREAD_STRING_POSITIVE_INFINITY(thr)                     DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_POSITIVE_INFINITY)
+#define  DUK_HEAP_STRING_NEGATIVE_INFINITY(heap)                       DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NEGATIVE_INFINITY)
+#define  DUK_HTHREAD_STRING_NEGATIVE_INFINITY(thr)                     DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NEGATIVE_INFINITY)
+#define  DUK_HEAP_STRING_NAN(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NAN)
+#define  DUK_HTHREAD_STRING_NAN(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NAN)
+#define  DUK_HEAP_STRING_MIN_VALUE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MIN_VALUE)
+#define  DUK_HTHREAD_STRING_MIN_VALUE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MIN_VALUE)
+#define  DUK_HEAP_STRING_MAX_VALUE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MAX_VALUE)
+#define  DUK_HTHREAD_STRING_MAX_VALUE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MAX_VALUE)
+#define  DUK_HEAP_STRING_SUBSTR(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SUBSTR)
+#define  DUK_HTHREAD_STRING_SUBSTR(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SUBSTR)
+#define  DUK_HEAP_STRING_TRIM(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TRIM)
+#define  DUK_HTHREAD_STRING_TRIM(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TRIM)
+#define  DUK_HEAP_STRING_TO_LOCALE_UPPER_CASE(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_LOCALE_UPPER_CASE)
+#define  DUK_HTHREAD_STRING_TO_LOCALE_UPPER_CASE(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_LOCALE_UPPER_CASE)
+#define  DUK_HEAP_STRING_TO_UPPER_CASE(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_UPPER_CASE)
+#define  DUK_HTHREAD_STRING_TO_UPPER_CASE(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_UPPER_CASE)
+#define  DUK_HEAP_STRING_TO_LOCALE_LOWER_CASE(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_LOCALE_LOWER_CASE)
+#define  DUK_HTHREAD_STRING_TO_LOCALE_LOWER_CASE(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_LOCALE_LOWER_CASE)
+#define  DUK_HEAP_STRING_TO_LOWER_CASE(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_LOWER_CASE)
+#define  DUK_HTHREAD_STRING_TO_LOWER_CASE(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_LOWER_CASE)
+#define  DUK_HEAP_STRING_SUBSTRING(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SUBSTRING)
+#define  DUK_HTHREAD_STRING_SUBSTRING(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SUBSTRING)
+#define  DUK_HEAP_STRING_SPLIT(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SPLIT)
+#define  DUK_HTHREAD_STRING_SPLIT(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SPLIT)
+#define  DUK_HEAP_STRING_SEARCH(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SEARCH)
+#define  DUK_HTHREAD_STRING_SEARCH(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SEARCH)
+#define  DUK_HEAP_STRING_REPLACE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REPLACE)
+#define  DUK_HTHREAD_STRING_REPLACE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REPLACE)
+#define  DUK_HEAP_STRING_MATCH(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MATCH)
+#define  DUK_HTHREAD_STRING_MATCH(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MATCH)
+#define  DUK_HEAP_STRING_LOCALE_COMPARE(heap)                          DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LOCALE_COMPARE)
+#define  DUK_HTHREAD_STRING_LOCALE_COMPARE(thr)                        DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LOCALE_COMPARE)
+#define  DUK_HEAP_STRING_CHAR_CODE_AT(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CHAR_CODE_AT)
+#define  DUK_HTHREAD_STRING_CHAR_CODE_AT(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CHAR_CODE_AT)
+#define  DUK_HEAP_STRING_CHAR_AT(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CHAR_AT)
+#define  DUK_HTHREAD_STRING_CHAR_AT(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CHAR_AT)
+#define  DUK_HEAP_STRING_FROM_CHAR_CODE(heap)                          DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FROM_CHAR_CODE)
+#define  DUK_HTHREAD_STRING_FROM_CHAR_CODE(thr)                        DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FROM_CHAR_CODE)
+#define  DUK_HEAP_STRING_REDUCE_RIGHT(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REDUCE_RIGHT)
+#define  DUK_HTHREAD_STRING_REDUCE_RIGHT(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REDUCE_RIGHT)
+#define  DUK_HEAP_STRING_REDUCE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REDUCE)
+#define  DUK_HTHREAD_STRING_REDUCE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REDUCE)
+#define  DUK_HEAP_STRING_FILTER(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FILTER)
+#define  DUK_HTHREAD_STRING_FILTER(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FILTER)
+#define  DUK_HEAP_STRING_MAP(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MAP)
+#define  DUK_HTHREAD_STRING_MAP(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MAP)
+#define  DUK_HEAP_STRING_FOR_EACH(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FOR_EACH)
+#define  DUK_HTHREAD_STRING_FOR_EACH(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FOR_EACH)
+#define  DUK_HEAP_STRING_SOME(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SOME)
+#define  DUK_HTHREAD_STRING_SOME(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SOME)
+#define  DUK_HEAP_STRING_EVERY(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EVERY)
+#define  DUK_HTHREAD_STRING_EVERY(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EVERY)
+#define  DUK_HEAP_STRING_LAST_INDEX_OF(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LAST_INDEX_OF)
+#define  DUK_HTHREAD_STRING_LAST_INDEX_OF(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LAST_INDEX_OF)
+#define  DUK_HEAP_STRING_INDEX_OF(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INDEX_OF)
+#define  DUK_HTHREAD_STRING_INDEX_OF(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INDEX_OF)
+#define  DUK_HEAP_STRING_UNSHIFT(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UNSHIFT)
+#define  DUK_HTHREAD_STRING_UNSHIFT(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UNSHIFT)
+#define  DUK_HEAP_STRING_SPLICE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SPLICE)
+#define  DUK_HTHREAD_STRING_SPLICE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SPLICE)
+#define  DUK_HEAP_STRING_SORT(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SORT)
+#define  DUK_HTHREAD_STRING_SORT(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SORT)
+#define  DUK_HEAP_STRING_SLICE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SLICE)
+#define  DUK_HTHREAD_STRING_SLICE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SLICE)
+#define  DUK_HEAP_STRING_SHIFT(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SHIFT)
+#define  DUK_HTHREAD_STRING_SHIFT(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SHIFT)
+#define  DUK_HEAP_STRING_REVERSE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REVERSE)
+#define  DUK_HTHREAD_STRING_REVERSE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REVERSE)
+#define  DUK_HEAP_STRING_PUSH(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PUSH)
+#define  DUK_HTHREAD_STRING_PUSH(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PUSH)
+#define  DUK_HEAP_STRING_POP(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_POP)
+#define  DUK_HTHREAD_STRING_POP(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_POP)
+#define  DUK_HEAP_STRING_JOIN(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JOIN)
+#define  DUK_HTHREAD_STRING_JOIN(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JOIN)
+#define  DUK_HEAP_STRING_CONCAT(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CONCAT)
+#define  DUK_HTHREAD_STRING_CONCAT(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CONCAT)
+#define  DUK_HEAP_STRING_IS_ARRAY(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_ARRAY)
+#define  DUK_HTHREAD_STRING_IS_ARRAY(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_ARRAY)
+#define  DUK_HEAP_STRING_LC_ARGUMENTS(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_ARGUMENTS)
+#define  DUK_HTHREAD_STRING_LC_ARGUMENTS(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_ARGUMENTS)
+#define  DUK_HEAP_STRING_CALLER(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CALLER)
+#define  DUK_HTHREAD_STRING_CALLER(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CALLER)
+#define  DUK_HEAP_STRING_BIND(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BIND)
+#define  DUK_HTHREAD_STRING_BIND(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BIND)
+#define  DUK_HEAP_STRING_CALL(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CALL)
+#define  DUK_HTHREAD_STRING_CALL(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CALL)
+#define  DUK_HEAP_STRING_APPLY(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_APPLY)
+#define  DUK_HTHREAD_STRING_APPLY(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_APPLY)
+#define  DUK_HEAP_STRING_PROPERTY_IS_ENUMERABLE(heap)                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PROPERTY_IS_ENUMERABLE)
+#define  DUK_HTHREAD_STRING_PROPERTY_IS_ENUMERABLE(thr)                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PROPERTY_IS_ENUMERABLE)
+#define  DUK_HEAP_STRING_IS_PROTOTYPE_OF(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_PROTOTYPE_OF)
+#define  DUK_HTHREAD_STRING_IS_PROTOTYPE_OF(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_PROTOTYPE_OF)
+#define  DUK_HEAP_STRING_HAS_OWN_PROPERTY(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_HAS_OWN_PROPERTY)
+#define  DUK_HTHREAD_STRING_HAS_OWN_PROPERTY(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_HAS_OWN_PROPERTY)
+#define  DUK_HEAP_STRING_VALUE_OF(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_VALUE_OF)
+#define  DUK_HTHREAD_STRING_VALUE_OF(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_VALUE_OF)
+#define  DUK_HEAP_STRING_TO_LOCALE_STRING(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_LOCALE_STRING)
+#define  DUK_HTHREAD_STRING_TO_LOCALE_STRING(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_LOCALE_STRING)
+#define  DUK_HEAP_STRING_TO_STRING(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_STRING)
+#define  DUK_HTHREAD_STRING_TO_STRING(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_STRING)
+#define  DUK_HEAP_STRING_CONSTRUCTOR(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CONSTRUCTOR)
+#define  DUK_HTHREAD_STRING_CONSTRUCTOR(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CONSTRUCTOR)
+#define  DUK_HEAP_STRING_ENUMERABLE(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ENUMERABLE)
+#define  DUK_HTHREAD_STRING_ENUMERABLE(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ENUMERABLE)
+#define  DUK_HEAP_STRING_CONFIGURABLE(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CONFIGURABLE)
+#define  DUK_HTHREAD_STRING_CONFIGURABLE(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CONFIGURABLE)
+#define  DUK_HEAP_STRING_WRITABLE(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_WRITABLE)
+#define  DUK_HTHREAD_STRING_WRITABLE(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_WRITABLE)
+#define  DUK_HEAP_STRING_VALUE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_VALUE)
+#define  DUK_HTHREAD_STRING_VALUE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_VALUE)
+#define  DUK_HEAP_STRING_KEYS(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_KEYS)
+#define  DUK_HTHREAD_STRING_KEYS(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_KEYS)
+#define  DUK_HEAP_STRING_IS_EXTENSIBLE(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_EXTENSIBLE)
+#define  DUK_HTHREAD_STRING_IS_EXTENSIBLE(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_EXTENSIBLE)
+#define  DUK_HEAP_STRING_IS_FROZEN(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_FROZEN)
+#define  DUK_HTHREAD_STRING_IS_FROZEN(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_FROZEN)
+#define  DUK_HEAP_STRING_IS_SEALED(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_SEALED)
+#define  DUK_HTHREAD_STRING_IS_SEALED(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_SEALED)
+#define  DUK_HEAP_STRING_PREVENT_EXTENSIONS(heap)                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PREVENT_EXTENSIONS)
+#define  DUK_HTHREAD_STRING_PREVENT_EXTENSIONS(thr)                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PREVENT_EXTENSIONS)
+#define  DUK_HEAP_STRING_FREEZE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FREEZE)
+#define  DUK_HTHREAD_STRING_FREEZE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FREEZE)
+#define  DUK_HEAP_STRING_SEAL(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SEAL)
+#define  DUK_HTHREAD_STRING_SEAL(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SEAL)
+#define  DUK_HEAP_STRING_DEFINE_PROPERTIES(heap)                       DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEFINE_PROPERTIES)
+#define  DUK_HTHREAD_STRING_DEFINE_PROPERTIES(thr)                     DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEFINE_PROPERTIES)
+#define  DUK_HEAP_STRING_DEFINE_PROPERTY(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEFINE_PROPERTY)
+#define  DUK_HTHREAD_STRING_DEFINE_PROPERTY(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEFINE_PROPERTY)
+#define  DUK_HEAP_STRING_CREATE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CREATE)
+#define  DUK_HTHREAD_STRING_CREATE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CREATE)
+#define  DUK_HEAP_STRING_GET_OWN_PROPERTY_NAMES(heap)                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_OWN_PROPERTY_NAMES)
+#define  DUK_HTHREAD_STRING_GET_OWN_PROPERTY_NAMES(thr)                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_OWN_PROPERTY_NAMES)
+#define  DUK_HEAP_STRING_GET_OWN_PROPERTY_DESCRIPTOR(heap)             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_OWN_PROPERTY_DESCRIPTOR)
+#define  DUK_HTHREAD_STRING_GET_OWN_PROPERTY_DESCRIPTOR(thr)           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_OWN_PROPERTY_DESCRIPTOR)
+#define  DUK_HEAP_STRING_GET_PROTOTYPE_OF(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_PROTOTYPE_OF)
+#define  DUK_HTHREAD_STRING_GET_PROTOTYPE_OF(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_PROTOTYPE_OF)
+#define  DUK_HEAP_STRING_PROTOTYPE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PROTOTYPE)
+#define  DUK_HTHREAD_STRING_PROTOTYPE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PROTOTYPE)
+#define  DUK_HEAP_STRING_LENGTH(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LENGTH)
+#define  DUK_HTHREAD_STRING_LENGTH(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LENGTH)
+#define  DUK_HEAP_STRING_ALERT(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ALERT)
+#define  DUK_HTHREAD_STRING_ALERT(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ALERT)
+#define  DUK_HEAP_STRING_PRINT(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PRINT)
+#define  DUK_HTHREAD_STRING_PRINT(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PRINT)
+#define  DUK_HEAP_STRING_UNESCAPE(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UNESCAPE)
+#define  DUK_HTHREAD_STRING_UNESCAPE(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UNESCAPE)
+#define  DUK_HEAP_STRING_ESCAPE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ESCAPE)
+#define  DUK_HTHREAD_STRING_ESCAPE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ESCAPE)
+#define  DUK_HEAP_STRING_ENCODE_URI_COMPONENT(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ENCODE_URI_COMPONENT)
+#define  DUK_HTHREAD_STRING_ENCODE_URI_COMPONENT(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ENCODE_URI_COMPONENT)
+#define  DUK_HEAP_STRING_ENCODE_URI(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ENCODE_URI)
+#define  DUK_HTHREAD_STRING_ENCODE_URI(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ENCODE_URI)
+#define  DUK_HEAP_STRING_DECODE_URI_COMPONENT(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DECODE_URI_COMPONENT)
+#define  DUK_HTHREAD_STRING_DECODE_URI_COMPONENT(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DECODE_URI_COMPONENT)
+#define  DUK_HEAP_STRING_DECODE_URI(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DECODE_URI)
+#define  DUK_HTHREAD_STRING_DECODE_URI(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DECODE_URI)
+#define  DUK_HEAP_STRING_IS_FINITE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_FINITE)
+#define  DUK_HTHREAD_STRING_IS_FINITE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_FINITE)
+#define  DUK_HEAP_STRING_IS_NAN(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_NAN)
+#define  DUK_HTHREAD_STRING_IS_NAN(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_NAN)
+#define  DUK_HEAP_STRING_PARSE_FLOAT(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PARSE_FLOAT)
+#define  DUK_HTHREAD_STRING_PARSE_FLOAT(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PARSE_FLOAT)
+#define  DUK_HEAP_STRING_PARSE_INT(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PARSE_INT)
+#define  DUK_HTHREAD_STRING_PARSE_INT(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PARSE_INT)
+#define  DUK_HEAP_STRING_EVAL(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EVAL)
+#define  DUK_HTHREAD_STRING_EVAL(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EVAL)
+#define  DUK_HEAP_STRING_URI_ERROR(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_URI_ERROR)
+#define  DUK_HTHREAD_STRING_URI_ERROR(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_URI_ERROR)
+#define  DUK_HEAP_STRING_TYPE_ERROR(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TYPE_ERROR)
+#define  DUK_HTHREAD_STRING_TYPE_ERROR(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TYPE_ERROR)
+#define  DUK_HEAP_STRING_SYNTAX_ERROR(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SYNTAX_ERROR)
+#define  DUK_HTHREAD_STRING_SYNTAX_ERROR(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SYNTAX_ERROR)
+#define  DUK_HEAP_STRING_REFERENCE_ERROR(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REFERENCE_ERROR)
+#define  DUK_HTHREAD_STRING_REFERENCE_ERROR(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REFERENCE_ERROR)
+#define  DUK_HEAP_STRING_RANGE_ERROR(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_RANGE_ERROR)
+#define  DUK_HTHREAD_STRING_RANGE_ERROR(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_RANGE_ERROR)
+#define  DUK_HEAP_STRING_EVAL_ERROR(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EVAL_ERROR)
+#define  DUK_HTHREAD_STRING_EVAL_ERROR(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EVAL_ERROR)
+#define  DUK_HEAP_STRING_BREAK(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BREAK)
+#define  DUK_HTHREAD_STRING_BREAK(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BREAK)
+#define  DUK_HEAP_STRING_CASE(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CASE)
+#define  DUK_HTHREAD_STRING_CASE(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CASE)
+#define  DUK_HEAP_STRING_CATCH(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CATCH)
+#define  DUK_HTHREAD_STRING_CATCH(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CATCH)
+#define  DUK_HEAP_STRING_CONTINUE(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CONTINUE)
+#define  DUK_HTHREAD_STRING_CONTINUE(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CONTINUE)
+#define  DUK_HEAP_STRING_DEBUGGER(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEBUGGER)
+#define  DUK_HTHREAD_STRING_DEBUGGER(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEBUGGER)
+#define  DUK_HEAP_STRING_DEFAULT(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEFAULT)
+#define  DUK_HTHREAD_STRING_DEFAULT(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEFAULT)
+#define  DUK_HEAP_STRING_DELETE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DELETE)
+#define  DUK_HTHREAD_STRING_DELETE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DELETE)
+#define  DUK_HEAP_STRING_DO(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DO)
+#define  DUK_HTHREAD_STRING_DO(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DO)
+#define  DUK_HEAP_STRING_ELSE(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ELSE)
+#define  DUK_HTHREAD_STRING_ELSE(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ELSE)
+#define  DUK_HEAP_STRING_FINALLY(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FINALLY)
+#define  DUK_HTHREAD_STRING_FINALLY(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FINALLY)
+#define  DUK_HEAP_STRING_FOR(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FOR)
+#define  DUK_HTHREAD_STRING_FOR(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FOR)
+#define  DUK_HEAP_STRING_LC_FUNCTION(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_FUNCTION)
+#define  DUK_HTHREAD_STRING_LC_FUNCTION(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_FUNCTION)
+#define  DUK_HEAP_STRING_IF(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IF)
+#define  DUK_HTHREAD_STRING_IF(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IF)
+#define  DUK_HEAP_STRING_IN(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IN)
+#define  DUK_HTHREAD_STRING_IN(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IN)
+#define  DUK_HEAP_STRING_INSTANCEOF(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INSTANCEOF)
+#define  DUK_HTHREAD_STRING_INSTANCEOF(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INSTANCEOF)
+#define  DUK_HEAP_STRING_NEW(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NEW)
+#define  DUK_HTHREAD_STRING_NEW(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NEW)
+#define  DUK_HEAP_STRING_RETURN(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_RETURN)
+#define  DUK_HTHREAD_STRING_RETURN(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_RETURN)
+#define  DUK_HEAP_STRING_SWITCH(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SWITCH)
+#define  DUK_HTHREAD_STRING_SWITCH(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SWITCH)
+#define  DUK_HEAP_STRING_THIS(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_THIS)
+#define  DUK_HTHREAD_STRING_THIS(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_THIS)
+#define  DUK_HEAP_STRING_THROW(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_THROW)
+#define  DUK_HTHREAD_STRING_THROW(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_THROW)
+#define  DUK_HEAP_STRING_TRY(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TRY)
+#define  DUK_HTHREAD_STRING_TRY(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TRY)
+#define  DUK_HEAP_STRING_TYPEOF(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TYPEOF)
+#define  DUK_HTHREAD_STRING_TYPEOF(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TYPEOF)
+#define  DUK_HEAP_STRING_VAR(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_VAR)
+#define  DUK_HTHREAD_STRING_VAR(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_VAR)
+#define  DUK_HEAP_STRING_VOID(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_VOID)
+#define  DUK_HTHREAD_STRING_VOID(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_VOID)
+#define  DUK_HEAP_STRING_WHILE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_WHILE)
+#define  DUK_HTHREAD_STRING_WHILE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_WHILE)
+#define  DUK_HEAP_STRING_WITH(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_WITH)
+#define  DUK_HTHREAD_STRING_WITH(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_WITH)
+#define  DUK_HEAP_STRING_CLASS(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CLASS)
+#define  DUK_HTHREAD_STRING_CLASS(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CLASS)
+#define  DUK_HEAP_STRING_CONST(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CONST)
+#define  DUK_HTHREAD_STRING_CONST(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CONST)
+#define  DUK_HEAP_STRING_ENUM(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ENUM)
+#define  DUK_HTHREAD_STRING_ENUM(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ENUM)
+#define  DUK_HEAP_STRING_EXPORT(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EXPORT)
+#define  DUK_HTHREAD_STRING_EXPORT(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EXPORT)
+#define  DUK_HEAP_STRING_EXTENDS(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EXTENDS)
+#define  DUK_HTHREAD_STRING_EXTENDS(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EXTENDS)
+#define  DUK_HEAP_STRING_IMPORT(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IMPORT)
+#define  DUK_HTHREAD_STRING_IMPORT(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IMPORT)
+#define  DUK_HEAP_STRING_SUPER(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SUPER)
+#define  DUK_HTHREAD_STRING_SUPER(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SUPER)
+#define  DUK_HEAP_STRING_NULL(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NULL)
+#define  DUK_HTHREAD_STRING_NULL(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NULL)
+#define  DUK_HEAP_STRING_TRUE(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TRUE)
+#define  DUK_HTHREAD_STRING_TRUE(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TRUE)
+#define  DUK_HEAP_STRING_FALSE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FALSE)
+#define  DUK_HTHREAD_STRING_FALSE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FALSE)
+#define  DUK_HEAP_STRING_GET(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET)
+#define  DUK_HTHREAD_STRING_GET(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET)
+#define  DUK_HEAP_STRING_SET(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET)
+#define  DUK_HTHREAD_STRING_SET(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET)
+#define  DUK_HEAP_STRING_IMPLEMENTS(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IMPLEMENTS)
+#define  DUK_HTHREAD_STRING_IMPLEMENTS(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IMPLEMENTS)
+#define  DUK_HEAP_STRING_INTERFACE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INTERFACE)
+#define  DUK_HTHREAD_STRING_INTERFACE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INTERFACE)
+#define  DUK_HEAP_STRING_LET(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LET)
+#define  DUK_HTHREAD_STRING_LET(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LET)
+#define  DUK_HEAP_STRING_PACKAGE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PACKAGE)
+#define  DUK_HTHREAD_STRING_PACKAGE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PACKAGE)
+#define  DUK_HEAP_STRING_PRIVATE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PRIVATE)
+#define  DUK_HTHREAD_STRING_PRIVATE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PRIVATE)
+#define  DUK_HEAP_STRING_PROTECTED(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PROTECTED)
+#define  DUK_HTHREAD_STRING_PROTECTED(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PROTECTED)
+#define  DUK_HEAP_STRING_PUBLIC(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PUBLIC)
+#define  DUK_HTHREAD_STRING_PUBLIC(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PUBLIC)
+#define  DUK_HEAP_STRING_STATIC(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_STATIC)
+#define  DUK_HTHREAD_STRING_STATIC(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_STATIC)
+#define  DUK_HEAP_STRING_YIELD(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_YIELD)
+#define  DUK_HTHREAD_STRING_YIELD(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_YIELD)
+
+#define  DUK_HEAP_NUM_STRINGS                                          305
+
+#define  DUK_STRIDX_START_RESERVED                                     258
+#define  DUK_STRIDX_START_STRICT_RESERVED                              296
+#define  DUK_STRIDX_END_RESERVED                                       305                            /* exclusive endpoint */
+
+extern duk_c_function duk_builtin_native_functions[];
+
+extern char duk_builtins_data[];
+
+#define  DUK_BUILTINS_DATA_LENGTH                                      1225
+
+#define  DUK_BIDX_GLOBAL                                               0
+#define  DUK_BIDX_GLOBAL_ENV                                           1
+#define  DUK_BIDX_OBJECT_CONSTRUCTOR                                   2
+#define  DUK_BIDX_OBJECT_PROTOTYPE                                     3
+#define  DUK_BIDX_FUNCTION_CONSTRUCTOR                                 4
+#define  DUK_BIDX_FUNCTION_PROTOTYPE                                   5
+#define  DUK_BIDX_ARRAY_CONSTRUCTOR                                    6
+#define  DUK_BIDX_ARRAY_PROTOTYPE                                      7
+#define  DUK_BIDX_STRING_CONSTRUCTOR                                   8
+#define  DUK_BIDX_STRING_PROTOTYPE                                     9
+#define  DUK_BIDX_BOOLEAN_CONSTRUCTOR                                  10
+#define  DUK_BIDX_BOOLEAN_PROTOTYPE                                    11
+#define  DUK_BIDX_NUMBER_CONSTRUCTOR                                   12
+#define  DUK_BIDX_NUMBER_PROTOTYPE                                     13
+#define  DUK_BIDX_DATE_CONSTRUCTOR                                     14
+#define  DUK_BIDX_DATE_PROTOTYPE                                       15
+#define  DUK_BIDX_REGEXP_CONSTRUCTOR                                   16
+#define  DUK_BIDX_REGEXP_PROTOTYPE                                     17
+#define  DUK_BIDX_ERROR_CONSTRUCTOR                                    18
+#define  DUK_BIDX_ERROR_PROTOTYPE                                      19
+#define  DUK_BIDX_EVAL_ERROR_CONSTRUCTOR                               20
+#define  DUK_BIDX_EVAL_ERROR_PROTOTYPE                                 21
+#define  DUK_BIDX_RANGE_ERROR_CONSTRUCTOR                              22
+#define  DUK_BIDX_RANGE_ERROR_PROTOTYPE                                23
+#define  DUK_BIDX_REFERENCE_ERROR_CONSTRUCTOR                          24
+#define  DUK_BIDX_REFERENCE_ERROR_PROTOTYPE                            25
+#define  DUK_BIDX_SYNTAX_ERROR_CONSTRUCTOR                             26
+#define  DUK_BIDX_SYNTAX_ERROR_PROTOTYPE                               27
+#define  DUK_BIDX_TYPE_ERROR_CONSTRUCTOR                               28
+#define  DUK_BIDX_TYPE_ERROR_PROTOTYPE                                 29
+#define  DUK_BIDX_URI_ERROR_CONSTRUCTOR                                30
+#define  DUK_BIDX_URI_ERROR_PROTOTYPE                                  31
+#define  DUK_BIDX_MATH                                                 32
+#define  DUK_BIDX_JSON                                                 33
+#define  DUK_BIDX_TYPE_ERROR_THROWER                                   34
+#define  DUK_BIDX_DUK                                                  35
+#define  DUK_BIDX_THREAD_CONSTRUCTOR                                   36
+#define  DUK_BIDX_THREAD_PROTOTYPE                                     37
+#define  DUK_BIDX_BUFFER_CONSTRUCTOR                                   38
+#define  DUK_BIDX_BUFFER_PROTOTYPE                                     39
+#define  DUK_BIDX_POINTER_CONSTRUCTOR                                  40
+#define  DUK_BIDX_POINTER_PROTOTYPE                                    41
+#define  DUK_BIDX_DOUBLE_ERROR                                         42
+
+#define  DUK_NUM_BUILTINS                                              43
+
+#elif defined(DUK_USE_DOUBLE_ME)
+extern char duk_strings_data[];
+
+#define  DUK_STRDATA_DATA_LENGTH                                       1785
+#define  DUK_STRDATA_MAX_STRLEN                                        24
+
+#define  DUK_STRIDX_UC_THREAD                                          0                              /* 'Thread' */
+#define  DUK_STRIDX_UC_POINTER                                         1                              /* 'Pointer' */
+#define  DUK_STRIDX_UC_BUFFER                                          2                              /* 'Buffer' */
+#define  DUK_STRIDX_DEC_ENV                                            3                              /* 'DecEnv' */
+#define  DUK_STRIDX_OBJ_ENV                                            4                              /* 'ObjEnv' */
+#define  DUK_STRIDX_EMPTY_STRING                                       5                              /* '' */
+#define  DUK_STRIDX_GLOBAL                                             6                              /* 'global' */
+#define  DUK_STRIDX_UC_ARGUMENTS                                       7                              /* 'Arguments' */
+#define  DUK_STRIDX_JSON                                               8                              /* 'JSON' */
+#define  DUK_STRIDX_MATH                                               9                              /* 'Math' */
+#define  DUK_STRIDX_ERROR                                              10                             /* 'Error' */
+#define  DUK_STRIDX_REG_EXP                                            11                             /* 'RegExp' */
+#define  DUK_STRIDX_DATE                                               12                             /* 'Date' */
+#define  DUK_STRIDX_UC_NUMBER                                          13                             /* 'Number' */
+#define  DUK_STRIDX_UC_BOOLEAN                                         14                             /* 'Boolean' */
+#define  DUK_STRIDX_UC_STRING                                          15                             /* 'String' */
+#define  DUK_STRIDX_ARRAY                                              16                             /* 'Array' */
+#define  DUK_STRIDX_UC_FUNCTION                                        17                             /* 'Function' */
+#define  DUK_STRIDX_UC_OBJECT                                          18                             /* 'Object' */
+#define  DUK_STRIDX_JSON_EXT_NEGINF                                    19                             /* '{"_ninf":true}' */
+#define  DUK_STRIDX_JSON_EXT_POSINF                                    20                             /* '{"_inf":true}' */
+#define  DUK_STRIDX_JSON_EXT_NAN                                       21                             /* '{"_nan":true}' */
+#define  DUK_STRIDX_JSON_EXT_UNDEFINED                                 22                             /* '{"_undefined":true}' */
+#define  DUK_STRIDX_CURRENT                                            23                             /* 'current' */
+#define  DUK_STRIDX_RESUME                                             24                             /* 'resume' */
+#define  DUK_STRIDX_BASE64                                             25                             /* 'base64' */
+#define  DUK_STRIDX_HEX                                                26                             /* 'hex' */
+#define  DUK_STRIDX_DEC                                                27                             /* 'dec' */
+#define  DUK_STRIDX_ENC                                                28                             /* 'enc' */
+#define  DUK_STRIDX_GET_FINALIZER                                      29                             /* 'getFinalizer' */
+#define  DUK_STRIDX_SET_FINALIZER                                      30                             /* 'setFinalizer' */
+#define  DUK_STRIDX_GC                                                 31                             /* 'gc' */
+#define  DUK_STRIDX_REFC                                               32                             /* 'refc' */
+#define  DUK_STRIDX_ADDR                                               33                             /* 'addr' */
+#define  DUK_STRIDX_BUILD                                              34                             /* 'build' */
+#define  DUK_STRIDX_VERSION                                            35                             /* 'version' */
+#define  DUK_STRIDX_DUK                                                36                             /* '__duk__' */
+#define  DUK_STRIDX_COMPILE                                            37                             /* 'compile' */
+#define  DUK_STRIDX_INT_REGBASE                                        38                             /* '\x00regbase' */
+#define  DUK_STRIDX_INT_THREAD                                         39                             /* '\x00thread' */
+#define  DUK_STRIDX_INT_FINALIZER                                      40                             /* '\x00finalizer' */
+#define  DUK_STRIDX_INT_METATABLE                                      41                             /* '\x00metatable' */
+#define  DUK_STRIDX_INT_CALLEE                                         42                             /* '\x00callee' */
+#define  DUK_STRIDX_INT_MAP                                            43                             /* '\x00map' */
+#define  DUK_STRIDX_INT_ARGS                                           44                             /* '\x00args' */
+#define  DUK_STRIDX_INT_THIS                                           45                             /* '\x00this' */
+#define  DUK_STRIDX_INT_PC2LINE                                        46                             /* '\x00pc2line' */
+#define  DUK_STRIDX_INT_SOURCE                                         47                             /* '\x00source' */
+#define  DUK_STRIDX_INT_VARENV                                         48                             /* '\x00varenv' */
+#define  DUK_STRIDX_INT_LEXENV                                         49                             /* '\x00lexenv' */
+#define  DUK_STRIDX_INT_VARMAP                                         50                             /* '\x00varmap' */
+#define  DUK_STRIDX_INT_FORMALS                                        51                             /* '\x00formals' */
+#define  DUK_STRIDX_INT_BYTECODE                                       52                             /* '\x00bytecode' */
+#define  DUK_STRIDX_INT_NEXT                                           53                             /* '\x00next' */
+#define  DUK_STRIDX_INT_TARGET                                         54                             /* '\x00target' */
+#define  DUK_STRIDX_INT_VALUE                                          55                             /* '\x00value' */
+#define  DUK_STRIDX_LC_POINTER                                         56                             /* 'pointer' */
+#define  DUK_STRIDX_LC_BUFFER                                          57                             /* 'buffer' */
+#define  DUK_STRIDX_TRACEDATA                                          58                             /* 'tracedata' */
+#define  DUK_STRIDX_LINE_NUMBER                                        59                             /* 'lineNumber' */
+#define  DUK_STRIDX_FILE_NAME                                          60                             /* 'fileName' */
+#define  DUK_STRIDX_PC                                                 61                             /* 'pc' */
+#define  DUK_STRIDX_STACK                                              62                             /* 'stack' */
+#define  DUK_STRIDX_THROW_TYPE_ERROR                                   63                             /* 'ThrowTypeError' */
+#define  DUK_STRIDX_CALLEE                                             64                             /* 'callee' */
+#define  DUK_STRIDX_INVALID_DATE                                       65                             /* 'Invalid Date' */
+#define  DUK_STRIDX_BRACKETED_ELLIPSIS                                 66                             /* '[...]' */
+#define  DUK_STRIDX_NEWLINE_TAB                                        67                             /* '\n\t' */
+#define  DUK_STRIDX_SPACE                                              68                             /* ' ' */
+#define  DUK_STRIDX_COMMA                                              69                             /* ',' */
+#define  DUK_STRIDX_MINUS_ZERO                                         70                             /* '-0' */
+#define  DUK_STRIDX_PLUS_ZERO                                          71                             /* '+0' */
+#define  DUK_STRIDX_ZERO                                               72                             /* '0' */
+#define  DUK_STRIDX_MINUS_INFINITY                                     73                             /* '-Infinity' */
+#define  DUK_STRIDX_PLUS_INFINITY                                      74                             /* '+Infinity' */
+#define  DUK_STRIDX_INFINITY                                           75                             /* 'Infinity' */
+#define  DUK_STRIDX_LC_OBJECT                                          76                             /* 'object' */
+#define  DUK_STRIDX_LC_STRING                                          77                             /* 'string' */
+#define  DUK_STRIDX_LC_NUMBER                                          78                             /* 'number' */
+#define  DUK_STRIDX_LC_BOOLEAN                                         79                             /* 'boolean' */
+#define  DUK_STRIDX_UNDEFINED                                          80                             /* 'undefined' */
+#define  DUK_STRIDX_STRINGIFY                                          81                             /* 'stringify' */
+#define  DUK_STRIDX_TAN                                                82                             /* 'tan' */
+#define  DUK_STRIDX_SQRT                                               83                             /* 'sqrt' */
+#define  DUK_STRIDX_SIN                                                84                             /* 'sin' */
+#define  DUK_STRIDX_ROUND                                              85                             /* 'round' */
+#define  DUK_STRIDX_RANDOM                                             86                             /* 'random' */
+#define  DUK_STRIDX_POW                                                87                             /* 'pow' */
+#define  DUK_STRIDX_MIN                                                88                             /* 'min' */
+#define  DUK_STRIDX_MAX                                                89                             /* 'max' */
+#define  DUK_STRIDX_LOG                                                90                             /* 'log' */
+#define  DUK_STRIDX_FLOOR                                              91                             /* 'floor' */
+#define  DUK_STRIDX_EXP                                                92                             /* 'exp' */
+#define  DUK_STRIDX_COS                                                93                             /* 'cos' */
+#define  DUK_STRIDX_CEIL                                               94                             /* 'ceil' */
+#define  DUK_STRIDX_ATAN2                                              95                             /* 'atan2' */
+#define  DUK_STRIDX_ATAN                                               96                             /* 'atan' */
+#define  DUK_STRIDX_ASIN                                               97                             /* 'asin' */
+#define  DUK_STRIDX_ACOS                                               98                             /* 'acos' */
+#define  DUK_STRIDX_ABS                                                99                             /* 'abs' */
+#define  DUK_STRIDX_SQRT2                                              100                            /* 'SQRT2' */
+#define  DUK_STRIDX_SQRT1_2                                            101                            /* 'SQRT1_2' */
+#define  DUK_STRIDX_PI                                                 102                            /* 'PI' */
+#define  DUK_STRIDX_LOG10E                                             103                            /* 'LOG10E' */
+#define  DUK_STRIDX_LOG2E                                              104                            /* 'LOG2E' */
+#define  DUK_STRIDX_LN2                                                105                            /* 'LN2' */
+#define  DUK_STRIDX_LN10                                               106                            /* 'LN10' */
+#define  DUK_STRIDX_E                                                  107                            /* 'E' */
+#define  DUK_STRIDX_MESSAGE                                            108                            /* 'message' */
+#define  DUK_STRIDX_NAME                                               109                            /* 'name' */
+#define  DUK_STRIDX_INPUT                                              110                            /* 'input' */
+#define  DUK_STRIDX_INDEX                                              111                            /* 'index' */
+#define  DUK_STRIDX_ESCAPED_EMPTY_REGEXP                               112                            /* '(?:)' */
+#define  DUK_STRIDX_LAST_INDEX                                         113                            /* 'lastIndex' */
+#define  DUK_STRIDX_MULTILINE                                          114                            /* 'multiline' */
+#define  DUK_STRIDX_IGNORE_CASE                                        115                            /* 'ignoreCase' */
+#define  DUK_STRIDX_SOURCE                                             116                            /* 'source' */
+#define  DUK_STRIDX_TEST                                               117                            /* 'test' */
+#define  DUK_STRIDX_EXEC                                               118                            /* 'exec' */
+#define  DUK_STRIDX_TO_GMT_STRING                                      119                            /* 'toGMTString' */
+#define  DUK_STRIDX_SET_YEAR                                           120                            /* 'setYear' */
+#define  DUK_STRIDX_GET_YEAR                                           121                            /* 'getYear' */
+#define  DUK_STRIDX_TO_JSON                                            122                            /* 'toJSON' */
+#define  DUK_STRIDX_TO_ISO_STRING                                      123                            /* 'toISOString' */
+#define  DUK_STRIDX_TO_UTC_STRING                                      124                            /* 'toUTCString' */
+#define  DUK_STRIDX_SET_UTC_FULL_YEAR                                  125                            /* 'setUTCFullYear' */
+#define  DUK_STRIDX_SET_FULL_YEAR                                      126                            /* 'setFullYear' */
+#define  DUK_STRIDX_SET_UTC_MONTH                                      127                            /* 'setUTCMonth' */
+#define  DUK_STRIDX_SET_MONTH                                          128                            /* 'setMonth' */
+#define  DUK_STRIDX_SET_UTC_DATE                                       129                            /* 'setUTCDate' */
+#define  DUK_STRIDX_SET_DATE                                           130                            /* 'setDate' */
+#define  DUK_STRIDX_SET_UTC_HOURS                                      131                            /* 'setUTCHours' */
+#define  DUK_STRIDX_SET_HOURS                                          132                            /* 'setHours' */
+#define  DUK_STRIDX_SET_UTC_MINUTES                                    133                            /* 'setUTCMinutes' */
+#define  DUK_STRIDX_SET_MINUTES                                        134                            /* 'setMinutes' */
+#define  DUK_STRIDX_SET_UTC_SECONDS                                    135                            /* 'setUTCSeconds' */
+#define  DUK_STRIDX_SET_SECONDS                                        136                            /* 'setSeconds' */
+#define  DUK_STRIDX_SET_UTC_MILLISECONDS                               137                            /* 'setUTCMilliseconds' */
+#define  DUK_STRIDX_SET_MILLISECONDS                                   138                            /* 'setMilliseconds' */
+#define  DUK_STRIDX_SET_TIME                                           139                            /* 'setTime' */
+#define  DUK_STRIDX_GET_TIMEZONE_OFFSET                                140                            /* 'getTimezoneOffset' */
+#define  DUK_STRIDX_GET_UTC_MILLISECONDS                               141                            /* 'getUTCMilliseconds' */
+#define  DUK_STRIDX_GET_MILLISECONDS                                   142                            /* 'getMilliseconds' */
+#define  DUK_STRIDX_GET_UTC_SECONDS                                    143                            /* 'getUTCSeconds' */
+#define  DUK_STRIDX_GET_SECONDS                                        144                            /* 'getSeconds' */
+#define  DUK_STRIDX_GET_UTC_MINUTES                                    145                            /* 'getUTCMinutes' */
+#define  DUK_STRIDX_GET_MINUTES                                        146                            /* 'getMinutes' */
+#define  DUK_STRIDX_GET_UTC_HOURS                                      147                            /* 'getUTCHours' */
+#define  DUK_STRIDX_GET_HOURS                                          148                            /* 'getHours' */
+#define  DUK_STRIDX_GET_UTC_DAY                                        149                            /* 'getUTCDay' */
+#define  DUK_STRIDX_GET_DAY                                            150                            /* 'getDay' */
+#define  DUK_STRIDX_GET_UTC_DATE                                       151                            /* 'getUTCDate' */
+#define  DUK_STRIDX_GET_DATE                                           152                            /* 'getDate' */
+#define  DUK_STRIDX_GET_UTC_MONTH                                      153                            /* 'getUTCMonth' */
+#define  DUK_STRIDX_GET_MONTH                                          154                            /* 'getMonth' */
+#define  DUK_STRIDX_GET_UTC_FULL_YEAR                                  155                            /* 'getUTCFullYear' */
+#define  DUK_STRIDX_GET_FULL_YEAR                                      156                            /* 'getFullYear' */
+#define  DUK_STRIDX_GET_TIME                                           157                            /* 'getTime' */
+#define  DUK_STRIDX_TO_LOCALE_TIME_STRING                              158                            /* 'toLocaleTimeString' */
+#define  DUK_STRIDX_TO_LOCALE_DATE_STRING                              159                            /* 'toLocaleDateString' */
+#define  DUK_STRIDX_TO_TIME_STRING                                     160                            /* 'toTimeString' */
+#define  DUK_STRIDX_TO_DATE_STRING                                     161                            /* 'toDateString' */
+#define  DUK_STRIDX_NOW                                                162                            /* 'now' */
+#define  DUK_STRIDX_UTC                                                163                            /* 'UTC' */
+#define  DUK_STRIDX_PARSE                                              164                            /* 'parse' */
+#define  DUK_STRIDX_TO_PRECISION                                       165                            /* 'toPrecision' */
+#define  DUK_STRIDX_TO_EXPONENTIAL                                     166                            /* 'toExponential' */
+#define  DUK_STRIDX_TO_FIXED                                           167                            /* 'toFixed' */
+#define  DUK_STRIDX_POSITIVE_INFINITY                                  168                            /* 'POSITIVE_INFINITY' */
+#define  DUK_STRIDX_NEGATIVE_INFINITY                                  169                            /* 'NEGATIVE_INFINITY' */
+#define  DUK_STRIDX_NAN                                                170                            /* 'NaN' */
+#define  DUK_STRIDX_MIN_VALUE                                          171                            /* 'MIN_VALUE' */
+#define  DUK_STRIDX_MAX_VALUE                                          172                            /* 'MAX_VALUE' */
+#define  DUK_STRIDX_SUBSTR                                             173                            /* 'substr' */
+#define  DUK_STRIDX_TRIM                                               174                            /* 'trim' */
+#define  DUK_STRIDX_TO_LOCALE_UPPER_CASE                               175                            /* 'toLocaleUpperCase' */
+#define  DUK_STRIDX_TO_UPPER_CASE                                      176                            /* 'toUpperCase' */
+#define  DUK_STRIDX_TO_LOCALE_LOWER_CASE                               177                            /* 'toLocaleLowerCase' */
+#define  DUK_STRIDX_TO_LOWER_CASE                                      178                            /* 'toLowerCase' */
+#define  DUK_STRIDX_SUBSTRING                                          179                            /* 'substring' */
+#define  DUK_STRIDX_SPLIT                                              180                            /* 'split' */
+#define  DUK_STRIDX_SEARCH                                             181                            /* 'search' */
+#define  DUK_STRIDX_REPLACE                                            182                            /* 'replace' */
+#define  DUK_STRIDX_MATCH                                              183                            /* 'match' */
+#define  DUK_STRIDX_LOCALE_COMPARE                                     184                            /* 'localeCompare' */
+#define  DUK_STRIDX_CHAR_CODE_AT                                       185                            /* 'charCodeAt' */
+#define  DUK_STRIDX_CHAR_AT                                            186                            /* 'charAt' */
+#define  DUK_STRIDX_FROM_CHAR_CODE                                     187                            /* 'fromCharCode' */
+#define  DUK_STRIDX_REDUCE_RIGHT                                       188                            /* 'reduceRight' */
+#define  DUK_STRIDX_REDUCE                                             189                            /* 'reduce' */
+#define  DUK_STRIDX_FILTER                                             190                            /* 'filter' */
+#define  DUK_STRIDX_MAP                                                191                            /* 'map' */
+#define  DUK_STRIDX_FOR_EACH                                           192                            /* 'forEach' */
+#define  DUK_STRIDX_SOME                                               193                            /* 'some' */
+#define  DUK_STRIDX_EVERY                                              194                            /* 'every' */
+#define  DUK_STRIDX_LAST_INDEX_OF                                      195                            /* 'lastIndexOf' */
+#define  DUK_STRIDX_INDEX_OF                                           196                            /* 'indexOf' */
+#define  DUK_STRIDX_UNSHIFT                                            197                            /* 'unshift' */
+#define  DUK_STRIDX_SPLICE                                             198                            /* 'splice' */
+#define  DUK_STRIDX_SORT                                               199                            /* 'sort' */
+#define  DUK_STRIDX_SLICE                                              200                            /* 'slice' */
+#define  DUK_STRIDX_SHIFT                                              201                            /* 'shift' */
+#define  DUK_STRIDX_REVERSE                                            202                            /* 'reverse' */
+#define  DUK_STRIDX_PUSH                                               203                            /* 'push' */
+#define  DUK_STRIDX_POP                                                204                            /* 'pop' */
+#define  DUK_STRIDX_JOIN                                               205                            /* 'join' */
+#define  DUK_STRIDX_CONCAT                                             206                            /* 'concat' */
+#define  DUK_STRIDX_IS_ARRAY                                           207                            /* 'isArray' */
+#define  DUK_STRIDX_LC_ARGUMENTS                                       208                            /* 'arguments' */
+#define  DUK_STRIDX_CALLER                                             209                            /* 'caller' */
+#define  DUK_STRIDX_BIND                                               210                            /* 'bind' */
+#define  DUK_STRIDX_CALL                                               211                            /* 'call' */
+#define  DUK_STRIDX_APPLY                                              212                            /* 'apply' */
+#define  DUK_STRIDX_PROPERTY_IS_ENUMERABLE                             213                            /* 'propertyIsEnumerable' */
+#define  DUK_STRIDX_IS_PROTOTYPE_OF                                    214                            /* 'isPrototypeOf' */
+#define  DUK_STRIDX_HAS_OWN_PROPERTY                                   215                            /* 'hasOwnProperty' */
+#define  DUK_STRIDX_VALUE_OF                                           216                            /* 'valueOf' */
+#define  DUK_STRIDX_TO_LOCALE_STRING                                   217                            /* 'toLocaleString' */
+#define  DUK_STRIDX_TO_STRING                                          218                            /* 'toString' */
+#define  DUK_STRIDX_CONSTRUCTOR                                        219                            /* 'constructor' */
+#define  DUK_STRIDX_ENUMERABLE                                         220                            /* 'enumerable' */
+#define  DUK_STRIDX_CONFIGURABLE                                       221                            /* 'configurable' */
+#define  DUK_STRIDX_WRITABLE                                           222                            /* 'writable' */
+#define  DUK_STRIDX_VALUE                                              223                            /* 'value' */
+#define  DUK_STRIDX_KEYS                                               224                            /* 'keys' */
+#define  DUK_STRIDX_IS_EXTENSIBLE                                      225                            /* 'isExtensible' */
+#define  DUK_STRIDX_IS_FROZEN                                          226                            /* 'isFrozen' */
+#define  DUK_STRIDX_IS_SEALED                                          227                            /* 'isSealed' */
+#define  DUK_STRIDX_PREVENT_EXTENSIONS                                 228                            /* 'preventExtensions' */
+#define  DUK_STRIDX_FREEZE                                             229                            /* 'freeze' */
+#define  DUK_STRIDX_SEAL                                               230                            /* 'seal' */
+#define  DUK_STRIDX_DEFINE_PROPERTIES                                  231                            /* 'defineProperties' */
+#define  DUK_STRIDX_DEFINE_PROPERTY                                    232                            /* 'defineProperty' */
+#define  DUK_STRIDX_CREATE                                             233                            /* 'create' */
+#define  DUK_STRIDX_GET_OWN_PROPERTY_NAMES                             234                            /* 'getOwnPropertyNames' */
+#define  DUK_STRIDX_GET_OWN_PROPERTY_DESCRIPTOR                        235                            /* 'getOwnPropertyDescriptor' */
+#define  DUK_STRIDX_GET_PROTOTYPE_OF                                   236                            /* 'getPrototypeOf' */
+#define  DUK_STRIDX_PROTOTYPE                                          237                            /* 'prototype' */
+#define  DUK_STRIDX_LENGTH                                             238                            /* 'length' */
+#define  DUK_STRIDX_ALERT                                              239                            /* 'alert' */
+#define  DUK_STRIDX_PRINT                                              240                            /* 'print' */
+#define  DUK_STRIDX_UNESCAPE                                           241                            /* 'unescape' */
+#define  DUK_STRIDX_ESCAPE                                             242                            /* 'escape' */
+#define  DUK_STRIDX_ENCODE_URI_COMPONENT                               243                            /* 'encodeURIComponent' */
+#define  DUK_STRIDX_ENCODE_URI                                         244                            /* 'encodeURI' */
+#define  DUK_STRIDX_DECODE_URI_COMPONENT                               245                            /* 'decodeURIComponent' */
+#define  DUK_STRIDX_DECODE_URI                                         246                            /* 'decodeURI' */
+#define  DUK_STRIDX_IS_FINITE                                          247                            /* 'isFinite' */
+#define  DUK_STRIDX_IS_NAN                                             248                            /* 'isNaN' */
+#define  DUK_STRIDX_PARSE_FLOAT                                        249                            /* 'parseFloat' */
+#define  DUK_STRIDX_PARSE_INT                                          250                            /* 'parseInt' */
+#define  DUK_STRIDX_EVAL                                               251                            /* 'eval' */
+#define  DUK_STRIDX_URI_ERROR                                          252                            /* 'URIError' */
+#define  DUK_STRIDX_TYPE_ERROR                                         253                            /* 'TypeError' */
+#define  DUK_STRIDX_SYNTAX_ERROR                                       254                            /* 'SyntaxError' */
+#define  DUK_STRIDX_REFERENCE_ERROR                                    255                            /* 'ReferenceError' */
+#define  DUK_STRIDX_RANGE_ERROR                                        256                            /* 'RangeError' */
+#define  DUK_STRIDX_EVAL_ERROR                                         257                            /* 'EvalError' */
+#define  DUK_STRIDX_BREAK                                              258                            /* 'break' */
+#define  DUK_STRIDX_CASE                                               259                            /* 'case' */
+#define  DUK_STRIDX_CATCH                                              260                            /* 'catch' */
+#define  DUK_STRIDX_CONTINUE                                           261                            /* 'continue' */
+#define  DUK_STRIDX_DEBUGGER                                           262                            /* 'debugger' */
+#define  DUK_STRIDX_DEFAULT                                            263                            /* 'default' */
+#define  DUK_STRIDX_DELETE                                             264                            /* 'delete' */
+#define  DUK_STRIDX_DO                                                 265                            /* 'do' */
+#define  DUK_STRIDX_ELSE                                               266                            /* 'else' */
+#define  DUK_STRIDX_FINALLY                                            267                            /* 'finally' */
+#define  DUK_STRIDX_FOR                                                268                            /* 'for' */
+#define  DUK_STRIDX_LC_FUNCTION                                        269                            /* 'function' */
+#define  DUK_STRIDX_IF                                                 270                            /* 'if' */
+#define  DUK_STRIDX_IN                                                 271                            /* 'in' */
+#define  DUK_STRIDX_INSTANCEOF                                         272                            /* 'instanceof' */
+#define  DUK_STRIDX_NEW                                                273                            /* 'new' */
+#define  DUK_STRIDX_RETURN                                             274                            /* 'return' */
+#define  DUK_STRIDX_SWITCH                                             275                            /* 'switch' */
+#define  DUK_STRIDX_THIS                                               276                            /* 'this' */
+#define  DUK_STRIDX_THROW                                              277                            /* 'throw' */
+#define  DUK_STRIDX_TRY                                                278                            /* 'try' */
+#define  DUK_STRIDX_TYPEOF                                             279                            /* 'typeof' */
+#define  DUK_STRIDX_VAR                                                280                            /* 'var' */
+#define  DUK_STRIDX_VOID                                               281                            /* 'void' */
+#define  DUK_STRIDX_WHILE                                              282                            /* 'while' */
+#define  DUK_STRIDX_WITH                                               283                            /* 'with' */
+#define  DUK_STRIDX_CLASS                                              284                            /* 'class' */
+#define  DUK_STRIDX_CONST                                              285                            /* 'const' */
+#define  DUK_STRIDX_ENUM                                               286                            /* 'enum' */
+#define  DUK_STRIDX_EXPORT                                             287                            /* 'export' */
+#define  DUK_STRIDX_EXTENDS                                            288                            /* 'extends' */
+#define  DUK_STRIDX_IMPORT                                             289                            /* 'import' */
+#define  DUK_STRIDX_SUPER                                              290                            /* 'super' */
+#define  DUK_STRIDX_NULL                                               291                            /* 'null' */
+#define  DUK_STRIDX_TRUE                                               292                            /* 'true' */
+#define  DUK_STRIDX_FALSE                                              293                            /* 'false' */
+#define  DUK_STRIDX_GET                                                294                            /* 'get' */
+#define  DUK_STRIDX_SET                                                295                            /* 'set' */
+#define  DUK_STRIDX_IMPLEMENTS                                         296                            /* 'implements' */
+#define  DUK_STRIDX_INTERFACE                                          297                            /* 'interface' */
+#define  DUK_STRIDX_LET                                                298                            /* 'let' */
+#define  DUK_STRIDX_PACKAGE                                            299                            /* 'package' */
+#define  DUK_STRIDX_PRIVATE                                            300                            /* 'private' */
+#define  DUK_STRIDX_PROTECTED                                          301                            /* 'protected' */
+#define  DUK_STRIDX_PUBLIC                                             302                            /* 'public' */
+#define  DUK_STRIDX_STATIC                                             303                            /* 'static' */
+#define  DUK_STRIDX_YIELD                                              304                            /* 'yield' */
+
+#define  DUK_HEAP_STRING_UC_THREAD(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_THREAD)
+#define  DUK_HTHREAD_STRING_UC_THREAD(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_THREAD)
+#define  DUK_HEAP_STRING_UC_POINTER(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_POINTER)
+#define  DUK_HTHREAD_STRING_UC_POINTER(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_POINTER)
+#define  DUK_HEAP_STRING_UC_BUFFER(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_BUFFER)
+#define  DUK_HTHREAD_STRING_UC_BUFFER(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_BUFFER)
+#define  DUK_HEAP_STRING_DEC_ENV(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEC_ENV)
+#define  DUK_HTHREAD_STRING_DEC_ENV(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEC_ENV)
+#define  DUK_HEAP_STRING_OBJ_ENV(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_OBJ_ENV)
+#define  DUK_HTHREAD_STRING_OBJ_ENV(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_OBJ_ENV)
+#define  DUK_HEAP_STRING_EMPTY_STRING(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EMPTY_STRING)
+#define  DUK_HTHREAD_STRING_EMPTY_STRING(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EMPTY_STRING)
+#define  DUK_HEAP_STRING_GLOBAL(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GLOBAL)
+#define  DUK_HTHREAD_STRING_GLOBAL(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GLOBAL)
+#define  DUK_HEAP_STRING_UC_ARGUMENTS(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_ARGUMENTS)
+#define  DUK_HTHREAD_STRING_UC_ARGUMENTS(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_ARGUMENTS)
+#define  DUK_HEAP_STRING_JSON(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JSON)
+#define  DUK_HTHREAD_STRING_JSON(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JSON)
+#define  DUK_HEAP_STRING_MATH(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MATH)
+#define  DUK_HTHREAD_STRING_MATH(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MATH)
+#define  DUK_HEAP_STRING_ERROR(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ERROR)
+#define  DUK_HTHREAD_STRING_ERROR(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ERROR)
+#define  DUK_HEAP_STRING_REG_EXP(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REG_EXP)
+#define  DUK_HTHREAD_STRING_REG_EXP(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REG_EXP)
+#define  DUK_HEAP_STRING_DATE(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DATE)
+#define  DUK_HTHREAD_STRING_DATE(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DATE)
+#define  DUK_HEAP_STRING_UC_NUMBER(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_NUMBER)
+#define  DUK_HTHREAD_STRING_UC_NUMBER(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_NUMBER)
+#define  DUK_HEAP_STRING_UC_BOOLEAN(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_BOOLEAN)
+#define  DUK_HTHREAD_STRING_UC_BOOLEAN(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_BOOLEAN)
+#define  DUK_HEAP_STRING_UC_STRING(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_STRING)
+#define  DUK_HTHREAD_STRING_UC_STRING(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_STRING)
+#define  DUK_HEAP_STRING_ARRAY(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ARRAY)
+#define  DUK_HTHREAD_STRING_ARRAY(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ARRAY)
+#define  DUK_HEAP_STRING_UC_FUNCTION(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_FUNCTION)
+#define  DUK_HTHREAD_STRING_UC_FUNCTION(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_FUNCTION)
+#define  DUK_HEAP_STRING_UC_OBJECT(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UC_OBJECT)
+#define  DUK_HTHREAD_STRING_UC_OBJECT(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UC_OBJECT)
+#define  DUK_HEAP_STRING_JSON_EXT_NEGINF(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JSON_EXT_NEGINF)
+#define  DUK_HTHREAD_STRING_JSON_EXT_NEGINF(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JSON_EXT_NEGINF)
+#define  DUK_HEAP_STRING_JSON_EXT_POSINF(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JSON_EXT_POSINF)
+#define  DUK_HTHREAD_STRING_JSON_EXT_POSINF(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JSON_EXT_POSINF)
+#define  DUK_HEAP_STRING_JSON_EXT_NAN(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JSON_EXT_NAN)
+#define  DUK_HTHREAD_STRING_JSON_EXT_NAN(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JSON_EXT_NAN)
+#define  DUK_HEAP_STRING_JSON_EXT_UNDEFINED(heap)                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JSON_EXT_UNDEFINED)
+#define  DUK_HTHREAD_STRING_JSON_EXT_UNDEFINED(thr)                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JSON_EXT_UNDEFINED)
+#define  DUK_HEAP_STRING_CURRENT(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CURRENT)
+#define  DUK_HTHREAD_STRING_CURRENT(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CURRENT)
+#define  DUK_HEAP_STRING_RESUME(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_RESUME)
+#define  DUK_HTHREAD_STRING_RESUME(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_RESUME)
+#define  DUK_HEAP_STRING_BASE64(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BASE64)
+#define  DUK_HTHREAD_STRING_BASE64(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BASE64)
+#define  DUK_HEAP_STRING_HEX(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_HEX)
+#define  DUK_HTHREAD_STRING_HEX(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_HEX)
+#define  DUK_HEAP_STRING_DEC(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEC)
+#define  DUK_HTHREAD_STRING_DEC(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEC)
+#define  DUK_HEAP_STRING_ENC(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ENC)
+#define  DUK_HTHREAD_STRING_ENC(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ENC)
+#define  DUK_HEAP_STRING_GET_FINALIZER(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_FINALIZER)
+#define  DUK_HTHREAD_STRING_GET_FINALIZER(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_FINALIZER)
+#define  DUK_HEAP_STRING_SET_FINALIZER(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_FINALIZER)
+#define  DUK_HTHREAD_STRING_SET_FINALIZER(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_FINALIZER)
+#define  DUK_HEAP_STRING_GC(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GC)
+#define  DUK_HTHREAD_STRING_GC(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GC)
+#define  DUK_HEAP_STRING_REFC(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REFC)
+#define  DUK_HTHREAD_STRING_REFC(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REFC)
+#define  DUK_HEAP_STRING_ADDR(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ADDR)
+#define  DUK_HTHREAD_STRING_ADDR(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ADDR)
+#define  DUK_HEAP_STRING_BUILD(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BUILD)
+#define  DUK_HTHREAD_STRING_BUILD(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BUILD)
+#define  DUK_HEAP_STRING_VERSION(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_VERSION)
+#define  DUK_HTHREAD_STRING_VERSION(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_VERSION)
+#define  DUK_HEAP_STRING_DUK(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DUK)
+#define  DUK_HTHREAD_STRING_DUK(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DUK)
+#define  DUK_HEAP_STRING_COMPILE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_COMPILE)
+#define  DUK_HTHREAD_STRING_COMPILE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_COMPILE)
+#define  DUK_HEAP_STRING_INT_REGBASE(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_REGBASE)
+#define  DUK_HTHREAD_STRING_INT_REGBASE(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_REGBASE)
+#define  DUK_HEAP_STRING_INT_THREAD(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_THREAD)
+#define  DUK_HTHREAD_STRING_INT_THREAD(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_THREAD)
+#define  DUK_HEAP_STRING_INT_FINALIZER(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_FINALIZER)
+#define  DUK_HTHREAD_STRING_INT_FINALIZER(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_FINALIZER)
+#define  DUK_HEAP_STRING_INT_METATABLE(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_METATABLE)
+#define  DUK_HTHREAD_STRING_INT_METATABLE(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_METATABLE)
+#define  DUK_HEAP_STRING_INT_CALLEE(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_CALLEE)
+#define  DUK_HTHREAD_STRING_INT_CALLEE(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_CALLEE)
+#define  DUK_HEAP_STRING_INT_MAP(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_MAP)
+#define  DUK_HTHREAD_STRING_INT_MAP(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_MAP)
+#define  DUK_HEAP_STRING_INT_ARGS(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_ARGS)
+#define  DUK_HTHREAD_STRING_INT_ARGS(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_ARGS)
+#define  DUK_HEAP_STRING_INT_THIS(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_THIS)
+#define  DUK_HTHREAD_STRING_INT_THIS(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_THIS)
+#define  DUK_HEAP_STRING_INT_PC2LINE(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_PC2LINE)
+#define  DUK_HTHREAD_STRING_INT_PC2LINE(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_PC2LINE)
+#define  DUK_HEAP_STRING_INT_SOURCE(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_SOURCE)
+#define  DUK_HTHREAD_STRING_INT_SOURCE(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_SOURCE)
+#define  DUK_HEAP_STRING_INT_VARENV(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_VARENV)
+#define  DUK_HTHREAD_STRING_INT_VARENV(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_VARENV)
+#define  DUK_HEAP_STRING_INT_LEXENV(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_LEXENV)
+#define  DUK_HTHREAD_STRING_INT_LEXENV(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_LEXENV)
+#define  DUK_HEAP_STRING_INT_VARMAP(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_VARMAP)
+#define  DUK_HTHREAD_STRING_INT_VARMAP(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_VARMAP)
+#define  DUK_HEAP_STRING_INT_FORMALS(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_FORMALS)
+#define  DUK_HTHREAD_STRING_INT_FORMALS(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_FORMALS)
+#define  DUK_HEAP_STRING_INT_BYTECODE(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_BYTECODE)
+#define  DUK_HTHREAD_STRING_INT_BYTECODE(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_BYTECODE)
+#define  DUK_HEAP_STRING_INT_NEXT(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_NEXT)
+#define  DUK_HTHREAD_STRING_INT_NEXT(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_NEXT)
+#define  DUK_HEAP_STRING_INT_TARGET(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_TARGET)
+#define  DUK_HTHREAD_STRING_INT_TARGET(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_TARGET)
+#define  DUK_HEAP_STRING_INT_VALUE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INT_VALUE)
+#define  DUK_HTHREAD_STRING_INT_VALUE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INT_VALUE)
+#define  DUK_HEAP_STRING_LC_POINTER(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_POINTER)
+#define  DUK_HTHREAD_STRING_LC_POINTER(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_POINTER)
+#define  DUK_HEAP_STRING_LC_BUFFER(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_BUFFER)
+#define  DUK_HTHREAD_STRING_LC_BUFFER(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_BUFFER)
+#define  DUK_HEAP_STRING_TRACEDATA(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TRACEDATA)
+#define  DUK_HTHREAD_STRING_TRACEDATA(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TRACEDATA)
+#define  DUK_HEAP_STRING_LINE_NUMBER(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LINE_NUMBER)
+#define  DUK_HTHREAD_STRING_LINE_NUMBER(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LINE_NUMBER)
+#define  DUK_HEAP_STRING_FILE_NAME(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FILE_NAME)
+#define  DUK_HTHREAD_STRING_FILE_NAME(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FILE_NAME)
+#define  DUK_HEAP_STRING_PC(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PC)
+#define  DUK_HTHREAD_STRING_PC(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PC)
+#define  DUK_HEAP_STRING_STACK(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_STACK)
+#define  DUK_HTHREAD_STRING_STACK(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_STACK)
+#define  DUK_HEAP_STRING_THROW_TYPE_ERROR(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_THROW_TYPE_ERROR)
+#define  DUK_HTHREAD_STRING_THROW_TYPE_ERROR(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_THROW_TYPE_ERROR)
+#define  DUK_HEAP_STRING_CALLEE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CALLEE)
+#define  DUK_HTHREAD_STRING_CALLEE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CALLEE)
+#define  DUK_HEAP_STRING_INVALID_DATE(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INVALID_DATE)
+#define  DUK_HTHREAD_STRING_INVALID_DATE(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INVALID_DATE)
+#define  DUK_HEAP_STRING_BRACKETED_ELLIPSIS(heap)                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BRACKETED_ELLIPSIS)
+#define  DUK_HTHREAD_STRING_BRACKETED_ELLIPSIS(thr)                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BRACKETED_ELLIPSIS)
+#define  DUK_HEAP_STRING_NEWLINE_TAB(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NEWLINE_TAB)
+#define  DUK_HTHREAD_STRING_NEWLINE_TAB(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NEWLINE_TAB)
+#define  DUK_HEAP_STRING_SPACE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SPACE)
+#define  DUK_HTHREAD_STRING_SPACE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SPACE)
+#define  DUK_HEAP_STRING_COMMA(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_COMMA)
+#define  DUK_HTHREAD_STRING_COMMA(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_COMMA)
+#define  DUK_HEAP_STRING_MINUS_ZERO(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MINUS_ZERO)
+#define  DUK_HTHREAD_STRING_MINUS_ZERO(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MINUS_ZERO)
+#define  DUK_HEAP_STRING_PLUS_ZERO(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PLUS_ZERO)
+#define  DUK_HTHREAD_STRING_PLUS_ZERO(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PLUS_ZERO)
+#define  DUK_HEAP_STRING_ZERO(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ZERO)
+#define  DUK_HTHREAD_STRING_ZERO(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ZERO)
+#define  DUK_HEAP_STRING_MINUS_INFINITY(heap)                          DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MINUS_INFINITY)
+#define  DUK_HTHREAD_STRING_MINUS_INFINITY(thr)                        DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MINUS_INFINITY)
+#define  DUK_HEAP_STRING_PLUS_INFINITY(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PLUS_INFINITY)
+#define  DUK_HTHREAD_STRING_PLUS_INFINITY(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PLUS_INFINITY)
+#define  DUK_HEAP_STRING_INFINITY(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INFINITY)
+#define  DUK_HTHREAD_STRING_INFINITY(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INFINITY)
+#define  DUK_HEAP_STRING_LC_OBJECT(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_OBJECT)
+#define  DUK_HTHREAD_STRING_LC_OBJECT(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_OBJECT)
+#define  DUK_HEAP_STRING_LC_STRING(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_STRING)
+#define  DUK_HTHREAD_STRING_LC_STRING(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_STRING)
+#define  DUK_HEAP_STRING_LC_NUMBER(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_NUMBER)
+#define  DUK_HTHREAD_STRING_LC_NUMBER(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_NUMBER)
+#define  DUK_HEAP_STRING_LC_BOOLEAN(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_BOOLEAN)
+#define  DUK_HTHREAD_STRING_LC_BOOLEAN(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_BOOLEAN)
+#define  DUK_HEAP_STRING_UNDEFINED(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UNDEFINED)
+#define  DUK_HTHREAD_STRING_UNDEFINED(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UNDEFINED)
+#define  DUK_HEAP_STRING_STRINGIFY(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_STRINGIFY)
+#define  DUK_HTHREAD_STRING_STRINGIFY(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_STRINGIFY)
+#define  DUK_HEAP_STRING_TAN(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TAN)
+#define  DUK_HTHREAD_STRING_TAN(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TAN)
+#define  DUK_HEAP_STRING_SQRT(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SQRT)
+#define  DUK_HTHREAD_STRING_SQRT(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SQRT)
+#define  DUK_HEAP_STRING_SIN(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SIN)
+#define  DUK_HTHREAD_STRING_SIN(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SIN)
+#define  DUK_HEAP_STRING_ROUND(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ROUND)
+#define  DUK_HTHREAD_STRING_ROUND(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ROUND)
+#define  DUK_HEAP_STRING_RANDOM(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_RANDOM)
+#define  DUK_HTHREAD_STRING_RANDOM(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_RANDOM)
+#define  DUK_HEAP_STRING_POW(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_POW)
+#define  DUK_HTHREAD_STRING_POW(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_POW)
+#define  DUK_HEAP_STRING_MIN(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MIN)
+#define  DUK_HTHREAD_STRING_MIN(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MIN)
+#define  DUK_HEAP_STRING_MAX(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MAX)
+#define  DUK_HTHREAD_STRING_MAX(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MAX)
+#define  DUK_HEAP_STRING_LOG(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LOG)
+#define  DUK_HTHREAD_STRING_LOG(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LOG)
+#define  DUK_HEAP_STRING_FLOOR(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FLOOR)
+#define  DUK_HTHREAD_STRING_FLOOR(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FLOOR)
+#define  DUK_HEAP_STRING_EXP(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EXP)
+#define  DUK_HTHREAD_STRING_EXP(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EXP)
+#define  DUK_HEAP_STRING_COS(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_COS)
+#define  DUK_HTHREAD_STRING_COS(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_COS)
+#define  DUK_HEAP_STRING_CEIL(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CEIL)
+#define  DUK_HTHREAD_STRING_CEIL(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CEIL)
+#define  DUK_HEAP_STRING_ATAN2(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ATAN2)
+#define  DUK_HTHREAD_STRING_ATAN2(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ATAN2)
+#define  DUK_HEAP_STRING_ATAN(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ATAN)
+#define  DUK_HTHREAD_STRING_ATAN(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ATAN)
+#define  DUK_HEAP_STRING_ASIN(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ASIN)
+#define  DUK_HTHREAD_STRING_ASIN(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ASIN)
+#define  DUK_HEAP_STRING_ACOS(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ACOS)
+#define  DUK_HTHREAD_STRING_ACOS(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ACOS)
+#define  DUK_HEAP_STRING_ABS(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ABS)
+#define  DUK_HTHREAD_STRING_ABS(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ABS)
+#define  DUK_HEAP_STRING_SQRT2(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SQRT2)
+#define  DUK_HTHREAD_STRING_SQRT2(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SQRT2)
+#define  DUK_HEAP_STRING_SQRT1_2(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SQRT1_2)
+#define  DUK_HTHREAD_STRING_SQRT1_2(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SQRT1_2)
+#define  DUK_HEAP_STRING_PI(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PI)
+#define  DUK_HTHREAD_STRING_PI(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PI)
+#define  DUK_HEAP_STRING_LOG10E(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LOG10E)
+#define  DUK_HTHREAD_STRING_LOG10E(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LOG10E)
+#define  DUK_HEAP_STRING_LOG2E(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LOG2E)
+#define  DUK_HTHREAD_STRING_LOG2E(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LOG2E)
+#define  DUK_HEAP_STRING_LN2(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LN2)
+#define  DUK_HTHREAD_STRING_LN2(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LN2)
+#define  DUK_HEAP_STRING_LN10(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LN10)
+#define  DUK_HTHREAD_STRING_LN10(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LN10)
+#define  DUK_HEAP_STRING_E(heap)                                       DUK_HEAP_GET_STRING((heap),DUK_STRIDX_E)
+#define  DUK_HTHREAD_STRING_E(thr)                                     DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_E)
+#define  DUK_HEAP_STRING_MESSAGE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MESSAGE)
+#define  DUK_HTHREAD_STRING_MESSAGE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MESSAGE)
+#define  DUK_HEAP_STRING_NAME(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NAME)
+#define  DUK_HTHREAD_STRING_NAME(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NAME)
+#define  DUK_HEAP_STRING_INPUT(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INPUT)
+#define  DUK_HTHREAD_STRING_INPUT(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INPUT)
+#define  DUK_HEAP_STRING_INDEX(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INDEX)
+#define  DUK_HTHREAD_STRING_INDEX(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INDEX)
+#define  DUK_HEAP_STRING_ESCAPED_EMPTY_REGEXP(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ESCAPED_EMPTY_REGEXP)
+#define  DUK_HTHREAD_STRING_ESCAPED_EMPTY_REGEXP(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ESCAPED_EMPTY_REGEXP)
+#define  DUK_HEAP_STRING_LAST_INDEX(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LAST_INDEX)
+#define  DUK_HTHREAD_STRING_LAST_INDEX(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LAST_INDEX)
+#define  DUK_HEAP_STRING_MULTILINE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MULTILINE)
+#define  DUK_HTHREAD_STRING_MULTILINE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MULTILINE)
+#define  DUK_HEAP_STRING_IGNORE_CASE(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IGNORE_CASE)
+#define  DUK_HTHREAD_STRING_IGNORE_CASE(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IGNORE_CASE)
+#define  DUK_HEAP_STRING_SOURCE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SOURCE)
+#define  DUK_HTHREAD_STRING_SOURCE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SOURCE)
+#define  DUK_HEAP_STRING_TEST(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TEST)
+#define  DUK_HTHREAD_STRING_TEST(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TEST)
+#define  DUK_HEAP_STRING_EXEC(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EXEC)
+#define  DUK_HTHREAD_STRING_EXEC(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EXEC)
+#define  DUK_HEAP_STRING_TO_GMT_STRING(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_GMT_STRING)
+#define  DUK_HTHREAD_STRING_TO_GMT_STRING(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_GMT_STRING)
+#define  DUK_HEAP_STRING_SET_YEAR(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_YEAR)
+#define  DUK_HTHREAD_STRING_SET_YEAR(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_YEAR)
+#define  DUK_HEAP_STRING_GET_YEAR(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_YEAR)
+#define  DUK_HTHREAD_STRING_GET_YEAR(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_YEAR)
+#define  DUK_HEAP_STRING_TO_JSON(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_JSON)
+#define  DUK_HTHREAD_STRING_TO_JSON(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_JSON)
+#define  DUK_HEAP_STRING_TO_ISO_STRING(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_ISO_STRING)
+#define  DUK_HTHREAD_STRING_TO_ISO_STRING(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_ISO_STRING)
+#define  DUK_HEAP_STRING_TO_UTC_STRING(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_UTC_STRING)
+#define  DUK_HTHREAD_STRING_TO_UTC_STRING(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_UTC_STRING)
+#define  DUK_HEAP_STRING_SET_UTC_FULL_YEAR(heap)                       DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_FULL_YEAR)
+#define  DUK_HTHREAD_STRING_SET_UTC_FULL_YEAR(thr)                     DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_FULL_YEAR)
+#define  DUK_HEAP_STRING_SET_FULL_YEAR(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_FULL_YEAR)
+#define  DUK_HTHREAD_STRING_SET_FULL_YEAR(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_FULL_YEAR)
+#define  DUK_HEAP_STRING_SET_UTC_MONTH(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_MONTH)
+#define  DUK_HTHREAD_STRING_SET_UTC_MONTH(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_MONTH)
+#define  DUK_HEAP_STRING_SET_MONTH(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_MONTH)
+#define  DUK_HTHREAD_STRING_SET_MONTH(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_MONTH)
+#define  DUK_HEAP_STRING_SET_UTC_DATE(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_DATE)
+#define  DUK_HTHREAD_STRING_SET_UTC_DATE(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_DATE)
+#define  DUK_HEAP_STRING_SET_DATE(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_DATE)
+#define  DUK_HTHREAD_STRING_SET_DATE(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_DATE)
+#define  DUK_HEAP_STRING_SET_UTC_HOURS(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_HOURS)
+#define  DUK_HTHREAD_STRING_SET_UTC_HOURS(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_HOURS)
+#define  DUK_HEAP_STRING_SET_HOURS(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_HOURS)
+#define  DUK_HTHREAD_STRING_SET_HOURS(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_HOURS)
+#define  DUK_HEAP_STRING_SET_UTC_MINUTES(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_MINUTES)
+#define  DUK_HTHREAD_STRING_SET_UTC_MINUTES(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_MINUTES)
+#define  DUK_HEAP_STRING_SET_MINUTES(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_MINUTES)
+#define  DUK_HTHREAD_STRING_SET_MINUTES(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_MINUTES)
+#define  DUK_HEAP_STRING_SET_UTC_SECONDS(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_SECONDS)
+#define  DUK_HTHREAD_STRING_SET_UTC_SECONDS(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_SECONDS)
+#define  DUK_HEAP_STRING_SET_SECONDS(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_SECONDS)
+#define  DUK_HTHREAD_STRING_SET_SECONDS(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_SECONDS)
+#define  DUK_HEAP_STRING_SET_UTC_MILLISECONDS(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_UTC_MILLISECONDS)
+#define  DUK_HTHREAD_STRING_SET_UTC_MILLISECONDS(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_UTC_MILLISECONDS)
+#define  DUK_HEAP_STRING_SET_MILLISECONDS(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_MILLISECONDS)
+#define  DUK_HTHREAD_STRING_SET_MILLISECONDS(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_MILLISECONDS)
+#define  DUK_HEAP_STRING_SET_TIME(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET_TIME)
+#define  DUK_HTHREAD_STRING_SET_TIME(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET_TIME)
+#define  DUK_HEAP_STRING_GET_TIMEZONE_OFFSET(heap)                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_TIMEZONE_OFFSET)
+#define  DUK_HTHREAD_STRING_GET_TIMEZONE_OFFSET(thr)                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_TIMEZONE_OFFSET)
+#define  DUK_HEAP_STRING_GET_UTC_MILLISECONDS(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_MILLISECONDS)
+#define  DUK_HTHREAD_STRING_GET_UTC_MILLISECONDS(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_MILLISECONDS)
+#define  DUK_HEAP_STRING_GET_MILLISECONDS(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_MILLISECONDS)
+#define  DUK_HTHREAD_STRING_GET_MILLISECONDS(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_MILLISECONDS)
+#define  DUK_HEAP_STRING_GET_UTC_SECONDS(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_SECONDS)
+#define  DUK_HTHREAD_STRING_GET_UTC_SECONDS(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_SECONDS)
+#define  DUK_HEAP_STRING_GET_SECONDS(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_SECONDS)
+#define  DUK_HTHREAD_STRING_GET_SECONDS(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_SECONDS)
+#define  DUK_HEAP_STRING_GET_UTC_MINUTES(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_MINUTES)
+#define  DUK_HTHREAD_STRING_GET_UTC_MINUTES(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_MINUTES)
+#define  DUK_HEAP_STRING_GET_MINUTES(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_MINUTES)
+#define  DUK_HTHREAD_STRING_GET_MINUTES(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_MINUTES)
+#define  DUK_HEAP_STRING_GET_UTC_HOURS(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_HOURS)
+#define  DUK_HTHREAD_STRING_GET_UTC_HOURS(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_HOURS)
+#define  DUK_HEAP_STRING_GET_HOURS(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_HOURS)
+#define  DUK_HTHREAD_STRING_GET_HOURS(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_HOURS)
+#define  DUK_HEAP_STRING_GET_UTC_DAY(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_DAY)
+#define  DUK_HTHREAD_STRING_GET_UTC_DAY(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_DAY)
+#define  DUK_HEAP_STRING_GET_DAY(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_DAY)
+#define  DUK_HTHREAD_STRING_GET_DAY(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_DAY)
+#define  DUK_HEAP_STRING_GET_UTC_DATE(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_DATE)
+#define  DUK_HTHREAD_STRING_GET_UTC_DATE(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_DATE)
+#define  DUK_HEAP_STRING_GET_DATE(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_DATE)
+#define  DUK_HTHREAD_STRING_GET_DATE(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_DATE)
+#define  DUK_HEAP_STRING_GET_UTC_MONTH(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_MONTH)
+#define  DUK_HTHREAD_STRING_GET_UTC_MONTH(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_MONTH)
+#define  DUK_HEAP_STRING_GET_MONTH(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_MONTH)
+#define  DUK_HTHREAD_STRING_GET_MONTH(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_MONTH)
+#define  DUK_HEAP_STRING_GET_UTC_FULL_YEAR(heap)                       DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_UTC_FULL_YEAR)
+#define  DUK_HTHREAD_STRING_GET_UTC_FULL_YEAR(thr)                     DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_UTC_FULL_YEAR)
+#define  DUK_HEAP_STRING_GET_FULL_YEAR(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_FULL_YEAR)
+#define  DUK_HTHREAD_STRING_GET_FULL_YEAR(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_FULL_YEAR)
+#define  DUK_HEAP_STRING_GET_TIME(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_TIME)
+#define  DUK_HTHREAD_STRING_GET_TIME(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_TIME)
+#define  DUK_HEAP_STRING_TO_LOCALE_TIME_STRING(heap)                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_LOCALE_TIME_STRING)
+#define  DUK_HTHREAD_STRING_TO_LOCALE_TIME_STRING(thr)                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_LOCALE_TIME_STRING)
+#define  DUK_HEAP_STRING_TO_LOCALE_DATE_STRING(heap)                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_LOCALE_DATE_STRING)
+#define  DUK_HTHREAD_STRING_TO_LOCALE_DATE_STRING(thr)                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_LOCALE_DATE_STRING)
+#define  DUK_HEAP_STRING_TO_TIME_STRING(heap)                          DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_TIME_STRING)
+#define  DUK_HTHREAD_STRING_TO_TIME_STRING(thr)                        DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_TIME_STRING)
+#define  DUK_HEAP_STRING_TO_DATE_STRING(heap)                          DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_DATE_STRING)
+#define  DUK_HTHREAD_STRING_TO_DATE_STRING(thr)                        DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_DATE_STRING)
+#define  DUK_HEAP_STRING_NOW(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NOW)
+#define  DUK_HTHREAD_STRING_NOW(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NOW)
+#define  DUK_HEAP_STRING_UTC(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UTC)
+#define  DUK_HTHREAD_STRING_UTC(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UTC)
+#define  DUK_HEAP_STRING_PARSE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PARSE)
+#define  DUK_HTHREAD_STRING_PARSE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PARSE)
+#define  DUK_HEAP_STRING_TO_PRECISION(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_PRECISION)
+#define  DUK_HTHREAD_STRING_TO_PRECISION(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_PRECISION)
+#define  DUK_HEAP_STRING_TO_EXPONENTIAL(heap)                          DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_EXPONENTIAL)
+#define  DUK_HTHREAD_STRING_TO_EXPONENTIAL(thr)                        DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_EXPONENTIAL)
+#define  DUK_HEAP_STRING_TO_FIXED(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_FIXED)
+#define  DUK_HTHREAD_STRING_TO_FIXED(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_FIXED)
+#define  DUK_HEAP_STRING_POSITIVE_INFINITY(heap)                       DUK_HEAP_GET_STRING((heap),DUK_STRIDX_POSITIVE_INFINITY)
+#define  DUK_HTHREAD_STRING_POSITIVE_INFINITY(thr)                     DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_POSITIVE_INFINITY)
+#define  DUK_HEAP_STRING_NEGATIVE_INFINITY(heap)                       DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NEGATIVE_INFINITY)
+#define  DUK_HTHREAD_STRING_NEGATIVE_INFINITY(thr)                     DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NEGATIVE_INFINITY)
+#define  DUK_HEAP_STRING_NAN(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NAN)
+#define  DUK_HTHREAD_STRING_NAN(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NAN)
+#define  DUK_HEAP_STRING_MIN_VALUE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MIN_VALUE)
+#define  DUK_HTHREAD_STRING_MIN_VALUE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MIN_VALUE)
+#define  DUK_HEAP_STRING_MAX_VALUE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MAX_VALUE)
+#define  DUK_HTHREAD_STRING_MAX_VALUE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MAX_VALUE)
+#define  DUK_HEAP_STRING_SUBSTR(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SUBSTR)
+#define  DUK_HTHREAD_STRING_SUBSTR(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SUBSTR)
+#define  DUK_HEAP_STRING_TRIM(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TRIM)
+#define  DUK_HTHREAD_STRING_TRIM(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TRIM)
+#define  DUK_HEAP_STRING_TO_LOCALE_UPPER_CASE(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_LOCALE_UPPER_CASE)
+#define  DUK_HTHREAD_STRING_TO_LOCALE_UPPER_CASE(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_LOCALE_UPPER_CASE)
+#define  DUK_HEAP_STRING_TO_UPPER_CASE(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_UPPER_CASE)
+#define  DUK_HTHREAD_STRING_TO_UPPER_CASE(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_UPPER_CASE)
+#define  DUK_HEAP_STRING_TO_LOCALE_LOWER_CASE(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_LOCALE_LOWER_CASE)
+#define  DUK_HTHREAD_STRING_TO_LOCALE_LOWER_CASE(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_LOCALE_LOWER_CASE)
+#define  DUK_HEAP_STRING_TO_LOWER_CASE(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_LOWER_CASE)
+#define  DUK_HTHREAD_STRING_TO_LOWER_CASE(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_LOWER_CASE)
+#define  DUK_HEAP_STRING_SUBSTRING(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SUBSTRING)
+#define  DUK_HTHREAD_STRING_SUBSTRING(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SUBSTRING)
+#define  DUK_HEAP_STRING_SPLIT(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SPLIT)
+#define  DUK_HTHREAD_STRING_SPLIT(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SPLIT)
+#define  DUK_HEAP_STRING_SEARCH(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SEARCH)
+#define  DUK_HTHREAD_STRING_SEARCH(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SEARCH)
+#define  DUK_HEAP_STRING_REPLACE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REPLACE)
+#define  DUK_HTHREAD_STRING_REPLACE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REPLACE)
+#define  DUK_HEAP_STRING_MATCH(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MATCH)
+#define  DUK_HTHREAD_STRING_MATCH(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MATCH)
+#define  DUK_HEAP_STRING_LOCALE_COMPARE(heap)                          DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LOCALE_COMPARE)
+#define  DUK_HTHREAD_STRING_LOCALE_COMPARE(thr)                        DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LOCALE_COMPARE)
+#define  DUK_HEAP_STRING_CHAR_CODE_AT(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CHAR_CODE_AT)
+#define  DUK_HTHREAD_STRING_CHAR_CODE_AT(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CHAR_CODE_AT)
+#define  DUK_HEAP_STRING_CHAR_AT(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CHAR_AT)
+#define  DUK_HTHREAD_STRING_CHAR_AT(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CHAR_AT)
+#define  DUK_HEAP_STRING_FROM_CHAR_CODE(heap)                          DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FROM_CHAR_CODE)
+#define  DUK_HTHREAD_STRING_FROM_CHAR_CODE(thr)                        DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FROM_CHAR_CODE)
+#define  DUK_HEAP_STRING_REDUCE_RIGHT(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REDUCE_RIGHT)
+#define  DUK_HTHREAD_STRING_REDUCE_RIGHT(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REDUCE_RIGHT)
+#define  DUK_HEAP_STRING_REDUCE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REDUCE)
+#define  DUK_HTHREAD_STRING_REDUCE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REDUCE)
+#define  DUK_HEAP_STRING_FILTER(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FILTER)
+#define  DUK_HTHREAD_STRING_FILTER(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FILTER)
+#define  DUK_HEAP_STRING_MAP(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_MAP)
+#define  DUK_HTHREAD_STRING_MAP(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_MAP)
+#define  DUK_HEAP_STRING_FOR_EACH(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FOR_EACH)
+#define  DUK_HTHREAD_STRING_FOR_EACH(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FOR_EACH)
+#define  DUK_HEAP_STRING_SOME(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SOME)
+#define  DUK_HTHREAD_STRING_SOME(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SOME)
+#define  DUK_HEAP_STRING_EVERY(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EVERY)
+#define  DUK_HTHREAD_STRING_EVERY(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EVERY)
+#define  DUK_HEAP_STRING_LAST_INDEX_OF(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LAST_INDEX_OF)
+#define  DUK_HTHREAD_STRING_LAST_INDEX_OF(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LAST_INDEX_OF)
+#define  DUK_HEAP_STRING_INDEX_OF(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INDEX_OF)
+#define  DUK_HTHREAD_STRING_INDEX_OF(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INDEX_OF)
+#define  DUK_HEAP_STRING_UNSHIFT(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UNSHIFT)
+#define  DUK_HTHREAD_STRING_UNSHIFT(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UNSHIFT)
+#define  DUK_HEAP_STRING_SPLICE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SPLICE)
+#define  DUK_HTHREAD_STRING_SPLICE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SPLICE)
+#define  DUK_HEAP_STRING_SORT(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SORT)
+#define  DUK_HTHREAD_STRING_SORT(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SORT)
+#define  DUK_HEAP_STRING_SLICE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SLICE)
+#define  DUK_HTHREAD_STRING_SLICE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SLICE)
+#define  DUK_HEAP_STRING_SHIFT(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SHIFT)
+#define  DUK_HTHREAD_STRING_SHIFT(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SHIFT)
+#define  DUK_HEAP_STRING_REVERSE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REVERSE)
+#define  DUK_HTHREAD_STRING_REVERSE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REVERSE)
+#define  DUK_HEAP_STRING_PUSH(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PUSH)
+#define  DUK_HTHREAD_STRING_PUSH(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PUSH)
+#define  DUK_HEAP_STRING_POP(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_POP)
+#define  DUK_HTHREAD_STRING_POP(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_POP)
+#define  DUK_HEAP_STRING_JOIN(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_JOIN)
+#define  DUK_HTHREAD_STRING_JOIN(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_JOIN)
+#define  DUK_HEAP_STRING_CONCAT(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CONCAT)
+#define  DUK_HTHREAD_STRING_CONCAT(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CONCAT)
+#define  DUK_HEAP_STRING_IS_ARRAY(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_ARRAY)
+#define  DUK_HTHREAD_STRING_IS_ARRAY(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_ARRAY)
+#define  DUK_HEAP_STRING_LC_ARGUMENTS(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_ARGUMENTS)
+#define  DUK_HTHREAD_STRING_LC_ARGUMENTS(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_ARGUMENTS)
+#define  DUK_HEAP_STRING_CALLER(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CALLER)
+#define  DUK_HTHREAD_STRING_CALLER(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CALLER)
+#define  DUK_HEAP_STRING_BIND(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BIND)
+#define  DUK_HTHREAD_STRING_BIND(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BIND)
+#define  DUK_HEAP_STRING_CALL(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CALL)
+#define  DUK_HTHREAD_STRING_CALL(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CALL)
+#define  DUK_HEAP_STRING_APPLY(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_APPLY)
+#define  DUK_HTHREAD_STRING_APPLY(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_APPLY)
+#define  DUK_HEAP_STRING_PROPERTY_IS_ENUMERABLE(heap)                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PROPERTY_IS_ENUMERABLE)
+#define  DUK_HTHREAD_STRING_PROPERTY_IS_ENUMERABLE(thr)                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PROPERTY_IS_ENUMERABLE)
+#define  DUK_HEAP_STRING_IS_PROTOTYPE_OF(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_PROTOTYPE_OF)
+#define  DUK_HTHREAD_STRING_IS_PROTOTYPE_OF(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_PROTOTYPE_OF)
+#define  DUK_HEAP_STRING_HAS_OWN_PROPERTY(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_HAS_OWN_PROPERTY)
+#define  DUK_HTHREAD_STRING_HAS_OWN_PROPERTY(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_HAS_OWN_PROPERTY)
+#define  DUK_HEAP_STRING_VALUE_OF(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_VALUE_OF)
+#define  DUK_HTHREAD_STRING_VALUE_OF(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_VALUE_OF)
+#define  DUK_HEAP_STRING_TO_LOCALE_STRING(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_LOCALE_STRING)
+#define  DUK_HTHREAD_STRING_TO_LOCALE_STRING(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_LOCALE_STRING)
+#define  DUK_HEAP_STRING_TO_STRING(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TO_STRING)
+#define  DUK_HTHREAD_STRING_TO_STRING(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TO_STRING)
+#define  DUK_HEAP_STRING_CONSTRUCTOR(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CONSTRUCTOR)
+#define  DUK_HTHREAD_STRING_CONSTRUCTOR(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CONSTRUCTOR)
+#define  DUK_HEAP_STRING_ENUMERABLE(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ENUMERABLE)
+#define  DUK_HTHREAD_STRING_ENUMERABLE(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ENUMERABLE)
+#define  DUK_HEAP_STRING_CONFIGURABLE(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CONFIGURABLE)
+#define  DUK_HTHREAD_STRING_CONFIGURABLE(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CONFIGURABLE)
+#define  DUK_HEAP_STRING_WRITABLE(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_WRITABLE)
+#define  DUK_HTHREAD_STRING_WRITABLE(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_WRITABLE)
+#define  DUK_HEAP_STRING_VALUE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_VALUE)
+#define  DUK_HTHREAD_STRING_VALUE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_VALUE)
+#define  DUK_HEAP_STRING_KEYS(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_KEYS)
+#define  DUK_HTHREAD_STRING_KEYS(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_KEYS)
+#define  DUK_HEAP_STRING_IS_EXTENSIBLE(heap)                           DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_EXTENSIBLE)
+#define  DUK_HTHREAD_STRING_IS_EXTENSIBLE(thr)                         DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_EXTENSIBLE)
+#define  DUK_HEAP_STRING_IS_FROZEN(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_FROZEN)
+#define  DUK_HTHREAD_STRING_IS_FROZEN(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_FROZEN)
+#define  DUK_HEAP_STRING_IS_SEALED(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_SEALED)
+#define  DUK_HTHREAD_STRING_IS_SEALED(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_SEALED)
+#define  DUK_HEAP_STRING_PREVENT_EXTENSIONS(heap)                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PREVENT_EXTENSIONS)
+#define  DUK_HTHREAD_STRING_PREVENT_EXTENSIONS(thr)                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PREVENT_EXTENSIONS)
+#define  DUK_HEAP_STRING_FREEZE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FREEZE)
+#define  DUK_HTHREAD_STRING_FREEZE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FREEZE)
+#define  DUK_HEAP_STRING_SEAL(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SEAL)
+#define  DUK_HTHREAD_STRING_SEAL(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SEAL)
+#define  DUK_HEAP_STRING_DEFINE_PROPERTIES(heap)                       DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEFINE_PROPERTIES)
+#define  DUK_HTHREAD_STRING_DEFINE_PROPERTIES(thr)                     DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEFINE_PROPERTIES)
+#define  DUK_HEAP_STRING_DEFINE_PROPERTY(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEFINE_PROPERTY)
+#define  DUK_HTHREAD_STRING_DEFINE_PROPERTY(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEFINE_PROPERTY)
+#define  DUK_HEAP_STRING_CREATE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CREATE)
+#define  DUK_HTHREAD_STRING_CREATE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CREATE)
+#define  DUK_HEAP_STRING_GET_OWN_PROPERTY_NAMES(heap)                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_OWN_PROPERTY_NAMES)
+#define  DUK_HTHREAD_STRING_GET_OWN_PROPERTY_NAMES(thr)                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_OWN_PROPERTY_NAMES)
+#define  DUK_HEAP_STRING_GET_OWN_PROPERTY_DESCRIPTOR(heap)             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_OWN_PROPERTY_DESCRIPTOR)
+#define  DUK_HTHREAD_STRING_GET_OWN_PROPERTY_DESCRIPTOR(thr)           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_OWN_PROPERTY_DESCRIPTOR)
+#define  DUK_HEAP_STRING_GET_PROTOTYPE_OF(heap)                        DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET_PROTOTYPE_OF)
+#define  DUK_HTHREAD_STRING_GET_PROTOTYPE_OF(thr)                      DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET_PROTOTYPE_OF)
+#define  DUK_HEAP_STRING_PROTOTYPE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PROTOTYPE)
+#define  DUK_HTHREAD_STRING_PROTOTYPE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PROTOTYPE)
+#define  DUK_HEAP_STRING_LENGTH(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LENGTH)
+#define  DUK_HTHREAD_STRING_LENGTH(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LENGTH)
+#define  DUK_HEAP_STRING_ALERT(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ALERT)
+#define  DUK_HTHREAD_STRING_ALERT(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ALERT)
+#define  DUK_HEAP_STRING_PRINT(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PRINT)
+#define  DUK_HTHREAD_STRING_PRINT(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PRINT)
+#define  DUK_HEAP_STRING_UNESCAPE(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_UNESCAPE)
+#define  DUK_HTHREAD_STRING_UNESCAPE(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_UNESCAPE)
+#define  DUK_HEAP_STRING_ESCAPE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ESCAPE)
+#define  DUK_HTHREAD_STRING_ESCAPE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ESCAPE)
+#define  DUK_HEAP_STRING_ENCODE_URI_COMPONENT(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ENCODE_URI_COMPONENT)
+#define  DUK_HTHREAD_STRING_ENCODE_URI_COMPONENT(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ENCODE_URI_COMPONENT)
+#define  DUK_HEAP_STRING_ENCODE_URI(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ENCODE_URI)
+#define  DUK_HTHREAD_STRING_ENCODE_URI(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ENCODE_URI)
+#define  DUK_HEAP_STRING_DECODE_URI_COMPONENT(heap)                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DECODE_URI_COMPONENT)
+#define  DUK_HTHREAD_STRING_DECODE_URI_COMPONENT(thr)                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DECODE_URI_COMPONENT)
+#define  DUK_HEAP_STRING_DECODE_URI(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DECODE_URI)
+#define  DUK_HTHREAD_STRING_DECODE_URI(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DECODE_URI)
+#define  DUK_HEAP_STRING_IS_FINITE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_FINITE)
+#define  DUK_HTHREAD_STRING_IS_FINITE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_FINITE)
+#define  DUK_HEAP_STRING_IS_NAN(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IS_NAN)
+#define  DUK_HTHREAD_STRING_IS_NAN(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IS_NAN)
+#define  DUK_HEAP_STRING_PARSE_FLOAT(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PARSE_FLOAT)
+#define  DUK_HTHREAD_STRING_PARSE_FLOAT(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PARSE_FLOAT)
+#define  DUK_HEAP_STRING_PARSE_INT(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PARSE_INT)
+#define  DUK_HTHREAD_STRING_PARSE_INT(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PARSE_INT)
+#define  DUK_HEAP_STRING_EVAL(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EVAL)
+#define  DUK_HTHREAD_STRING_EVAL(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EVAL)
+#define  DUK_HEAP_STRING_URI_ERROR(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_URI_ERROR)
+#define  DUK_HTHREAD_STRING_URI_ERROR(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_URI_ERROR)
+#define  DUK_HEAP_STRING_TYPE_ERROR(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TYPE_ERROR)
+#define  DUK_HTHREAD_STRING_TYPE_ERROR(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TYPE_ERROR)
+#define  DUK_HEAP_STRING_SYNTAX_ERROR(heap)                            DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SYNTAX_ERROR)
+#define  DUK_HTHREAD_STRING_SYNTAX_ERROR(thr)                          DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SYNTAX_ERROR)
+#define  DUK_HEAP_STRING_REFERENCE_ERROR(heap)                         DUK_HEAP_GET_STRING((heap),DUK_STRIDX_REFERENCE_ERROR)
+#define  DUK_HTHREAD_STRING_REFERENCE_ERROR(thr)                       DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_REFERENCE_ERROR)
+#define  DUK_HEAP_STRING_RANGE_ERROR(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_RANGE_ERROR)
+#define  DUK_HTHREAD_STRING_RANGE_ERROR(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_RANGE_ERROR)
+#define  DUK_HEAP_STRING_EVAL_ERROR(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EVAL_ERROR)
+#define  DUK_HTHREAD_STRING_EVAL_ERROR(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EVAL_ERROR)
+#define  DUK_HEAP_STRING_BREAK(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_BREAK)
+#define  DUK_HTHREAD_STRING_BREAK(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_BREAK)
+#define  DUK_HEAP_STRING_CASE(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CASE)
+#define  DUK_HTHREAD_STRING_CASE(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CASE)
+#define  DUK_HEAP_STRING_CATCH(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CATCH)
+#define  DUK_HTHREAD_STRING_CATCH(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CATCH)
+#define  DUK_HEAP_STRING_CONTINUE(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CONTINUE)
+#define  DUK_HTHREAD_STRING_CONTINUE(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CONTINUE)
+#define  DUK_HEAP_STRING_DEBUGGER(heap)                                DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEBUGGER)
+#define  DUK_HTHREAD_STRING_DEBUGGER(thr)                              DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEBUGGER)
+#define  DUK_HEAP_STRING_DEFAULT(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DEFAULT)
+#define  DUK_HTHREAD_STRING_DEFAULT(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DEFAULT)
+#define  DUK_HEAP_STRING_DELETE(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DELETE)
+#define  DUK_HTHREAD_STRING_DELETE(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DELETE)
+#define  DUK_HEAP_STRING_DO(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_DO)
+#define  DUK_HTHREAD_STRING_DO(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_DO)
+#define  DUK_HEAP_STRING_ELSE(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ELSE)
+#define  DUK_HTHREAD_STRING_ELSE(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ELSE)
+#define  DUK_HEAP_STRING_FINALLY(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FINALLY)
+#define  DUK_HTHREAD_STRING_FINALLY(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FINALLY)
+#define  DUK_HEAP_STRING_FOR(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FOR)
+#define  DUK_HTHREAD_STRING_FOR(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FOR)
+#define  DUK_HEAP_STRING_LC_FUNCTION(heap)                             DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LC_FUNCTION)
+#define  DUK_HTHREAD_STRING_LC_FUNCTION(thr)                           DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LC_FUNCTION)
+#define  DUK_HEAP_STRING_IF(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IF)
+#define  DUK_HTHREAD_STRING_IF(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IF)
+#define  DUK_HEAP_STRING_IN(heap)                                      DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IN)
+#define  DUK_HTHREAD_STRING_IN(thr)                                    DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IN)
+#define  DUK_HEAP_STRING_INSTANCEOF(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INSTANCEOF)
+#define  DUK_HTHREAD_STRING_INSTANCEOF(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INSTANCEOF)
+#define  DUK_HEAP_STRING_NEW(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NEW)
+#define  DUK_HTHREAD_STRING_NEW(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NEW)
+#define  DUK_HEAP_STRING_RETURN(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_RETURN)
+#define  DUK_HTHREAD_STRING_RETURN(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_RETURN)
+#define  DUK_HEAP_STRING_SWITCH(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SWITCH)
+#define  DUK_HTHREAD_STRING_SWITCH(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SWITCH)
+#define  DUK_HEAP_STRING_THIS(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_THIS)
+#define  DUK_HTHREAD_STRING_THIS(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_THIS)
+#define  DUK_HEAP_STRING_THROW(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_THROW)
+#define  DUK_HTHREAD_STRING_THROW(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_THROW)
+#define  DUK_HEAP_STRING_TRY(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TRY)
+#define  DUK_HTHREAD_STRING_TRY(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TRY)
+#define  DUK_HEAP_STRING_TYPEOF(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TYPEOF)
+#define  DUK_HTHREAD_STRING_TYPEOF(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TYPEOF)
+#define  DUK_HEAP_STRING_VAR(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_VAR)
+#define  DUK_HTHREAD_STRING_VAR(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_VAR)
+#define  DUK_HEAP_STRING_VOID(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_VOID)
+#define  DUK_HTHREAD_STRING_VOID(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_VOID)
+#define  DUK_HEAP_STRING_WHILE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_WHILE)
+#define  DUK_HTHREAD_STRING_WHILE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_WHILE)
+#define  DUK_HEAP_STRING_WITH(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_WITH)
+#define  DUK_HTHREAD_STRING_WITH(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_WITH)
+#define  DUK_HEAP_STRING_CLASS(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CLASS)
+#define  DUK_HTHREAD_STRING_CLASS(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CLASS)
+#define  DUK_HEAP_STRING_CONST(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_CONST)
+#define  DUK_HTHREAD_STRING_CONST(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_CONST)
+#define  DUK_HEAP_STRING_ENUM(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_ENUM)
+#define  DUK_HTHREAD_STRING_ENUM(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_ENUM)
+#define  DUK_HEAP_STRING_EXPORT(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EXPORT)
+#define  DUK_HTHREAD_STRING_EXPORT(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EXPORT)
+#define  DUK_HEAP_STRING_EXTENDS(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_EXTENDS)
+#define  DUK_HTHREAD_STRING_EXTENDS(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_EXTENDS)
+#define  DUK_HEAP_STRING_IMPORT(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IMPORT)
+#define  DUK_HTHREAD_STRING_IMPORT(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IMPORT)
+#define  DUK_HEAP_STRING_SUPER(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SUPER)
+#define  DUK_HTHREAD_STRING_SUPER(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SUPER)
+#define  DUK_HEAP_STRING_NULL(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_NULL)
+#define  DUK_HTHREAD_STRING_NULL(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_NULL)
+#define  DUK_HEAP_STRING_TRUE(heap)                                    DUK_HEAP_GET_STRING((heap),DUK_STRIDX_TRUE)
+#define  DUK_HTHREAD_STRING_TRUE(thr)                                  DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_TRUE)
+#define  DUK_HEAP_STRING_FALSE(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_FALSE)
+#define  DUK_HTHREAD_STRING_FALSE(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_FALSE)
+#define  DUK_HEAP_STRING_GET(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_GET)
+#define  DUK_HTHREAD_STRING_GET(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_GET)
+#define  DUK_HEAP_STRING_SET(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_SET)
+#define  DUK_HTHREAD_STRING_SET(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_SET)
+#define  DUK_HEAP_STRING_IMPLEMENTS(heap)                              DUK_HEAP_GET_STRING((heap),DUK_STRIDX_IMPLEMENTS)
+#define  DUK_HTHREAD_STRING_IMPLEMENTS(thr)                            DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_IMPLEMENTS)
+#define  DUK_HEAP_STRING_INTERFACE(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_INTERFACE)
+#define  DUK_HTHREAD_STRING_INTERFACE(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_INTERFACE)
+#define  DUK_HEAP_STRING_LET(heap)                                     DUK_HEAP_GET_STRING((heap),DUK_STRIDX_LET)
+#define  DUK_HTHREAD_STRING_LET(thr)                                   DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_LET)
+#define  DUK_HEAP_STRING_PACKAGE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PACKAGE)
+#define  DUK_HTHREAD_STRING_PACKAGE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PACKAGE)
+#define  DUK_HEAP_STRING_PRIVATE(heap)                                 DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PRIVATE)
+#define  DUK_HTHREAD_STRING_PRIVATE(thr)                               DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PRIVATE)
+#define  DUK_HEAP_STRING_PROTECTED(heap)                               DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PROTECTED)
+#define  DUK_HTHREAD_STRING_PROTECTED(thr)                             DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PROTECTED)
+#define  DUK_HEAP_STRING_PUBLIC(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_PUBLIC)
+#define  DUK_HTHREAD_STRING_PUBLIC(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_PUBLIC)
+#define  DUK_HEAP_STRING_STATIC(heap)                                  DUK_HEAP_GET_STRING((heap),DUK_STRIDX_STATIC)
+#define  DUK_HTHREAD_STRING_STATIC(thr)                                DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_STATIC)
+#define  DUK_HEAP_STRING_YIELD(heap)                                   DUK_HEAP_GET_STRING((heap),DUK_STRIDX_YIELD)
+#define  DUK_HTHREAD_STRING_YIELD(thr)                                 DUK_HTHREAD_GET_STRING((thr),DUK_STRIDX_YIELD)
+
+#define  DUK_HEAP_NUM_STRINGS                                          305
+
+#define  DUK_STRIDX_START_RESERVED                                     258
+#define  DUK_STRIDX_START_STRICT_RESERVED                              296
+#define  DUK_STRIDX_END_RESERVED                                       305                            /* exclusive endpoint */
+
+extern duk_c_function duk_builtin_native_functions[];
+
+extern char duk_builtins_data[];
+
+#define  DUK_BUILTINS_DATA_LENGTH                                      1228
+
+#define  DUK_BIDX_GLOBAL                                               0
+#define  DUK_BIDX_GLOBAL_ENV                                           1
+#define  DUK_BIDX_OBJECT_CONSTRUCTOR                                   2
+#define  DUK_BIDX_OBJECT_PROTOTYPE                                     3
+#define  DUK_BIDX_FUNCTION_CONSTRUCTOR                                 4
+#define  DUK_BIDX_FUNCTION_PROTOTYPE                                   5
+#define  DUK_BIDX_ARRAY_CONSTRUCTOR                                    6
+#define  DUK_BIDX_ARRAY_PROTOTYPE                                      7
+#define  DUK_BIDX_STRING_CONSTRUCTOR                                   8
+#define  DUK_BIDX_STRING_PROTOTYPE                                     9
+#define  DUK_BIDX_BOOLEAN_CONSTRUCTOR                                  10
+#define  DUK_BIDX_BOOLEAN_PROTOTYPE                                    11
+#define  DUK_BIDX_NUMBER_CONSTRUCTOR                                   12
+#define  DUK_BIDX_NUMBER_PROTOTYPE                                     13
+#define  DUK_BIDX_DATE_CONSTRUCTOR                                     14
+#define  DUK_BIDX_DATE_PROTOTYPE                                       15
+#define  DUK_BIDX_REGEXP_CONSTRUCTOR                                   16
+#define  DUK_BIDX_REGEXP_PROTOTYPE                                     17
+#define  DUK_BIDX_ERROR_CONSTRUCTOR                                    18
+#define  DUK_BIDX_ERROR_PROTOTYPE                                      19
+#define  DUK_BIDX_EVAL_ERROR_CONSTRUCTOR                               20
+#define  DUK_BIDX_EVAL_ERROR_PROTOTYPE                                 21
+#define  DUK_BIDX_RANGE_ERROR_CONSTRUCTOR                              22
+#define  DUK_BIDX_RANGE_ERROR_PROTOTYPE                                23
+#define  DUK_BIDX_REFERENCE_ERROR_CONSTRUCTOR                          24
+#define  DUK_BIDX_REFERENCE_ERROR_PROTOTYPE                            25
+#define  DUK_BIDX_SYNTAX_ERROR_CONSTRUCTOR                             26
+#define  DUK_BIDX_SYNTAX_ERROR_PROTOTYPE                               27
+#define  DUK_BIDX_TYPE_ERROR_CONSTRUCTOR                               28
+#define  DUK_BIDX_TYPE_ERROR_PROTOTYPE                                 29
+#define  DUK_BIDX_URI_ERROR_CONSTRUCTOR                                30
+#define  DUK_BIDX_URI_ERROR_PROTOTYPE                                  31
+#define  DUK_BIDX_MATH                                                 32
+#define  DUK_BIDX_JSON                                                 33
+#define  DUK_BIDX_TYPE_ERROR_THROWER                                   34
+#define  DUK_BIDX_DUK                                                  35
+#define  DUK_BIDX_THREAD_CONSTRUCTOR                                   36
+#define  DUK_BIDX_THREAD_PROTOTYPE                                     37
+#define  DUK_BIDX_BUFFER_CONSTRUCTOR                                   38
+#define  DUK_BIDX_BUFFER_PROTOTYPE                                     39
+#define  DUK_BIDX_POINTER_CONSTRUCTOR                                  40
+#define  DUK_BIDX_POINTER_PROTOTYPE                                    41
+#define  DUK_BIDX_DOUBLE_ERROR                                         42
+
+#define  DUK_NUM_BUILTINS                                              43
+
+#else
+#error invalid endianness defines
+#endif
+#endif  /* DUK_BUILTINS_H_INCLUDED */
+#line 35 "duk_internal.h"
+
+#line 1 "duk_js_bytecode.h"
+/*
+ *  Ecmascript bytecode
+ */
+
+#ifndef DUK_JS_BYTECODE_H_INCLUDED
+#define DUK_JS_BYTECODE_H_INCLUDED
+
+/*
+ *  Logical instruction layout
+ *  ==========================
+ *
+ *  !3!3!2!2!2!2!2!2!2!2!2!2!1!1!1!1!1!1!1!1!1!1! ! ! ! ! ! ! ! ! ! !
+ *  !1!0!9!8!7!6!5!4!3!2!1!0!9!8!7!6!5!4!3!2!1!0!9!8!7!6!5!4!3!2!1!0!
+ *  +---------------------------------------------------+-----------+
+ *  !       C         !       B         !      A        !    OP     !
+ *  +---------------------------------------------------+-----------+
+ *
+ *  OP (6 bits):  opcode (DUK_OP_*), access should be fastest
+ *  A (8 bits):   typically a target register number
+ *  B (9 bits):   typically first source register/constant number
+ *  C (9 bits):   typically second source register/constant number
+ *
+ *  Some instructions combine BC or ABC together for larger parameter values.
+ *  Signed integers (e.g. jump offsets) are encoded as unsigned, with an opcode
+ *  specific bias.  B and C may denote a register or a constant, see
+ *  DUK_BC_ISREG() and DUK_BC_ISCONST().
+ *
+ *  Note: macro naming is a bit misleading, e.g. "ABC" in macro name but
+ *  the field layout is logically "CBA".
+ */ 
+
+typedef duk_u32 duk_instr;
+
+#define  DUK_DEC_OP(x)               ((x) & 0x3f)
+#define  DUK_DEC_A(x)                (((x) >> 6) & 0xff)
+#define  DUK_DEC_B(x)                (((x) >> 14) & 0x1ff)
+#define  DUK_DEC_C(x)                (((x) >> 23) & 0x1ff)
+#define  DUK_DEC_BC(x)               (((x) >> 14) & 0x3ffff)
+#define  DUK_DEC_ABC(x)              (((x) >> 6) & 0x3ffffff)
+
+#define  DUK_ENC_OP_ABC(op,abc)      ((duk_instr) (((abc) << 6) | (op)))
+#define  DUK_ENC_OP_A_BC(op,a,bc)    ((duk_instr) (((bc) << 14) | ((a) << 6) | (op)))
+#define  DUK_ENC_OP_A_B_C(op,a,b,c)  ((duk_instr) (((c) << 23) | ((b) << 14) | ((a) << 6) | (op)))
+#define  DUK_ENC_OP_A_B(op,a,b)      DUK_ENC_OP_A_B_C(op,a,b,0)
+#define  DUK_ENC_OP_A(op,a)          DUK_ENC_OP_A_B_C(op,a,0,0)
+
+#define  DUK_BC_OP_MIN               0
+#define  DUK_BC_OP_MAX               0x3f
+#define  DUK_BC_A_MIN                0
+#define  DUK_BC_A_MAX                0xff
+#define  DUK_BC_B_MIN                0
+#define  DUK_BC_B_MAX                0x1ff
+#define  DUK_BC_C_MIN                0
+#define  DUK_BC_C_MAX                0x1ff
+#define  DUK_BC_BC_MIN               0
+#define  DUK_BC_BC_MAX               0x3ffff
+#define  DUK_BC_ABC_MIN              0
+#define  DUK_BC_ABC_MAX              0x3ffffff
+#define  DUK_BC_EXTRAOP_MIN          DUK_BC_A_MIN
+#define  DUK_BC_EXTRAOP_MAX          DUK_BC_A_MAX
+
+#define  DUK_OP_LDREG                0 
+#define  DUK_OP_STREG                1  /* FIXME: UNUSED */
+#define  DUK_OP_LDCONST              2
+#define  DUK_OP_LDINT                3
+#define  DUK_OP_LDINTX               4  /* FIXME: UNUSED */
+#define  DUK_OP_MPUTOBJ              5
+#define  DUK_OP_MPUTARR              6
+#define  DUK_OP_NEW                  7
+#define  DUK_OP_REGEXP               8
+#define  DUK_OP_CSREG                9
+#define  DUK_OP_GETVAR               10
+#define  DUK_OP_PUTVAR               11
+#define  DUK_OP_DECLVAR              12
+#define  DUK_OP_DELVAR               13
+#define  DUK_OP_CSVAR                14
+#define  DUK_OP_CLOSURE              15
+#define  DUK_OP_GETPROP              16
+#define  DUK_OP_PUTPROP              17
+#define  DUK_OP_DELPROP              18
+#define  DUK_OP_CSPROP               19
+#define  DUK_OP_ADD                  20
+#define  DUK_OP_SUB                  21
+#define  DUK_OP_MUL                  22
+#define  DUK_OP_DIV                  23
+#define  DUK_OP_MOD                  24
+#define  DUK_OP_UNM                  25
+#define  DUK_OP_UNP                  26
+#define  DUK_OP_INC                  27
+#define  DUK_OP_DEC                  28
+#define  DUK_OP_BAND                 29
+#define  DUK_OP_BOR                  30
+#define  DUK_OP_BXOR                 31
+#define  DUK_OP_BASL                 32
+#define  DUK_OP_BLSR                 33
+#define  DUK_OP_BASR                 34
+#define  DUK_OP_BNOT                 35
+#define  DUK_OP_LNOT                 36
+#define  DUK_OP_EQ                   37
+#define  DUK_OP_NEQ                  38
+#define  DUK_OP_SEQ                  39
+#define  DUK_OP_SNEQ                 40
+#define  DUK_OP_GT                   41
+#define  DUK_OP_GE                   42
+#define  DUK_OP_LT                   43
+#define  DUK_OP_LE                   44
+#define  DUK_OP_IF                   45
+#define  DUK_OP_INSTOF               46
+#define  DUK_OP_IN                   47
+#define  DUK_OP_JUMP                 48
+#define  DUK_OP_RETURN               49
+#define  DUK_OP_CALL                 50
+#define  DUK_OP_LABEL                51
+#define  DUK_OP_ENDLABEL             52
+#define  DUK_OP_BREAK                53
+#define  DUK_OP_CONTINUE             54
+#define  DUK_OP_TRYCATCH             55
+#define  DUK_OP_56                   56
+#define  DUK_OP_57                   57
+#define  DUK_OP_58                   58
+#define  DUK_OP_59                   59
+#define  DUK_OP_60                   60
+#define  DUK_OP_EXTRA                61
+#define  DUK_OP_DEBUG                62
+#define  DUK_OP_INVALID              63
+
+/* DUK_OP_EXTRA, sub-operation in A */
+#define  DUK_EXTRAOP_NOP             0
+#define  DUK_EXTRAOP_LDTHIS          1
+#define  DUK_EXTRAOP_LDUNDEF         2
+#define  DUK_EXTRAOP_LDNULL          3
+#define  DUK_EXTRAOP_LDTRUE          4
+#define  DUK_EXTRAOP_LDFALSE         5
+#define  DUK_EXTRAOP_NEWOBJ          6
+#define  DUK_EXTRAOP_NEWARR          7
+#define  DUK_EXTRAOP_SETALEN         8
+#define  DUK_EXTRAOP_TYPEOF          9
+#define  DUK_EXTRAOP_TYPEOFID        10
+#define  DUK_EXTRAOP_TONUM           11
+#define  DUK_EXTRAOP_INITENUM        12
+#define  DUK_EXTRAOP_NEXTENUM        13
+#define  DUK_EXTRAOP_INITSET         14
+#define  DUK_EXTRAOP_INITGET         15
+#define  DUK_EXTRAOP_ENDTRY          16
+#define  DUK_EXTRAOP_ENDCATCH        17
+#define  DUK_EXTRAOP_ENDFIN          18
+#define  DUK_EXTRAOP_THROW           19
+#define  DUK_EXTRAOP_INVLHS          20
+
+/* DUK_OP_DEBUG, sub-operation in A */
+#define  DUK_DEBUGOP_DUMPREG         0
+#define  DUK_DEBUGOP_DUMPREGS        1
+#define  DUK_DEBUGOP_DUMPTHREAD      2
+#define  DUK_DEBUGOP_LOGMARK         3
+
+/* DUK_OP_CALL flags in A */
+#define  DUK_BC_CALL_FLAG_TAILCALL           (1 << 0)
+#define  DUK_BC_CALL_FLAG_EVALCALL           (1 << 1)
+
+/* DUK_OP_TRYCATCH flags in A */
+#define  DUK_BC_TRYCATCH_FLAG_HAVE_CATCH     (1 << 0)
+#define  DUK_BC_TRYCATCH_FLAG_HAVE_FINALLY   (1 << 1)
+#define  DUK_BC_TRYCATCH_FLAG_CATCH_BINDING  (1 << 2)
+#define  DUK_BC_TRYCATCH_FLAG_WITH_BINDING   (1 << 3)
+
+/* DUK_OP_RETURN flags in A */
+#define  DUK_BC_RETURN_FLAG_FAST             (1 << 0)
+#define  DUK_BC_RETURN_FLAG_HAVE_RETVAL      (1 << 1)
+
+/* DUK_OP_DECLVAR flags in A; bottom bits are reserved for propdesc flags (DUK_PROPDESC_FLAG_XXX) */
+#define  DUK_BC_DECLVAR_FLAG_UNDEF_VALUE     (1 << 4)  /* use 'undefined' for value automatically */
+#define  DUK_BC_DECLVAR_FLAG_FUNC_DECL       (1 << 5)  /* function declaration */
+
+/* misc constants and helper macros */
+#define  DUK_BC_REGLIMIT             256  /* if B/C is >= this value, refers to a const */
+#define  DUK_BC_ISREG(x)             ((x) < DUK_BC_REGLIMIT)
+#define  DUK_BC_ISCONST(x)           ((x) >= DUK_BC_REGLIMIT)
+#define  DUK_BC_LDINT_BIAS           (1 << 17)
+#define  DUK_BC_LDINTX_SHIFT         18
+#define  DUK_BC_JUMP_BIAS            (1 << 25)
+
+#endif  /* DUK_JS_BYTECODE_H_INCLUDED */
+
+#line 1 "duk_lexer.h"
+/*
+ *  Lexer defines.
+ */
+
+#ifndef DUK_LEXER_H_INCLUDED
+#define DUK_LEXER_H_INCLUDED
 
 typedef void (*duk_re_range_callback)(void *user, duk_u32 r1, duk_u32 r2, int direct);
 
@@ -2503,8 +4897,6 @@ void duk_js_compile(duk_hthread *thr, int flags);
 #ifndef DUK_REGEXP_H_INCLUDED
 #define DUK_REGEXP_H_INCLUDED
 
-/* already included: duk_bittypes.h */
-
 /* maximum bytecode copies for {n,m} quantifiers */
 #define  DUK_RE_MAX_ATOM_COPIES             1000
 
@@ -2616,9 +5008,9 @@ void duk_regexp_match_force_global(duk_hthread *thr);  /* hacky helper for Strin
  *
  *  At least three memory layouts are relevant here:
  *
- *    A B C D E F G H    Big endian (e.g. 68k)           _USE_BE_VARIANT
- *    H G F E D C B A    Little endian (e.g. x86)        _USE_LE_VARIANT
- *    D C B A H G F E    Middle/cross endian (e.g. ARM)  _USE_ME_VARIANT
+ *    A B C D E F G H    Big endian (e.g. 68k)           USE__BE_VARIANT
+ *    H G F E D C B A    Little endian (e.g. x86)        USE__LE_VARIANT
+ *    D C B A H G F E    Middle/cross endian (e.g. ARM)  USE__ME_VARIANT
  *
  *  ARM is a special case: ARM double values are in middle/cross endian
  *  format while ARM unsigned long long (64-bit) values are in standard
@@ -2638,119 +5030,23 @@ void duk_regexp_match_force_global(duk_hthread *thr);  /* hacky helper for Strin
 #ifndef DUK_TVAL_H_INCLUDED
 #define DUK_TVAL_H_INCLUDED
 
-#include <math.h>  /* provides NAN with -std=c99 */
-
-#ifndef  NAN
-#error missing a define for NAN, try -std=c99 or fix this header
-#endif
-
-/* already included: duk_features.h */
-/* already included: duk_forwdecl.h */
-
 #ifdef DUK_USE_DOUBLE_LE
-#define  _USE_LE_VARIANT
+#define  USE__LE_VARIANT
 #endif
 #ifdef DUK_USE_DOUBLE_ME
-#define  _USE_ME_VARIANT
+#define  USE__ME_VARIANT
 #endif
 #ifdef DUK_USE_DOUBLE_BE
-#define  _USE_BE_VARIANT
+#define  USE__BE_VARIANT
+#endif
+#ifdef DUK_USE_64BIT_OPS
+#define  USE__64BIT
 #endif
 
 /* sanity */
-#if !defined(_USE_LE_VARIANT) && !defined(_USE_ME_VARIANT) && !defined(_USE_BE_VARIANT)
+#if !defined(USE__LE_VARIANT) && !defined(USE__ME_VARIANT) && !defined(USE__BE_VARIANT)
 #error unsupported: cannot determine byte order variant
 #endif
-
-/*
- *  Union to access IEEE double memory representation
- */
-
-/* indexes of various types with respect to big endian (logical) layout */
-#ifdef _USE_LE_VARIANT
-#define  _DUK_IDX_ULL0   0
-#define  _DUK_IDX_UI0    1
-#define  _DUK_IDX_UI1    0
-#define  _DUK_IDX_US0    3
-#define  _DUK_IDX_US1    2
-#define  _DUK_IDX_US2    1
-#define  _DUK_IDX_US3    0
-#define  _DUK_IDX_UC0    7
-#define  _DUK_IDX_UC1    6
-#define  _DUK_IDX_UC2    5
-#define  _DUK_IDX_UC3    4
-#define  _DUK_IDX_UC4    3
-#define  _DUK_IDX_UC5    2
-#define  _DUK_IDX_UC6    1
-#define  _DUK_IDX_UC7    0
-#define  _DUK_IDX_VP0    _DUK_IDX_UI0  /* packed tval */
-#define  _DUK_IDX_VP1    _DUK_IDX_UI1  /* packed tval */
-#endif
-#ifdef _USE_BE_VARIANT
-#define  _DUK_IDX_ULL0   0
-#define  _DUK_IDX_UI0    0
-#define  _DUK_IDX_UI1    1
-#define  _DUK_IDX_US0    0
-#define  _DUK_IDX_US1    1
-#define  _DUK_IDX_US2    2
-#define  _DUK_IDX_US3    3
-#define  _DUK_IDX_UC0    0
-#define  _DUK_IDX_UC1    1
-#define  _DUK_IDX_UC2    2
-#define  _DUK_IDX_UC3    3
-#define  _DUK_IDX_UC4    4
-#define  _DUK_IDX_UC5    5
-#define  _DUK_IDX_UC6    6
-#define  _DUK_IDX_UC7    7
-#define  _DUK_IDX_VP0    _DUK_IDX_UI0  /* packed tval */
-#define  _DUK_IDX_VP1    _DUK_IDX_UI1  /* packed tval */
-#endif
-#ifdef _USE_ME_VARIANT
-#define  _DUK_IDX_ULL0   0  /* not directly applicable, byte order differs from a double */
-#define  _DUK_IDX_UI0    0
-#define  _DUK_IDX_UI1    1
-#define  _DUK_IDX_US0    1
-#define  _DUK_IDX_US1    0
-#define  _DUK_IDX_US2    3
-#define  _DUK_IDX_US3    2
-#define  _DUK_IDX_UC0    3
-#define  _DUK_IDX_UC1    2
-#define  _DUK_IDX_UC2    1
-#define  _DUK_IDX_UC3    0
-#define  _DUK_IDX_UC4    7
-#define  _DUK_IDX_UC5    6
-#define  _DUK_IDX_UC6    5
-#define  _DUK_IDX_UC7    4
-#define  _DUK_IDX_VP0    _DUK_IDX_UI0  /* packed tval */
-#define  _DUK_IDX_VP1    _DUK_IDX_UI1  /* packed tval */
-#endif
-
-/* Almost the same as a packed duk_tval, but only for accessing doubles e.g.
- * for numconv, which is needed regardless of duk_tval representation.
- */
-
-union duk_double_union {
-	double d;
-	unsigned long long ull[1];
-	unsigned int ui[2];
-	unsigned short us[4];
-	unsigned char uc[8];
-};
-typedef union duk_double_union duk_double_union;
-
-/* macros for duk_numconv.c */
-#define  DUK_DBLUNION_SET_DOUBLE(u,v)  do {  \
-		(u)->d = (v); \
-	} while (0)
-#define  DUK_DBLUNION_SET_HIGH32(u,v)  do {  \
-		(u)->ui[_DUK_IDX_UI0] = (unsigned int) (v); \
-	} while (0)
-#define  DUK_DBLUNION_SET_LOW32(u,v)  do {  \
-		(u)->ui[_DUK_IDX_UI1] = (unsigned int) (v); \
-	} while (0)
-#define  DUK_DBLUNION_GET_DOUBLE(u)  ((u)->d)
-#define  DUK_DBLUNION_GET_HIGH32(u)  ((u)->ui[_DUK_IDX_UI0])
-#define  DUK_DBLUNION_GET_LOW32(u)   ((u)->ui[_DUK_IDX_UI1])
 
 #ifdef DUK_USE_PACKED_TVAL
 /* ======================================================================== */
@@ -2770,7 +5066,10 @@ typedef union duk_double_union duk_double_union;
  */
 union duk_tval {
 	double d;
+	/* FIXME: types */
+#ifdef USE__64BIT
 	unsigned long long ull[1];
+#endif
 	unsigned int ui[2];
 	unsigned short us[4];
 	unsigned char uc[8];
@@ -2794,6 +5093,7 @@ typedef union duk_tval duk_tval;
 /* for convenience */
 #define  DUK_XTAG_UNDEFINED_ACTUAL 0xfff10000
 #define  DUK_XTAG_UNDEFINED_UNUSED 0xfff10001
+#define  DUK_XTAG_NULL             0xfff20000
 #define  DUK_XTAG_BOOLEAN_FALSE    0xfff30000
 #define  DUK_XTAG_BOOLEAN_TRUE     0xfff30001
 
@@ -2802,152 +5102,145 @@ typedef union duk_tval duk_tval;
  *  feature that while doubles have a mixed byte order (32107654), unsigned
  *  long long values has a little endian byte order (76543210).  When writing
  *  a logical double value through a ULL pointer, the 32-bit words need to be
- *  swapped; hence the #ifdefs below for ULL writes with _USE_ME_VARIANT.
+ *  swapped; hence the #ifdefs below for ULL writes with USE__ME_VARIANT.
  *  This is not full ARM support but suffices for some environments.
  */
 
 /* raw setters */
-#ifdef _USE_ME_VARIANT
-#define  _DUK_TVAL_SET_UNDEFINED_ACTUAL_FULL(v)  do { \
-		(v)->ull[_DUK_IDX_ULL0] = (unsigned long long) DUK_XTAG_UNDEFINED_ACTUAL; \
+#ifdef USE__64BIT
+#ifdef USE__ME_VARIANT
+#define  DUK__TVAL_SET_HIGH32_FULL(v,x)  do { \
+		(v)->ull[DUK_DBL_IDX_ULL0] = (unsigned long long) (x); \
 	} while (0)
 #else
-#define  _DUK_TVAL_SET_UNDEFINED_ACTUAL_FULL(v)  do { \
-		(v)->ull[_DUK_IDX_ULL0] = ((unsigned long long) DUK_XTAG_UNDEFINED_ACTUAL) << 32; \
+#define  DUK__TVAL_SET_HIGH32_FULL(v,x)  do { \
+		(v)->ull[DUK_DBL_IDX_ULL0] = ((unsigned long long) (x)) << 32; \
 	} while (0)
 #endif
-
-#define  _DUK_TVAL_SET_UNDEFINED_ACTUAL_NOTFULL(v)  do { \
-		(v)->ui[_DUK_IDX_UI0] = (unsigned int) DUK_XTAG_UNDEFINED_ACTUAL; \
+#else  /* USE__64BIT */
+#define  DUK__TVAL_SET_HIGH32_FULL(v,x)  do { \
+		(v)->ui[DUK_DBL_IDX_UI0] = (unsigned int) (x); \
+		(v)->ui[DUK_DBL_IDX_UI1] = (unsigned int) 0; \
 	} while (0)
+#endif  /* USE__64BIT */
 
-#ifdef _USE_ME_VARIANT
-#define  _DUK_TVAL_SET_UNDEFINED_UNUSED_FULL(v)  do { \
-		(v)->ull[_DUK_IDX_ULL0] = (unsigned long long) DUK_XTAG_UNDEFINED_UNUSED; \
-	} while (0)
-#else
-#define  _DUK_TVAL_SET_UNDEFINED_UNUSED_FULL(v)  do { \
-		(v)->ull[_DUK_IDX_ULL0] = ((unsigned long long) DUK_XTAG_UNDEFINED_UNUSED) << 32; \
-	} while (0)
-#endif
-
-#define  _DUK_TVAL_SET_UNDEFINED_UNUSED_NOTFULL(v)  do { \
-		(v)->ui[_DUK_IDX_UI0] = (unsigned int) DUK_XTAG_UNDEFINED_UNUSED; \
+#define  DUK__TVAL_SET_UNDEFINED_ACTUAL_FULL(v)  DUK__TVAL_SET_HIGH32((v), DUK_XTAG_UNDEFINED_ACTUAL)
+#define  DUK__TVAL_SET_UNDEFINED_ACTUAL_NOTFULL(v)  do { \
+		(v)->ui[DUK_DBL_IDX_UI0] = (unsigned int) DUK_XTAG_UNDEFINED_ACTUAL; \
 	} while (0)
 
-#ifdef _USE_ME_VARIANT
-#define  _DUK_TVAL_SET_NULL_FULL(v)  do { \
-		(v)->ull[_DUK_IDX_ULL0] = (((unsigned long long) DUK_TAG_NULL) << 16); \
+#define  DUK__TVAL_SET_UNDEFINED_UNUSED_FULL(v)  DUK__TVAL_SET_HIGH32((v), DUK_XTAG_UNDEFINED_UNUSED)
+#define  DUK__TVAL_SET_UNDEFINED_UNUSED_NOTFULL(v)  do { \
+		(v)->ui[DUK_DBL_IDX_UI0] = (unsigned int) DUK_XTAG_UNDEFINED_UNUSED; \
 	} while (0)
-#else
-#define  _DUK_TVAL_SET_NULL_FULL(v)  do { \
-		(v)->ull[_DUK_IDX_ULL0] = (((unsigned long long) DUK_TAG_NULL) << 48); \
-	} while (0)
-#endif
 
 /* Note: 16-bit initializer suffices (unlike for undefined/boolean) */
-#define  _DUK_TVAL_SET_NULL_NOTFULL(v)  do { \
-		(v)->us[_DUK_IDX_US0] = (unsigned short) DUK_TAG_NULL; \
+#define  DUK__TVAL_SET_NULL_FULL(v)  DUK__TVAL_SET_HIGH32((v), DUK_XTAG_NULL)
+#define  DUK__TVAL_SET_NULL_NOTFULL(v)  do { \
+		(v)->us[DUK_DBL_IDX_US0] = (unsigned short) DUK_TAG_NULL; \
 	} while (0)
 
-#ifdef _USE_ME_VARIANT
-#define  _DUK_TVAL_SET_BOOLEAN_FULL(v,val)  do { \
+#define  DUK__TVAL_SET_BOOLEAN_FULL(v,val)  DUK__TVAL_SET_HIGH32((v), (((unsigned int) DUK_TAG_BOOLEAN) << 16) | ((unsigned int) val))
+#define  DUK__TVAL_SET_BOOLEAN_NOTFULL(v,val)  do { \
 		DUK_ASSERT((val) == 0 || (val) == 1); \
-		(v)->ull[_DUK_IDX_ULL0] = (((unsigned long long) DUK_TAG_BOOLEAN) << 16) | ((unsigned long long) (val)); \
-	} while (0)
-#else
-#define  _DUK_TVAL_SET_BOOLEAN_FULL(v,val)  do { \
-		DUK_ASSERT((val) == 0 || (val) == 1); \
-		(v)->ull[_DUK_IDX_ULL0] = (((unsigned long long) DUK_TAG_BOOLEAN) << 48) | (((unsigned long long) (val)) << 32); \
-	} while (0)
-#endif
-
-#define  _DUK_TVAL_SET_BOOLEAN_NOTFULL(v,val)  do { \
-		DUK_ASSERT((val) == 0 || (val) == 1); \
-		(v)->ui[_DUK_IDX_UI0] = (((unsigned int) DUK_TAG_BOOLEAN) << 16) | ((unsigned int) (val)); \
+		(v)->ui[DUK_DBL_IDX_UI0] = (((unsigned int) DUK_TAG_BOOLEAN) << 16) | ((unsigned int) (val)); \
 	} while (0)
 
 /* assumes that caller has normalized a possible NaN value of 'val', otherwise trouble ahead */
-#define  _DUK_TVAL_SET_NUMBER_FULL(v,val)  do { \
+#define  DUK__TVAL_SET_NUMBER_FULL(v,val)  do { \
 		(v)->d = (double) (val); \
 	} while (0)
 
 /* no notfull variant */
-#define  _DUK_TVAL_SET_NUMBER_NOTFULL(v,d)  _DUK_TVAL_SET_NUMBER_FULL(v,d)
+#define  DUK__TVAL_SET_NUMBER_NOTFULL(v,d)  DUK__TVAL_SET_NUMBER_FULL(v,d)
 
 /* two casts to avoid gcc warning: "warning: cast from pointer to integer of different size [-Wpointer-to-int-cast]" */
-#ifdef _USE_ME_VARIANT
-#define  _DUK_TVAL_SET_TAGGEDPOINTER(v,h,tag)  do { \
-		(v)->ull[_DUK_IDX_ULL0] = (((unsigned long long) (tag)) << 16) | (((unsigned long long) (unsigned int) (h)) << 32); \
+#ifdef USE__64BIT
+#ifdef USE__ME_VARIANT
+#define  DUK__TVAL_SET_TAGGEDPOINTER(v,h,tag)  do { \
+		(v)->ull[DUK_DBL_IDX_ULL0] = (((unsigned long long) (tag)) << 16) | (((unsigned long long) (unsigned int) (h)) << 32); \
 	} while (0)
 #else
-#define  _DUK_TVAL_SET_TAGGEDPOINTER(v,h,tag)  do { \
-		(v)->ull[_DUK_IDX_ULL0] = (((unsigned long long) (tag)) << 48) | ((unsigned long long) (unsigned int) (h)); \
+#define  DUK__TVAL_SET_TAGGEDPOINTER(v,h,tag)  do { \
+		(v)->ull[DUK_DBL_IDX_ULL0] = (((unsigned long long) (tag)) << 48) | ((unsigned long long) (unsigned int) (h)); \
 	} while (0)
 #endif
+#else  /* USE__64BIT */
+#define  DUK__TVAL_SET_TAGGEDPOINTER(v,h,tag)  do { \
+		(v)->ui[DUK_DBL_IDX_UI0] = ((unsigned int) (tag)) << 16; \
+		(v)->ui[DUK_DBL_IDX_UI1] = (unsigned int) (h); \
+	} while (0)
+#endif  /* USE__64BIT */
 
-#ifdef _USE_ME_VARIANT
-#define  _DUK_TVAL_SET_NAN_FULL(v)  do { \
-		(v)->ull[_DUK_IDX_ULL0] = 0x000000007ff80000ULL; \
+#ifdef USE__64BIT
+#ifdef USE__ME_VARIANT
+#define  DUK__TVAL_SET_NAN_FULL(v)  do { \
+		(v)->ull[DUK_DBL_IDX_ULL0] = 0x000000007ff80000ULL; \
 	} while (0)
 #else
-#define  _DUK_TVAL_SET_NAN_FULL(v)  do { \
-		(v)->ull[_DUK_IDX_ULL0] = 0x7ff8000000000000ULL; \
+#define  DUK__TVAL_SET_NAN_FULL(v)  do { \
+		(v)->ull[DUK_DBL_IDX_ULL0] = 0x7ff8000000000000ULL; \
 	} while (0)
 #endif
+#else  /* USE__64BIT */
+#define  DUK__TVAL_SET_NAN_FULL(v)  do { \
+		(v)->ui[DUK_DBL_IDX_UI0] = (unsigned int) 0x7ff80000; \
+		(v)->ui[DUK_DBL_IDX_UI1] = (unsigned int) 0x00000000; \
+	} while (0)
+#endif  /* USE__64BIT */
 
-#define  _DUK_TVAL_SET_NAN_NOTFULL(v)  do { \
-		(v)->us[_DUK_IDX_US0] = 0x7ff8; \
+#define  DUK__TVAL_SET_NAN_NOTFULL(v)  do { \
+		(v)->us[DUK_DBL_IDX_US0] = 0x7ff8; \
 	} while (0)
 
-#define  _DUK_DOUBLE_SET_NAN_FULL(d)         _DUK_TVAL_SET_NAN_FULL((duk_tval *)(d))
-#define  _DUK_DOUBLE_SET_NAN_NOTFULL(d)      _DUK_TVAL_SET_NAN_NOTFULL((duk_tval *)(d))
+#define  DUK__DOUBLE_SET_NAN_FULL(d)         DUK__TVAL_SET_NAN_FULL((duk_tval *)(d))
+#define  DUK__DOUBLE_SET_NAN_NOTFULL(d)      DUK__TVAL_SET_NAN_NOTFULL((duk_tval *)(d))
 
 /* select actual setters */
 #ifdef DUK_USE_FULL_TVAL
-#define  DUK_TVAL_SET_UNDEFINED_ACTUAL(v)    _DUK_TVAL_SET_UNDEFINED_ACTUAL_FULL((v))
-#define  DUK_TVAL_SET_UNDEFINED_UNUSED(v)    _DUK_TVAL_SET_UNDEFINED_UNUSED_FULL((v))
-#define  DUK_TVAL_SET_NULL(v)                _DUK_TVAL_SET_NULL_FULL((v))
-#define  DUK_TVAL_SET_BOOLEAN(v,i)           _DUK_TVAL_SET_BOOLEAN_FULL((v),(i))
-#define  DUK_TVAL_SET_NUMBER(v,d)            _DUK_TVAL_SET_NUMBER_FULL((v),(d))
-#define  DUK_TVAL_SET_NAN(v)                 _DUK_TVAL_SET_NAN_FULL((v))
-#define  DUK_DOUBLE_SET_NAN(d)               _DUK_DOUBLE_SET_NAN_FULL((d))
+#define  DUK_TVAL_SET_UNDEFINED_ACTUAL(v)    DUK__TVAL_SET_UNDEFINED_ACTUAL_FULL((v))
+#define  DUK_TVAL_SET_UNDEFINED_UNUSED(v)    DUK__TVAL_SET_UNDEFINED_UNUSED_FULL((v))
+#define  DUK_TVAL_SET_NULL(v)                DUK__TVAL_SET_NULL_FULL((v))
+#define  DUK_TVAL_SET_BOOLEAN(v,i)           DUK__TVAL_SET_BOOLEAN_FULL((v),(i))
+#define  DUK_TVAL_SET_NUMBER(v,d)            DUK__TVAL_SET_NUMBER_FULL((v),(d))
+#define  DUK_TVAL_SET_NAN(v)                 DUK__TVAL_SET_NAN_FULL((v))
+#define  DUK_DOUBLE_SET_NAN(d)               DUK__DOUBLE_SET_NAN_FULL((d))
 #else
-#define  DUK_TVAL_SET_UNDEFINED_ACTUAL(v)    _DUK_TVAL_SET_UNDEFINED_ACTUAL_NOTFULL((v))
-#define  DUK_TVAL_SET_UNDEFINED_UNUSED(v)    _DUK_TVAL_SET_UNDEFINED_UNUSED_NOTFULL((v))
-#define  DUK_TVAL_SET_NULL(v)                _DUK_TVAL_SET_NULL_NOTFULL((v))
-#define  DUK_TVAL_SET_BOOLEAN(v,i)           _DUK_TVAL_SET_BOOLEAN_NOTFULL((v),(i))
-#define  DUK_TVAL_SET_NUMBER(v,d)            _DUK_TVAL_SET_NUMBER_NOTFULL((v),(d))
-#define  DUK_TVAL_SET_NAN(v)                 _DUK_TVAL_SET_NAN_NOTFULL((v))
-#define  DUK_DOUBLE_SET_NAN(d)               _DUK_DOUBLE_SET_NAN_NOTFULL((d))
+#define  DUK_TVAL_SET_UNDEFINED_ACTUAL(v)    DUK__TVAL_SET_UNDEFINED_ACTUAL_NOTFULL((v))
+#define  DUK_TVAL_SET_UNDEFINED_UNUSED(v)    DUK__TVAL_SET_UNDEFINED_UNUSED_NOTFULL((v))
+#define  DUK_TVAL_SET_NULL(v)                DUK__TVAL_SET_NULL_NOTFULL((v))
+#define  DUK_TVAL_SET_BOOLEAN(v,i)           DUK__TVAL_SET_BOOLEAN_NOTFULL((v),(i))
+#define  DUK_TVAL_SET_NUMBER(v,d)            DUK__TVAL_SET_NUMBER_NOTFULL((v),(d))
+#define  DUK_TVAL_SET_NAN(v)                 DUK__TVAL_SET_NAN_NOTFULL((v))
+#define  DUK_DOUBLE_SET_NAN(d)               DUK__DOUBLE_SET_NAN_NOTFULL((d))
 #endif
 
-#define  DUK_TVAL_SET_STRING(v,h)            _DUK_TVAL_SET_TAGGEDPOINTER((v),(h),DUK_TAG_STRING)
-#define  DUK_TVAL_SET_OBJECT(v,h)            _DUK_TVAL_SET_TAGGEDPOINTER((v),(h),DUK_TAG_OBJECT)
-#define  DUK_TVAL_SET_BUFFER(v,h)            _DUK_TVAL_SET_TAGGEDPOINTER((v),(h),DUK_TAG_BUFFER)
-#define  DUK_TVAL_SET_POINTER(v,p)           _DUK_TVAL_SET_TAGGEDPOINTER((v),(p),DUK_TAG_POINTER)
+#define  DUK_TVAL_SET_STRING(v,h)            DUK__TVAL_SET_TAGGEDPOINTER((v),(h),DUK_TAG_STRING)
+#define  DUK_TVAL_SET_OBJECT(v,h)            DUK__TVAL_SET_TAGGEDPOINTER((v),(h),DUK_TAG_OBJECT)
+#define  DUK_TVAL_SET_BUFFER(v,h)            DUK__TVAL_SET_TAGGEDPOINTER((v),(h),DUK_TAG_BUFFER)
+#define  DUK_TVAL_SET_POINTER(v,p)           DUK__TVAL_SET_TAGGEDPOINTER((v),(p),DUK_TAG_POINTER)
 
 #define  DUK_TVAL_SET_TVAL(v,x)              do { *(v) = *(x); } while (0)
 
 /* getters */
-#define  DUK_TVAL_GET_BOOLEAN(v)             ((int) (v)->us[_DUK_IDX_US1])
+#define  DUK_TVAL_GET_BOOLEAN(v)             ((int) (v)->us[DUK_DBL_IDX_US1])
 #define  DUK_TVAL_GET_NUMBER(v)              ((v)->d)
-#define  DUK_TVAL_GET_STRING(v)              ((duk_hstring *) (v)->vp[_DUK_IDX_VP1])
-#define  DUK_TVAL_GET_OBJECT(v)              ((duk_hobject *) (v)->vp[_DUK_IDX_VP1])
-#define  DUK_TVAL_GET_BUFFER(v)              ((duk_hbuffer *) (v)->vp[_DUK_IDX_VP1])
-#define  DUK_TVAL_GET_POINTER(v)             ((void *) (v)->vp[_DUK_IDX_VP1])
-#define  DUK_TVAL_GET_HEAPHDR(v)             ((duk_heaphdr *) (v)->vp[_DUK_IDX_VP1])
+#define  DUK_TVAL_GET_STRING(v)              ((duk_hstring *) (v)->vp[DUK_DBL_IDX_VP1])
+#define  DUK_TVAL_GET_OBJECT(v)              ((duk_hobject *) (v)->vp[DUK_DBL_IDX_VP1])
+#define  DUK_TVAL_GET_BUFFER(v)              ((duk_hbuffer *) (v)->vp[DUK_DBL_IDX_VP1])
+#define  DUK_TVAL_GET_POINTER(v)             ((void *) (v)->vp[DUK_DBL_IDX_VP1])
+#define  DUK_TVAL_GET_HEAPHDR(v)             ((duk_heaphdr *) (v)->vp[DUK_DBL_IDX_VP1])
 
 /* decoding */
-#define  DUK_TVAL_GET_TAG(v)                 ((int) (v)->us[_DUK_IDX_US0])
+#define  DUK_TVAL_GET_TAG(v)                 ((int) (v)->us[DUK_DBL_IDX_US0])
 
 #define  DUK_TVAL_IS_UNDEFINED(v)            (DUK_TVAL_GET_TAG((v)) == DUK_TAG_UNDEFINED)
-#define  DUK_TVAL_IS_UNDEFINED_ACTUAL(v)     ((v)->ui[_DUK_IDX_UI0] == DUK_XTAG_UNDEFINED_ACTUAL)
-#define  DUK_TVAL_IS_UNDEFINED_UNUSED(v)     ((v)->ui[_DUK_IDX_UI0] == DUK_XTAG_UNDEFINED_UNUSED)
+#define  DUK_TVAL_IS_UNDEFINED_ACTUAL(v)     ((v)->ui[DUK_DBL_IDX_UI0] == DUK_XTAG_UNDEFINED_ACTUAL)
+#define  DUK_TVAL_IS_UNDEFINED_UNUSED(v)     ((v)->ui[DUK_DBL_IDX_UI0] == DUK_XTAG_UNDEFINED_UNUSED)
 #define  DUK_TVAL_IS_NULL(v)                 (DUK_TVAL_GET_TAG((v)) == DUK_TAG_NULL)
 #define  DUK_TVAL_IS_BOOLEAN(v)              (DUK_TVAL_GET_TAG((v)) == DUK_TAG_BOOLEAN)
-#define  DUK_TVAL_IS_BOOLEAN_TRUE(v)         ((v)->ui[_DUK_IDX_UI0] == DUK_XTAG_BOOLEAN_TRUE)
-#define  DUK_TVAL_IS_BOOLEAN_FALSE(v)        ((v)->ui[_DUK_IDX_UI0] == DUK_XTAG_BOOLEAN_FALSE)
+#define  DUK_TVAL_IS_BOOLEAN_TRUE(v)         ((v)->ui[DUK_DBL_IDX_UI0] == DUK_XTAG_BOOLEAN_TRUE)
+#define  DUK_TVAL_IS_BOOLEAN_FALSE(v)        ((v)->ui[DUK_DBL_IDX_UI0] == DUK_XTAG_BOOLEAN_FALSE)
 #define  DUK_TVAL_IS_STRING(v)               (DUK_TVAL_GET_TAG((v)) == DUK_TAG_STRING)
 #define  DUK_TVAL_IS_OBJECT(v)               (DUK_TVAL_GET_TAG((v)) == DUK_TAG_OBJECT)
 #define  DUK_TVAL_IS_BUFFER(v)               (DUK_TVAL_GET_TAG((v)) == DUK_TAG_BUFFER)
@@ -2968,56 +5261,70 @@ typedef union duk_tval duk_tval;
  */
 
 /* XXX: reading unsigned int instead of unsigned short is one byte shorter on x86 :) */
-#ifdef _USE_ME_VARIANT
-#define  _DUK_DOUBLE_IS_NAN_FULL(d) \
+#ifdef USE__64BIT
+#ifdef USE__ME_VARIANT
+#define  DUK__DOUBLE_IS_NAN_FULL(d) \
 	/* E == 0x7ff, F != 0 => NaN */ \
-	(((((duk_tval *)(d))->us[_DUK_IDX_US0] & 0x7ff0) == 0x7ff0) && \
-	 (((((duk_tval *)(d))->ull[_DUK_IDX_ULL0]) & 0x000fffffffffffffULL) != 0))
+	(((((duk_tval *)(d))->us[DUK_DBL_IDX_US0] & 0x7ff0) == 0x7ff0) && \
+	 (((((duk_tval *)(d))->ull[DUK_DBL_IDX_ULL0]) & 0xffffffff000fffffULL) != 0))
 #else
-#define  _DUK_DOUBLE_IS_NAN_FULL(d) \
+#define  DUK__DOUBLE_IS_NAN_FULL(d) \
 	/* E == 0x7ff, F != 0 => NaN */ \
-	(((((duk_tval *)(d))->us[_DUK_IDX_US0] & 0x7ff0) == 0x7ff0) && \
-	 (((((duk_tval *)(d))->ull[_DUK_IDX_ULL0]) & 0xffffffff000fffffULL) != 0))
+	(((((duk_tval *)(d))->us[DUK_DBL_IDX_US0] & 0x7ff0) == 0x7ff0) && \
+	 (((((duk_tval *)(d))->ull[DUK_DBL_IDX_ULL0]) & 0x000fffffffffffffULL) != 0))
 #endif
+#else  /* USE__64BIT */
+#define  DUK__DOUBLE_IS_NAN_FULL(d) \
+	/* E == 0x7ff, F != 0 => NaN */ \
+	(((((duk_tval *)(d))->ui[DUK_DBL_IDX_UI0] & 0x7ff00000) == 0x7ff00000) && \
+	 ((((duk_tval *)(d))->ui[DUK_DBL_IDX_UI0] & 0x000fffff) != 0 || \
+          ((duk_tval *)(d))->ui[DUK_DBL_IDX_UI1] != 0))
+#endif  /* USE__64BIT */
 
 /* XXX: avoid possible double read? */
-#define  _DUK_DOUBLE_IS_NAN_NOTFULL(d) \
+#define  DUK__DOUBLE_IS_NAN_NOTFULL(d) \
 	/* E == 0x7ff, topmost four bits of F != 0 => assume NaN */ \
-	(((((duk_tval *)(d))->us[_DUK_IDX_US0] & 0x7ff0) == 0x7ff0) && \
-	 ((((duk_tval *)(d))->us[_DUK_IDX_US0] & 0x000f) != 0x0000))
+	(((((duk_tval *)(d))->us[DUK_DBL_IDX_US0] & 0x7ff0) == 0x7ff0) && \
+	 ((((duk_tval *)(d))->us[DUK_DBL_IDX_US0] & 0x000f) != 0x0000))
 
-#define  _DUK_DOUBLE_NORMALIZE_NAN_CHECK_FULL(d)  do { \
-		if (_DUK_DOUBLE_IS_NAN_FULL((d))) { \
-			_DUK_DOUBLE_SET_NAN_FULL((d)); \
+#define  DUK__DOUBLE_NORMALIZE_NAN_CHECK_FULL(d)  do { \
+		if (DUK__DOUBLE_IS_NAN_FULL((d))) { \
+			DUK__DOUBLE_SET_NAN_FULL((d)); \
 		} \
 	} while (0)
 
-#define  _DUK_DOUBLE_NORMALIZE_NAN_CHECK_NOTFULL(d)  do { \
-		if (_DUK_DOUBLE_IS_NAN_NOTFULL((d))) { \
-			_DUK_DOUBLE_SET_NAN_NOTFULL((d)); \
+#define  DUK__DOUBLE_NORMALIZE_NAN_CHECK_NOTFULL(d)  do { \
+		if (DUK__DOUBLE_IS_NAN_NOTFULL((d))) { \
+			DUK__DOUBLE_SET_NAN_NOTFULL((d)); \
 		} \
 	} while (0)
 
-#ifdef _USE_ME_VARIANT
-#define  _DUK_DOUBLE_IS_NORMALIZED_NAN_FULL(d) \
-	(((duk_tval *)(d))->ull[_DUK_IDX_ULL0] == 0x000000007ff80000ULL)
+#ifdef USE__64BIT
+#ifdef USE__ME_VARIANT
+#define  DUK__DOUBLE_IS_NORMALIZED_NAN_FULL(d) \
+	(((duk_tval *)(d))->ull[DUK_DBL_IDX_ULL0] == 0x000000007ff80000ULL)
 #else
-#define  _DUK_DOUBLE_IS_NORMALIZED_NAN_FULL(d) \
-	(((duk_tval *)(d))->ull[_DUK_IDX_ULL0] == 0x7ff8000000000000ULL)
+#define  DUK__DOUBLE_IS_NORMALIZED_NAN_FULL(d) \
+	(((duk_tval *)(d))->ull[DUK_DBL_IDX_ULL0] == 0x7ff8000000000000ULL)
 #endif
+#else  /* USE__64BIT */
+#define  DUK__DOUBLE_IS_NORMALIZED_NAN_FULL(d) \
+	((((duk_tval *)(d))->ui[DUK_DBL_IDX_UI0] == 0x7ff80000) && \
+	 (((duk_tval *)(d))->ui[DUK_DBL_IDX_UI1] == 0x00000000))
+#endif  /* USE__64BIT */
 
-#define  _DUK_DOUBLE_IS_NORMALIZED_NAN_NOTFULL(d) \
+#define  DUK__DOUBLE_IS_NORMALIZED_NAN_NOTFULL(d) \
 	/* E == 0x7ff, F == 8 => normalized NaN */ \
-	(((duk_tval *)(d))->us[_DUK_IDX_US0] == 0x7ff8)
+	(((duk_tval *)(d))->us[DUK_DBL_IDX_US0] == 0x7ff8)
 
 #ifdef DUK_USE_FULL_TVAL
-#define  DUK_DOUBLE_NORMALIZE_NAN_CHECK(d)  _DUK_DOUBLE_NORMALIZE_NAN_CHECK_FULL((d))
-#define  DUK_DOUBLE_IS_NAN(d)               _DUK_DOUBLE_IS_NAN_FULL((d))
-#define  DUK_DOUBLE_IS_NORMALIZED_NAN(d)    _DUK_DOUBLE_IS_NORMALIZED_NAN_FULL((d))
+#define  DUK_DOUBLE_NORMALIZE_NAN_CHECK(d)  DUK__DOUBLE_NORMALIZE_NAN_CHECK_FULL((d))
+#define  DUK_DOUBLE_IS_NAN(d)               DUK__DOUBLE_IS_NAN_FULL((d))
+#define  DUK_DOUBLE_IS_NORMALIZED_NAN(d)    DUK__DOUBLE_IS_NORMALIZED_NAN_FULL((d))
 #else
-#define  DUK_DOUBLE_NORMALIZE_NAN_CHECK(d)  _DUK_DOUBLE_NORMALIZE_NAN_CHECK_NOTFULL((d))
-#define  DUK_DOUBLE_IS_NAN(d)               _DUK_DOUBLE_IS_NAN_NOTFULL((d))
-#define  DUK_DOUBLE_IS_NORMALIZED_NAN(d)    _DUK_DOUBLE_IS_NORMALIZED_NAN_NOTFULL((d))
+#define  DUK_DOUBLE_NORMALIZE_NAN_CHECK(d)  DUK__DOUBLE_NORMALIZE_NAN_CHECK_NOTFULL((d))
+#define  DUK_DOUBLE_IS_NAN(d)               DUK__DOUBLE_IS_NAN_NOTFULL((d))
+#define  DUK_DOUBLE_IS_NORMALIZED_NAN(d)    DUK__DOUBLE_IS_NORMALIZED_NAN_NOTFULL((d))
 #endif
 
 /* this is used for assertions - it checks that the NaN is properly normalized */
@@ -3054,7 +5361,7 @@ struct duk_tval_struct {
 	} v;
 };
 
-#define  _DUK_TAG_NUMBER               0  /* not exposed */
+#define  DUK__TAG_NUMBER               0  /* not exposed */
 #define  DUK_TAG_UNDEFINED             1
 #define  DUK_TAG_NULL                  2
 #define  DUK_TAG_BOOLEAN               3
@@ -3063,7 +5370,7 @@ struct duk_tval_struct {
 #define  DUK_TAG_OBJECT                6
 #define  DUK_TAG_BUFFER                7
 
-/* _DUK_TAG_NUMBER is intentionally first, as it is the default clause in code
+/* DUK__TAG_NUMBER is intentionally first, as it is the default clause in code
  * to support the 8-byte representation.  Further, it is a non-heap-allocated
  * type so it should come before DUK_TAG_STRING.  Finally, it should not break
  * the tag value ranges covered by case-clauses in a switch-case.
@@ -3090,7 +5397,7 @@ struct duk_tval_struct {
 	} while (0)
 
 #define  DUK_TVAL_SET_NUMBER(tv,val)  do { \
-		(tv)->t = _DUK_TAG_NUMBER; \
+		(tv)->t = DUK__TAG_NUMBER; \
 		(tv)->v.d = (val); \
 	} while (0)
 
@@ -3116,14 +5423,14 @@ struct duk_tval_struct {
 
 #define  DUK_TVAL_SET_NAN(tv)  do { \
 		/* in non-packed representation we don't care about which NaN is used */ \
-		(tv)->t = _DUK_TAG_NUMBER; \
-		(tv)->v.d = NAN; \
+		(tv)->t = DUK__TAG_NUMBER; \
+		(tv)->v.d = DUK_DOUBLE_NAN; \
 	} while (0)
 
 #define  DUK_DOUBLE_SET_NAN(d)  do { \
 		/* in non-packed representation we don't care about which NaN is used */ \
 		/* assume d is 'double *' */ \
-		(d)[0] = NAN; \
+		(d)[0] = DUK_DOUBLE_NAN; \
 	} while (0)
 
 #define  DUK_TVAL_SET_TVAL(v,x)              do { *(v) = *(x); } while (0)
@@ -3139,7 +5446,7 @@ struct duk_tval_struct {
 
 /* decoding */
 #define  DUK_TVAL_GET_TAG(tv)               ((tv)->t)
-#define  DUK_TVAL_IS_NUMBER(tv)             ((tv)->t == _DUK_TAG_NUMBER)
+#define  DUK_TVAL_IS_NUMBER(tv)             ((tv)->t == DUK__TAG_NUMBER)
 #define  DUK_TVAL_IS_UNDEFINED(tv)          ((tv)->t == DUK_TAG_UNDEFINED)
 #define  DUK_TVAL_IS_UNDEFINED_ACTUAL(tv)   (((tv)->t == DUK_TAG_UNDEFINED) && ((tv)->v.i == 0))
 #define  DUK_TVAL_IS_UNDEFINED_UNUSED(tv)   (((tv)->t == DUK_TAG_UNDEFINED) && ((tv)->v.i != 0))
@@ -3156,8 +5463,8 @@ struct duk_tval_struct {
 
 /* misc */
 #define  DUK_DOUBLE_NORMALIZE_NAN_CHECK(d)  /* nop: no need to normalize */
-#define  DUK_DOUBLE_IS_NAN(d)               (fpclassify(*(d)) == FP_NAN)
-#define  DUK_DOUBLE_IS_NORMALIZED_NAN(d)    (fpclassify(*(d)) == FP_NAN)  /* all NaNs are considered normalized */
+#define  DUK_DOUBLE_IS_NAN(d)               (DUK_ISNAN(*(d)))
+#define  DUK_DOUBLE_IS_NORMALIZED_NAN(d)    (DUK_ISNAN(*(d)))  /* all NaNs are considered normalized */
 #define  DUK_DOUBLE_IS_NORMALIZED(d)        1  /* all doubles are considered normalized */
 
 #endif  /* DUK_USE_PACKED_TVAL */
@@ -3170,14 +5477,17 @@ struct duk_tval_struct {
 #define  DUK_TVAL_SET_BOOLEAN_FALSE(v)       DUK_TVAL_SET_BOOLEAN(v, 0)
 
 /* undefine local defines */
-#ifdef _USE_LE_VARIANT
-#undef _USE_LE_VARIANT
+#ifdef USE__LE_VARIANT
+#undef USE__LE_VARIANT
 #endif
-#ifdef _USE_ME_VARIANT
-#undef _USE_ME_VARIANT
+#ifdef USE__ME_VARIANT
+#undef USE__ME_VARIANT
 #endif
-#ifdef _USE_BE_VARIANT
-#undef _USE_BE_VARIANT
+#ifdef USE__BE_VARIANT
+#undef USE__BE_VARIANT
+#endif
+#ifdef USE__64BIT
+#undef USE__64BIT
 #endif
 
 #endif  /* DUK_TVAL_H_INCLUDED */
@@ -3190,9 +5500,6 @@ struct duk_tval_struct {
 
 #ifndef DUK_HEAPHDR_H_INCLUDED
 #define DUK_HEAPHDR_H_INCLUDED
-
-/* already included: duk_forwdecl.h */
-/* already included: duk_tval.h */
 
 /*
  *  Common heap header
@@ -3367,22 +5674,22 @@ struct duk_heaphdr_string {
 
 #define  DUK_TVAL_INCREF(thr,tv)                duk_heap_tval_incref((tv))
 #define  DUK_TVAL_DECREF(thr,tv)                duk_heap_tval_decref((thr),(tv))
-#define  _DUK_HEAPHDR_INCREF(thr,h)             duk_heap_heaphdr_incref((h))
-#define  _DUK_HEAPHDR_DECREF(thr,h)             duk_heap_heaphdr_decref((thr),(h))
-#define  DUK_HEAPHDR_INCREF(thr,h)              _DUK_HEAPHDR_INCREF((thr),(duk_heaphdr *) (h))
-#define  DUK_HEAPHDR_DECREF(thr,h)              _DUK_HEAPHDR_DECREF((thr),(duk_heaphdr *) (h))
-#define  DUK_HSTRING_INCREF(thr,h)              _DUK_HEAPHDR_INCREF((thr),(duk_heaphdr *) (h))
-#define  DUK_HSTRING_DECREF(thr,h)              _DUK_HEAPHDR_DECREF((thr),(duk_heaphdr *) (h))
-#define  DUK_HOBJECT_INCREF(thr,h)              _DUK_HEAPHDR_INCREF((thr),(duk_heaphdr *) (h))
-#define  DUK_HOBJECT_DECREF(thr,h)              _DUK_HEAPHDR_DECREF((thr),(duk_heaphdr *) (h))
-#define  DUK_HBUFFER_INCREF(thr,h)              _DUK_HEAPHDR_INCREF((thr),(duk_heaphdr *) (h))
-#define  DUK_HBUFFER_DECREF(thr,h)              _DUK_HEAPHDR_DECREF((thr),(duk_heaphdr *) (h))
-#define  DUK_HCOMPILEDFUNCTION_INCREF(thr,h)    _DUK_HEAPHDR_INCREF((thr),(duk_heaphdr *) &(h)->obj)
-#define  DUK_HCOMPILEDFUNCTION_DECREF(thr,h)    _DUK_HEAPHDR_DECREF((thr),(duk_heaphdr *) &(h)->obj)
-#define  DUK_HNATIVEFUNCTION_INCREF(thr,h)      _DUK_HEAPHDR_INCREF((thr),(duk_heaphdr *) &(h)->obj)
-#define  DUK_HNATIVEFUNCTION_DECREF(thr,h)      _DUK_HEAPHDR_DECREF((thr),(duk_heaphdr *) &(h)->obj)
-#define  DUK_HTHREAD_INCREF(thr,h)              _DUK_HEAPHDR_INCREF((thr),(duk_heaphdr *) &(h)->obj)
-#define  DUK_HTHREAD_DECREF(thr,h)              _DUK_HEAPHDR_DECREF((thr),(duk_heaphdr *) &(h)->obj)
+#define  DUK__HEAPHDR_INCREF(thr,h)             duk_heap_heaphdr_incref((h))
+#define  DUK__HEAPHDR_DECREF(thr,h)             duk_heap_heaphdr_decref((thr),(h))
+#define  DUK_HEAPHDR_INCREF(thr,h)              DUK__HEAPHDR_INCREF((thr),(duk_heaphdr *) (h))
+#define  DUK_HEAPHDR_DECREF(thr,h)              DUK__HEAPHDR_DECREF((thr),(duk_heaphdr *) (h))
+#define  DUK_HSTRING_INCREF(thr,h)              DUK__HEAPHDR_INCREF((thr),(duk_heaphdr *) (h))
+#define  DUK_HSTRING_DECREF(thr,h)              DUK__HEAPHDR_DECREF((thr),(duk_heaphdr *) (h))
+#define  DUK_HOBJECT_INCREF(thr,h)              DUK__HEAPHDR_INCREF((thr),(duk_heaphdr *) (h))
+#define  DUK_HOBJECT_DECREF(thr,h)              DUK__HEAPHDR_DECREF((thr),(duk_heaphdr *) (h))
+#define  DUK_HBUFFER_INCREF(thr,h)              DUK__HEAPHDR_INCREF((thr),(duk_heaphdr *) (h))
+#define  DUK_HBUFFER_DECREF(thr,h)              DUK__HEAPHDR_DECREF((thr),(duk_heaphdr *) (h))
+#define  DUK_HCOMPILEDFUNCTION_INCREF(thr,h)    DUK__HEAPHDR_INCREF((thr),(duk_heaphdr *) &(h)->obj)
+#define  DUK_HCOMPILEDFUNCTION_DECREF(thr,h)    DUK__HEAPHDR_DECREF((thr),(duk_heaphdr *) &(h)->obj)
+#define  DUK_HNATIVEFUNCTION_INCREF(thr,h)      DUK__HEAPHDR_INCREF((thr),(duk_heaphdr *) &(h)->obj)
+#define  DUK_HNATIVEFUNCTION_DECREF(thr,h)      DUK__HEAPHDR_DECREF((thr),(duk_heaphdr *) &(h)->obj)
+#define  DUK_HTHREAD_INCREF(thr,h)              DUK__HEAPHDR_INCREF((thr),(duk_heaphdr *) &(h)->obj)
+#define  DUK_HTHREAD_DECREF(thr,h)              DUK__HEAPHDR_DECREF((thr),(duk_heaphdr *) &(h)->obj)
 
 #else  /* DUK_USE_REFERENCE_COUNTING */
 
@@ -3407,8 +5714,6 @@ struct duk_heaphdr_string {
 
 #endif  /* DUK_HEAPHDR_H_INCLUDED */
 
-#line 56 "duk_internal.h"
-#include "duktape.h"
 #line 1 "duk_api_internal.h"
 /*
  *  Internal API calls which have (stack and other) semantics
@@ -3443,7 +5748,7 @@ void duk_push_this_coercible_to_string(duk_context *ctx);       /* duk_push_this
 
 duk_hstring *duk_get_hstring(duk_context *ctx, int index);
 duk_hobject *duk_get_hobject(duk_context *ctx, int index);
-duk_hobject *duk_get_hobject_with_class(duk_context *ctx, int index, int class);
+duk_hobject *duk_get_hobject_with_class(duk_context *ctx, int index, int classnum);
 duk_hbuffer *duk_get_hbuffer(duk_context *ctx, int index);
 duk_hthread *duk_get_hthread(duk_context *ctx, int index);
 duk_hcompiledfunction *duk_get_hcompiledfunction(duk_context *ctx, int index);
@@ -3460,7 +5765,7 @@ int duk_to_int_check_range(duk_context *ctx, int index, int minval, int maxval);
 
 duk_hstring *duk_require_hstring(duk_context *ctx, int index);
 duk_hobject *duk_require_hobject(duk_context *ctx, int index);
-duk_hobject *duk_require_hobject_with_class(duk_context *ctx, int index, int class);
+duk_hobject *duk_require_hobject_with_class(duk_context *ctx, int index, int classnum);
 duk_hbuffer *duk_require_hbuffer(duk_context *ctx, int index);
 duk_hthread *duk_require_hthread(duk_context *ctx, int index);
 duk_hcompiledfunction *duk_require_hcompiledfunction(duk_context *ctx, int index);
@@ -3508,9 +5813,6 @@ void duk_def_prop_stridx_thrower(duk_context *ctx, int obj_index, unsigned int s
 
 #ifndef DUK_HSTRING_H_INCLUDED
 #define DUK_HSTRING_H_INCLUDED
-
-/* already included: duk_heaphdr.h */
-/* already included: duk_misc.h */
 
 /* FIXME: flag for 'valid extended utf-8' (internal strings are not, regexp bytecode is)? */
 /* FIXME: flag for 'contains non-bmp chars'? */
@@ -3622,8 +5924,6 @@ struct duk_hstring {
 #ifndef DUK_HOBJECT_H_INCLUDED
 #define DUK_HOBJECT_H_INCLUDED
 
-/* already included: duk_strings.h */
-
 /* there are currently 22 flag bits available */
 #define  DUK_HOBJECT_FLAG_EXTENSIBLE            DUK_HEAPHDR_USER_FLAG(0)   /* object is extensible */
 #define  DUK_HOBJECT_FLAG_CONSTRUCTABLE         DUK_HEAPHDR_USER_FLAG(1)   /* object is constructable */
@@ -3640,9 +5940,10 @@ struct duk_hstring {
 #define  DUK_HOBJECT_FLAG_SPECIAL_ARRAY         DUK_HEAPHDR_USER_FLAG(13)  /* 'Array' object, array length and index special behavior */
 #define  DUK_HOBJECT_FLAG_SPECIAL_STRINGOBJ     DUK_HEAPHDR_USER_FLAG(14)  /* 'String' object, array index special behavior */
 #define  DUK_HOBJECT_FLAG_SPECIAL_ARGUMENTS     DUK_HEAPHDR_USER_FLAG(15)  /* 'Arguments' object and has arguments special behavior (non-strict callee) */
+/* bit 16 unused */
 
-#define  DUK_HOBJECT_FLAG_CLASS_BASE            DUK_HEAPHDR_USER_FLAG_NUMBER(18)
-#define  DUK_HOBJECT_FLAG_CLASS_BITS            4
+#define  DUK_HOBJECT_FLAG_CLASS_BASE            DUK_HEAPHDR_USER_FLAG_NUMBER(17)
+#define  DUK_HOBJECT_FLAG_CLASS_BITS            5
 
 #define  DUK_HOBJECT_GET_CLASS_NUMBER(h)        \
 	DUK_HEAPHDR_GET_FLAG_RANGE(&(h)->hdr, DUK_HOBJECT_FLAG_CLASS_BASE, DUK_HOBJECT_FLAG_CLASS_BITS)
@@ -3669,6 +5970,9 @@ struct duk_hstring {
 #define  DUK_HOBJECT_CLASS_GLOBAL               13
 #define  DUK_HOBJECT_CLASS_OBJENV               14  /* custom */
 #define  DUK_HOBJECT_CLASS_DECENV               15  /* custom */
+#define  DUK_HOBJECT_CLASS_BUFFER               16  /* custom */
+#define  DUK_HOBJECT_CLASS_POINTER              17  /* custom */
+#define  DUK_HOBJECT_CLASS_THREAD               18  /* custom */
 
 #define  DUK_HOBJECT_IS_OBJENV(h)               (DUK_HOBJECT_GET_CLASS_NUMBER((h)) == DUK_HOBJECT_CLASS_OBJENV)
 #define  DUK_HOBJECT_IS_DECENV(h)               (DUK_HOBJECT_GET_CLASS_NUMBER((h)) == DUK_HOBJECT_CLASS_DECENV)
@@ -3756,6 +6060,11 @@ struct duk_hstring {
                                                   DUK_PROPDESC_FLAG_ENUMERABLE | \
                                                   DUK_PROPDESC_FLAG_CONFIGURABLE | \
                                                   DUK_PROPDESC_FLAG_ACCESSOR)
+
+/* additional flags which are passed in the same flags argument as property
+ * flags but are not stored in object properties.
+ */
+#define  DUK_PROPDESC_FLAG_NO_OVERWRITE          (1 << 4)    /* internal define property: skip write silently if exists */
 
 /* convenience */
 #define  DUK_PROPDESC_FLAGS_NONE                 0
@@ -4042,7 +6351,7 @@ struct duk_hobject {
  *  Exposed data
  */
 
-extern duk_u8 duk_class_number_to_stridx[16];
+extern duk_u8 duk_class_number_to_stridx[32];
 
 /*
  *  Prototypes
@@ -4070,6 +6379,7 @@ int duk_hobject_hasprop(duk_hthread *thr, duk_tval *tv_obj, duk_tval *tv_key);
 int duk_hobject_delprop_raw(duk_hthread *thr, duk_hobject *obj, duk_hstring *key, int throw_flag);
 int duk_hobject_hasprop_raw(duk_hthread *thr, duk_hobject *obj, duk_hstring *key);
 void duk_hobject_define_property_internal(duk_hthread *thr, duk_hobject *obj, duk_hstring *key, int propflags);
+void duk_hobject_define_accessor_internal(duk_hthread *thr, duk_hobject *obj, duk_hstring *key, duk_hobject *getter, duk_hobject *setter, int propflags);
 void duk_hobject_set_length(duk_hthread *thr, duk_hobject *obj, duk_u32 length);
 void duk_hobject_set_length_zero(duk_hthread *thr, duk_hobject *obj);
 duk_u32 duk_hobject_get_length(duk_hthread *thr, duk_hobject *obj);
@@ -4331,66 +6641,6 @@ struct duk_hnativefunction {
 #ifndef DUK_HTHREAD_H_INCLUDED
 #define DUK_HTHREAD_H_INCLUDED
 
-/* already included: duk_bittypes.h */
-/* already included: duk_forwdecl.h */
-#line 1 "duk_builtins.h"
-/*
- *  Automatically generated by genbuiltins.py, do not edit!
- */
-
-#ifndef __DUK_BUILTINS_H
-#define __DUK_BUILTINS_H 1
-
-extern duk_c_function duk_builtin_native_functions[];
-
-extern char duk_builtins_data[];
-
-#define  DUK_BUILTINS_DATA_LENGTH                                      1163
-
-#define  DUK_BIDX_GLOBAL                                               0
-#define  DUK_BIDX_GLOBAL_ENV                                           1
-#define  DUK_BIDX_OBJECT_CONSTRUCTOR                                   2
-#define  DUK_BIDX_OBJECT_PROTOTYPE                                     3
-#define  DUK_BIDX_FUNCTION_CONSTRUCTOR                                 4
-#define  DUK_BIDX_FUNCTION_PROTOTYPE                                   5
-#define  DUK_BIDX_ARRAY_CONSTRUCTOR                                    6
-#define  DUK_BIDX_ARRAY_PROTOTYPE                                      7
-#define  DUK_BIDX_STRING_CONSTRUCTOR                                   8
-#define  DUK_BIDX_STRING_PROTOTYPE                                     9
-#define  DUK_BIDX_BOOLEAN_CONSTRUCTOR                                  10
-#define  DUK_BIDX_BOOLEAN_PROTOTYPE                                    11
-#define  DUK_BIDX_NUMBER_CONSTRUCTOR                                   12
-#define  DUK_BIDX_NUMBER_PROTOTYPE                                     13
-#define  DUK_BIDX_DATE_CONSTRUCTOR                                     14
-#define  DUK_BIDX_DATE_PROTOTYPE                                       15
-#define  DUK_BIDX_REGEXP_CONSTRUCTOR                                   16
-#define  DUK_BIDX_REGEXP_PROTOTYPE                                     17
-#define  DUK_BIDX_ERROR_CONSTRUCTOR                                    18
-#define  DUK_BIDX_ERROR_PROTOTYPE                                      19
-#define  DUK_BIDX_EVAL_ERROR_CONSTRUCTOR                               20
-#define  DUK_BIDX_EVAL_ERROR_PROTOTYPE                                 21
-#define  DUK_BIDX_RANGE_ERROR_CONSTRUCTOR                              22
-#define  DUK_BIDX_RANGE_ERROR_PROTOTYPE                                23
-#define  DUK_BIDX_REFERENCE_ERROR_CONSTRUCTOR                          24
-#define  DUK_BIDX_REFERENCE_ERROR_PROTOTYPE                            25
-#define  DUK_BIDX_SYNTAX_ERROR_CONSTRUCTOR                             26
-#define  DUK_BIDX_SYNTAX_ERROR_PROTOTYPE                               27
-#define  DUK_BIDX_TYPE_ERROR_CONSTRUCTOR                               28
-#define  DUK_BIDX_TYPE_ERROR_PROTOTYPE                                 29
-#define  DUK_BIDX_URI_ERROR_CONSTRUCTOR                                30
-#define  DUK_BIDX_URI_ERROR_PROTOTYPE                                  31
-#define  DUK_BIDX_MATH                                                 32
-#define  DUK_BIDX_JSON                                                 33
-#define  DUK_BIDX_TYPE_ERROR_THROWER                                   34
-#define  DUK_BIDX_DUK                                                  35
-#define  DUK_BIDX_THREAD_PROTOTYPE                                     36
-#define  DUK_BIDX_DOUBLE_ERROR                                         37
-
-#define  DUK_NUM_BUILTINS                                              38
-
-#endif  /* __DUK_BUILTINS_H */
-#line 14 "duk_hthread.h"
-
 /*
  *  Stack constants
  */
@@ -4635,9 +6885,6 @@ duk_activation *duk_hthread_get_current_activation(duk_hthread *thr);
 #ifndef DUK_HBUFFER_H_INCLUDED
 #define DUK_HBUFFER_H_INCLUDED
 
-/* already included: duk_bittypes.h */
-/* already included: duk_forwdecl.h */
-
 #define  DUK_HBUFFER_FLAG_DYNAMIC        DUK_HEAPHDR_USER_FLAG(0)  /* buffer is resizable */
 
 #define  DUK_HBUFFER_HAS_DYNAMIC(x)      DUK_HEAPHDR_CHECK_FLAG_BITS(&(x)->hdr, DUK_HBUFFER_FLAG_DYNAMIC)
@@ -4646,7 +6893,7 @@ duk_activation *duk_hthread_get_current_activation(duk_hthread *thr);
 
 #define  DUK_HBUFFER_CLEAR_DYNAMIC(x)    DUK_HEAPHDR_CLEAR_FLAG_BITS(&(x)->hdr, DUK_HBUFFER_FLAG_DYNAMIC)
 
-#define  DUK_HBUFFER_FIXED_GET_DATA_PTR(x)         ((duk_u8 *) (&((x)->fixed_data[0])))
+#define  DUK_HBUFFER_FIXED_GET_DATA_PTR(x)         ((duk_u8 *) (((duk_hbuffer_fixed *) (x)) + 1))
 
 #define  DUK_HBUFFER_DYNAMIC_GET_ALLOC_SIZE(x)     ((x)->usable_size + 1)
 #define  DUK_HBUFFER_DYNAMIC_GET_USABLE_SIZE(x)    ((x)->usable_size)
@@ -4704,11 +6951,12 @@ struct duk_hbuffer_fixed {
 	duk_heaphdr hdr;
 	size_t size;
 
-#ifdef DUK_USE_STRUCT_HACK
-	duk_u8 fixed_data[0];
-#else
-	duk_u8 fixed_data[];
-#endif
+	/* Data follows the struct header.  The struct size is padded by the
+	 * compiler so the buffer data area begins at an aligned address.
+	 * This potentially a few bytes but would be difficult to implement
+	 * portably (for instance, there is no portable way of figuring out
+	 * the packed struct size, since packed attributes are non-portable).
+	 */
 };
 
 struct duk_hbuffer_dynamic {
@@ -4761,10 +7009,6 @@ void duk_hbuffer_append_slice(duk_hthread *thr, duk_hbuffer_dynamic *buf, size_t
 #ifndef DUK_HEAP_H_INCLUDED
 #define DUK_HEAP_H_INCLUDED
 
-/* already included: duk_bittypes.h */
-/* already included: duk_forwdecl.h */
-/* already included: duk_strings.h */
-
 /* alloc function typedefs in duktape.h */
 
 /*
@@ -4775,25 +7019,25 @@ void duk_hbuffer_append_slice(duk_hthread *thr, duk_hbuffer_dynamic *buf, size_t
 #define  DUK_HEAP_FLAG_MARKANDSWEEP_RECLIMIT_REACHED            (1 << 1)  /* mark-and-sweep marking reached a recursion limit and must use multi-pass marking */
 #define  DUK_HEAP_FLAG_REFZERO_FREE_RUNNING                     (1 << 2)  /* refcount code is processing refzero list */
 
-#define  _DUK_HEAP_HAS_FLAGS(heap,bits)               ((heap)->flags & (bits))
-#define  _DUK_HEAP_SET_FLAGS(heap,bits)  do { \
+#define  DUK__HEAP_HAS_FLAGS(heap,bits)               ((heap)->flags & (bits))
+#define  DUK__HEAP_SET_FLAGS(heap,bits)  do { \
 		(heap)->flags |= (bits); \
 	} while (0)
-#define  _DUK_HEAP_CLEAR_FLAGS(heap,bits)  do { \
+#define  DUK__HEAP_CLEAR_FLAGS(heap,bits)  do { \
 		(heap)->flags &= ~(bits); \
 	} while (0)
 
-#define  DUK_HEAP_HAS_MARKANDSWEEP_RUNNING(heap)            _DUK_HEAP_HAS_FLAGS((heap), DUK_HEAP_FLAG_MARKANDSWEEP_RUNNING)
-#define  DUK_HEAP_HAS_MARKANDSWEEP_RECLIMIT_REACHED(heap)   _DUK_HEAP_HAS_FLAGS((heap), DUK_HEAP_FLAG_MARKANDSWEEP_RECLIMIT_REACHED)
-#define  DUK_HEAP_HAS_REFZERO_FREE_RUNNING(heap)            _DUK_HEAP_HAS_FLAGS((heap), DUK_HEAP_FLAG_REFZERO_FREE_RUNNING)
+#define  DUK_HEAP_HAS_MARKANDSWEEP_RUNNING(heap)            DUK__HEAP_HAS_FLAGS((heap), DUK_HEAP_FLAG_MARKANDSWEEP_RUNNING)
+#define  DUK_HEAP_HAS_MARKANDSWEEP_RECLIMIT_REACHED(heap)   DUK__HEAP_HAS_FLAGS((heap), DUK_HEAP_FLAG_MARKANDSWEEP_RECLIMIT_REACHED)
+#define  DUK_HEAP_HAS_REFZERO_FREE_RUNNING(heap)            DUK__HEAP_HAS_FLAGS((heap), DUK_HEAP_FLAG_REFZERO_FREE_RUNNING)
 
-#define  DUK_HEAP_SET_MARKANDSWEEP_RUNNING(heap)            _DUK_HEAP_SET_FLAGS((heap), DUK_HEAP_FLAG_MARKANDSWEEP_RUNNING)
-#define  DUK_HEAP_SET_MARKANDSWEEP_RECLIMIT_REACHED(heap)   _DUK_HEAP_SET_FLAGS((heap), DUK_HEAP_FLAG_MARKANDSWEEP_RECLIMIT_REACHED)
-#define  DUK_HEAP_SET_REFZERO_FREE_RUNNING(heap)            _DUK_HEAP_SET_FLAGS((heap), DUK_HEAP_FLAG_REFZERO_FREE_RUNNING)
+#define  DUK_HEAP_SET_MARKANDSWEEP_RUNNING(heap)            DUK__HEAP_SET_FLAGS((heap), DUK_HEAP_FLAG_MARKANDSWEEP_RUNNING)
+#define  DUK_HEAP_SET_MARKANDSWEEP_RECLIMIT_REACHED(heap)   DUK__HEAP_SET_FLAGS((heap), DUK_HEAP_FLAG_MARKANDSWEEP_RECLIMIT_REACHED)
+#define  DUK_HEAP_SET_REFZERO_FREE_RUNNING(heap)            DUK__HEAP_SET_FLAGS((heap), DUK_HEAP_FLAG_REFZERO_FREE_RUNNING)
 
-#define  DUK_HEAP_CLEAR_MARKANDSWEEP_RUNNING(heap)          _DUK_HEAP_CLEAR_FLAGS((heap), DUK_HEAP_FLAG_MARKANDSWEEP_RUNNING)
-#define  DUK_HEAP_CLEAR_MARKANDSWEEP_RECLIMIT_REACHED(heap) _DUK_HEAP_CLEAR_FLAGS((heap), DUK_HEAP_FLAG_MARKANDSWEEP_RECLIMIT_REACHED)
-#define  DUK_HEAP_CLEAR_REFZERO_FREE_RUNNING(heap)          _DUK_HEAP_CLEAR_FLAGS((heap), DUK_HEAP_FLAG_REFZERO_FREE_RUNNING)
+#define  DUK_HEAP_CLEAR_MARKANDSWEEP_RUNNING(heap)          DUK__HEAP_CLEAR_FLAGS((heap), DUK_HEAP_FLAG_MARKANDSWEEP_RUNNING)
+#define  DUK_HEAP_CLEAR_MARKANDSWEEP_RECLIMIT_REACHED(heap) DUK__HEAP_CLEAR_FLAGS((heap), DUK_HEAP_FLAG_MARKANDSWEEP_RECLIMIT_REACHED)
+#define  DUK_HEAP_CLEAR_REFZERO_FREE_RUNNING(heap)          DUK__HEAP_CLEAR_FLAGS((heap), DUK_HEAP_FLAG_REFZERO_FREE_RUNNING)
 
 /*
  *  Longjmp types, also double as identifying continuation type for a rethrow (in 'finally')
@@ -4946,13 +7190,13 @@ void duk_hbuffer_append_slice(duk_hthread *thr, duk_hbuffer_dynamic *buf, size_t
  *  Memory calls: relative to a thread, GC interaction, throw error on alloc failure
  */
 
-/* XXX: add __func__ */
+/* XXX: add __func__; use DUK_FUNC_MACRO because __func__ is not always available */
 
 #ifdef DUK_USE_VERBOSE_ERRORS
-#define  DUK_ALLOC_CHECKED(thr,size)                     duk_heap_mem_alloc_checked((thr), (size), __FILE__, __LINE__)
-#define  DUK_ALLOC_CHECKED_ZEROED(thr,size)              duk_heap_mem_alloc_checked_zeroed((thr), (size), __FILE__, __LINE__)
-#define  DUK_REALLOC_CHECKED(thr,ptr,newsize)            duk_heap_mem_realloc_checked((thr), (ptr), (newsize), __FILE__, __LINE__)
-#define  DUK_REALLOC_INDIRECT_CHECKED(thr,iptr,newsize)  duk_heap_mem_realloc_indirect_checked((thr), (iptr), (newsize), __FILE__, __LINE__)
+#define  DUK_ALLOC_CHECKED(thr,size)                     duk_heap_mem_alloc_checked((thr), (size), DUK_FILE_MACRO, DUK_LINE_MACRO)
+#define  DUK_ALLOC_CHECKED_ZEROED(thr,size)              duk_heap_mem_alloc_checked_zeroed((thr), (size), DUK_FILE_MACRO, DUK_LINE_MACRO)
+#define  DUK_REALLOC_CHECKED(thr,ptr,newsize)            duk_heap_mem_realloc_checked((thr), (ptr), (newsize), DUK_FILE_MACRO, DUK_LINE_MACRO)
+#define  DUK_REALLOC_INDIRECT_CHECKED(thr,iptr,newsize)  duk_heap_mem_realloc_indirect_checked((thr), (iptr), (newsize), DUK_FILE_MACRO, DUK_LINE_MACRO)
 #define  DUK_FREE_CHECKED(thr,ptr)                       duk_heap_mem_free((thr)->heap, (ptr))  /* must not fail */
 #else
 #define  DUK_ALLOC_CHECKED(thr,size)                     duk_heap_mem_alloc_checked((thr), (size))
@@ -5171,17 +7415,11 @@ duk_u32 duk_heap_hashstring(duk_heap *heap, duk_u8 *str, duk_u32 len);
 #ifndef DUK_DEBUG_H_INCLUDED
 #define DUK_DEBUG_H_INCLUDED
 
-/* already included: duk_features.h */
-/* already included: duk_bittypes.h */
-/* already included: duk_forwdecl.h */
-
 #ifdef DUK_USE_DEBUG
 
 /*
  *  Exposed debug macros: debugging enabled
  */
-
-#include <stdarg.h>
 
 #define  DUK_LEVEL_DEBUG    1
 #define  DUK_LEVEL_DDEBUG   2
@@ -5192,47 +7430,47 @@ duk_u32 duk_heap_hashstring(duk_heap *heap, duk_u8 *str, duk_u32 len);
 /* Note: combining __FILE__, __LINE__, and __func__ into fmt would be
  * possible compile time, but waste some space with shared function names.
  */
-#define  _DUK_DEBUG_LOG(lev,...)  duk_debug_log((lev), __FILE__, (int) __LINE__, __func__, __VA_ARGS__);
+#define  DUK__DEBUG_LOG(lev,...)  duk_debug_log((lev), DUK_FILE_MACRO, (int) DUK_LINE_MACRO, DUK_FUNC_MACRO, __VA_ARGS__);
 
-#define  DUK_DPRINT(...)          _DUK_DEBUG_LOG(DUK_LEVEL_DEBUG, __VA_ARGS__)
+#define  DUK_DPRINT(...)          DUK__DEBUG_LOG(DUK_LEVEL_DEBUG, __VA_ARGS__)
 
 #ifdef DUK_USE_DDEBUG
-#define  DUK_DDPRINT(...)         _DUK_DEBUG_LOG(DUK_LEVEL_DDEBUG, __VA_ARGS__)
+#define  DUK_DDPRINT(...)         DUK__DEBUG_LOG(DUK_LEVEL_DDEBUG, __VA_ARGS__)
 #else
 #define  DUK_DDPRINT(...)
 #endif
 
 #ifdef DUK_USE_DDDEBUG
-#define  DUK_DDDPRINT(...)        _DUK_DEBUG_LOG(DUK_LEVEL_DDDEBUG, __VA_ARGS__)
+#define  DUK_DDDPRINT(...)        DUK__DEBUG_LOG(DUK_LEVEL_DDDEBUG, __VA_ARGS__)
 #else
 #define  DUK_DDDPRINT(...)
 #endif
 
 #else  /* DUK_USE_VARIADIC_MACROS */
 
-#define  _DUK_DEBUG_STASH(lev)    \
-	(void) memset((void *) duk_debug_file_stash, 0, (size_t) DUK_DEBUG_STASH_SIZE), \
-	(void) memset((void *) duk_debug_line_stash, 0, (size_t) DUK_DEBUG_STASH_SIZE), \
-	(void) memset((void *) duk_debug_func_stash, 0, (size_t) DUK_DEBUG_STASH_SIZE), \
-	(void) snprintf(duk_debug_file_stash, DUK_DEBUG_STASH_SIZE - 1, "%s", __FILE__), \
-	(void) snprintf(duk_debug_line_stash, DUK_DEBUG_STASH_SIZE - 1, "%d", (int) __LINE__), \
-	(void) snprintf(duk_debug_func_stash, DUK_DEBUG_STASH_SIZE - 1, "%s", __func__), \
+#define  DUK__DEBUG_STASH(lev)    \
+	(void) DUK_MEMSET((void *) duk_debug_file_stash, 0, (size_t) DUK_DEBUG_STASH_SIZE), \
+	(void) DUK_MEMSET((void *) duk_debug_line_stash, 0, (size_t) DUK_DEBUG_STASH_SIZE), \
+	(void) DUK_MEMSET((void *) duk_debug_func_stash, 0, (size_t) DUK_DEBUG_STASH_SIZE), \
+	(void) DUK_SNPRINTF(duk_debug_file_stash, DUK_DEBUG_STASH_SIZE - 1, "%s", DUK_FILE_MACRO), \
+	(void) DUK_SNPRINTF(duk_debug_line_stash, DUK_DEBUG_STASH_SIZE - 1, "%d", (int) DUK_LINE_MACRO), \
+	(void) DUK_SNPRINTF(duk_debug_func_stash, DUK_DEBUG_STASH_SIZE - 1, "%s", DUK_FUNC_MACRO), \
 	(void) (duk_debug_level_stash = (lev))
 
 #ifdef DUK_USE_DEBUG
-#define  DUK_DPRINT  _DUK_DEBUG_STASH(DUK_LEVEL_DEBUG), (void) duk_debug_log  /* args go here in parens */
+#define  DUK_DPRINT  DUK__DEBUG_STASH(DUK_LEVEL_DEBUG), (void) duk_debug_log  /* args go here in parens */
 #else
 #define  DUK_DPRINT  0 && 
 #endif
 
 #ifdef DUK_USE_DDEBUG
-#define  DUK_DDPRINT  _DUK_DEBUG_STASH(DUK_LEVEL_DDEBUG), (void) duk_debug_log  /* args go here in parens */
+#define  DUK_DDPRINT  DUK__DEBUG_STASH(DUK_LEVEL_DDEBUG), (void) duk_debug_log  /* args go here in parens */
 #else
 #define  DUK_DDPRINT  0 && 
 #endif
 
 #ifdef DUK_USE_DDDEBUG
-#define  DUK_DDDPRINT  _DUK_DEBUG_STASH(DUK_LEVEL_DDDEBUG), (void) duk_debug_log  /* args go here in parens */
+#define  DUK_DDDPRINT  DUK__DEBUG_STASH(DUK_LEVEL_DDDEBUG), (void) duk_debug_log  /* args go here in parens */
 #else
 #define  DUK_DDDPRINT  0 && 
 #endif
@@ -5253,7 +7491,7 @@ duk_u32 duk_heap_hashstring(duk_heap *heap, duk_u8 *str, duk_u32 len);
 /* summary macros */
 
 #define  DUK_DEBUG_SUMMARY_INIT()  do { \
-		memset(duk_debug_summary_buf, 0, sizeof(duk_debug_summary_buf)); \
+		DUK_MEMSET(duk_debug_summary_buf, 0, sizeof(duk_debug_summary_buf)); \
 		duk_debug_summary_idx = 0; \
 	} while (0)
 
@@ -5342,7 +7580,7 @@ extern void duk_debug_log(char *fmt, ...);
 
 void duk_fb_put_bytes(duk_fixedbuffer *fb, duk_u8 *buffer, duk_u32 length);
 void duk_fb_put_byte(duk_fixedbuffer *fb, duk_u8 x);
-void duk_fb_put_cstring(duk_fixedbuffer *fb, char *x);
+void duk_fb_put_cstring(duk_fixedbuffer *fb, const char *x);
 void duk_fb_sprintf(duk_fixedbuffer *fb, const char *fmt, ...);
 int duk_fb_is_full(duk_fixedbuffer *fb);
 
@@ -5368,8 +7606,6 @@ extern int duk_debug_summary_idx;
 
 #ifndef DUK_ERROR_H_INCLUDED
 #define DUK_ERROR_H_INCLUDED
-
-/* already included: duk_misc.h */
 
 /*
  *  Error codes (defined in duktape.h)
@@ -5420,9 +7656,9 @@ extern int duk_debug_summary_idx;
 #ifdef DUK_USE_VARIADIC_MACROS
 
 /* __VA_ARGS__ has comma issues for empty lists, so we mandate at least 1 argument for '...' (format string) */
-#define  DUK_ERROR(thr,err,...)                    duk_err_handle_error(__FILE__, (int) __LINE__, (thr), (err), __VA_ARGS__)
+#define  DUK_ERROR(thr,err,...)                    duk_err_handle_error(DUK_FILE_MACRO, (int) DUK_LINE_MACRO, (thr), (err), __VA_ARGS__)
 #define  DUK_ERROR_RAW(file,line,thr,err,...)      duk_err_handle_error((file), (line), (thr), (err), __VA_ARGS__)
-#define  DUK_PANIC(err,...)                        duk_err_handle_panic(__FILE__, __LINE__, (err), __VA_ARGS__)
+#define  DUK_PANIC(err,...)                        duk_err_handle_panic(DUK_FILE_MACRO, DUK_LINE_MACRO, (err), __VA_ARGS__)
 #define  DUK_PANIC_RAW(file,line,err,...)          duk_err_handle_panic((file), (line), (err), __VA_ARGS__)
 
 #else  /* DUK_USE_VARIADIC_MACROS */
@@ -5432,14 +7668,14 @@ extern int duk_debug_summary_idx;
  */
 
 #define  DUK_ERROR  \
-	duk_err_file_stash = (const char *) __FILE__, \
-	duk_err_line_stash = (int) __LINE__, \
-	(void) duk_err_handle_error_stash
+	duk_err_file_stash = (const char *) DUK_FILE_MACRO, \
+	duk_err_line_stash = (int) DUK_LINE_MACRO, \
+	(void) duk_err_handle_error_stash  /* arguments follow */
 #define  DUK_ERROR_RAW                             duk_err_handle_error
 #define  DUK_PANIC  \
-	duk_err_file_stash = (const char *) __FILE__, \
-	duk_err_line_stash = (int) __LINE__, \
-	(void) duk_err_handle_panic_stash
+	duk_err_file_stash = (const char *) DUK_FILE_MACRO, \
+	duk_err_line_stash = (int) DUK_LINE_MACRO, \
+	(void) duk_err_handle_panic_stash  /* arguments follow */
 #define  DUK_PANIC_RAW                             duk_err_handle_panic
 
 #endif  /* DUK_USE_VARIADIC_MACROS */
@@ -5482,7 +7718,7 @@ extern int duk_debug_summary_idx;
 	if (!(x)) { \
 		DUK_PANIC(DUK_ERR_ASSERTION_ERROR, \
 			"assertion failed: " #x \
-			" (" __FILE__ ":" DUK_MACRO_STRINGIFY(__LINE__) ")"); \
+			" (" DUK_FILE_MACRO ":" DUK_MACRO_STRINGIFY(DUK_LINE_MACRO) ")"); \
 	} \
 	} while (0)
 
@@ -5510,6 +7746,11 @@ extern int duk_debug_summary_idx;
 #ifdef DUK_PANIC_HANDLER
 /* already defined, good */
 #else
+#if 1
+#define  DUK_PANIC_EXIT()  abort()
+#else
+#define  DUK_PANIC_EXIT()  exit(-1)
+#endif
 #ifdef DUK_USE_GCC_PRAGMAS
 #define  DUK_PANIC_HANDLER(code,msg)  do { \
 		/* GCC pragmas to suppress: warning: the address of 'xxx' will always evaluate as 'true' [-Waddress]' */ \
@@ -5517,7 +7758,7 @@ extern int duk_debug_summary_idx;
 		_Pragma("GCC diagnostic ignored \"-Waddress\""); \
 		fprintf(stderr, "PANIC %d: %s\n", code, msg ? msg : "null"); \
 		fflush(stderr); \
-		exit(-1); \
+		DUK_PANIC_EXIT(); \
 		_Pragma("GCC diagnostic pop"); \
 	} while (0)
 #else
@@ -5525,7 +7766,7 @@ extern int duk_debug_summary_idx;
 		/* No pragmas to suppress warning, causes unclean build */ \
 		fprintf(stderr, "PANIC %d: %s\n", code, msg ? msg : "null"); \
 		fflush(stderr); \
-		exit(-1); \
+		DUK_PANIC_EXIT(); \
 	} while (0)
 #endif
 #endif
@@ -5607,7 +7848,7 @@ void duk_err_create_and_throw(duk_hthread *thr, duk_u32 code);
 void duk_error_throw_from_negative_rc(duk_hthread *thr, int rc);
 
 #ifdef DUK_USE_AUGMENT_ERRORS
-void duk_err_augment_error(duk_hthread *thr, duk_hthread *thr_callstack, int err_index);
+void duk_err_augment_error(duk_hthread *thr, duk_hthread *thr_callstack, int err_index, const char *filename, int line);
 #endif
 
 void duk_err_longjmp(duk_hthread *thr);
@@ -5627,8 +7868,6 @@ duk_hobject *duk_error_prototype_from_code(duk_hthread *thr, int err_code);
 
 #ifndef DUK_UTIL_H_INCLUDED
 #define DUK_UTIL_H_INCLUDED
-
-/* already included: duk_bittypes.h */
 
 #define  DUK_UTIL_MIN_HASH_PRIME  17  /* must match genhashsizes.py */
 
@@ -5693,8 +7932,6 @@ double duk_util_tinyrandom_get_double(duk_hthread *thr);
 
 #ifndef DUK_UNICODE_H_INCLUDED
 #define DUK_UNICODE_H_INCLUDED
-
-/* already included: duk_features.h */
 
 #define  DUK_UNICODE_MAX_XUTF8_LENGTH   7   /* up to 36 bit codepoints */
 #define  DUK_UNICODE_MAX_CESU8_LENGTH   6   /* all codepoints up to U+10FFFF */
@@ -5876,8 +8113,8 @@ int duk_js_in(duk_hthread *thr, duk_tval *tv_x, duk_tval *tv_y);
 duk_hstring *duk_js_typeof(duk_hthread *thr, duk_tval *tv_x);
 
 /* identifiers and environment handling */
-int duk_js_getvar_envrec(duk_hthread *thr, duk_hobject *env, duk_hstring *name, int throw);
-int duk_js_getvar_activation(duk_hthread *thr, duk_activation *act, duk_hstring *name, int throw);
+int duk_js_getvar_envrec(duk_hthread *thr, duk_hobject *env, duk_hstring *name, int throw_flag);
+int duk_js_getvar_activation(duk_hthread *thr, duk_activation *act, duk_hstring *name, int throw_flag);
 void duk_js_putvar_envrec(duk_hthread *thr, duk_hobject *env, duk_hstring *name, duk_tval *val, int strict);
 void duk_js_putvar_activation(duk_hthread *thr, duk_activation *act, duk_hstring *name, duk_tval *val, int strict);
 int duk_js_delvar_envrec(duk_hthread *thr, duk_hobject *env, duk_hstring *name);
@@ -6038,6 +8275,10 @@ int duk_builtin_boolean_constructor(duk_context *ctx);
 int duk_builtin_boolean_prototype_to_string(duk_context *ctx);
 int duk_builtin_boolean_prototype_value_of(duk_context *ctx);
 
+int duk_builtin_buffer_constructor(duk_context *ctx);
+int duk_builtin_buffer_prototype_to_string(duk_context *ctx);
+int duk_builtin_buffer_prototype_value_of(duk_context *ctx);
+
 int duk_builtin_date_constructor(duk_context *ctx);
 int duk_builtin_date_constructor_parse(duk_context *ctx);
 int duk_builtin_date_constructor_utc(duk_context *ctx);
@@ -6095,11 +8336,6 @@ int duk_builtin_duk_object_refc(duk_context *ctx);
 int duk_builtin_duk_object_gc(duk_context *ctx);
 int duk_builtin_duk_object_get_finalizer(duk_context *ctx);
 int duk_builtin_duk_object_set_finalizer(duk_context *ctx);
-int duk_builtin_duk_object_spawn(duk_context *ctx);
-int duk_builtin_duk_object_resume(duk_context *ctx);
-int duk_builtin_duk_object_yield(duk_context *ctx);
-int duk_builtin_duk_object_curr(duk_context *ctx);
-int duk_builtin_duk_object_print(duk_context *ctx);
 int duk_builtin_duk_object_time(duk_context *ctx);
 int duk_builtin_duk_object_enc(duk_context *ctx);
 int duk_builtin_duk_object_dec(duk_context *ctx);
@@ -6107,6 +8343,11 @@ int duk_builtin_duk_object_sleep(duk_context *ctx);
 
 int duk_builtin_error_constructor(duk_context *ctx);
 int duk_builtin_error_prototype_to_string(duk_context *ctx);
+int duk_builtin_error_prototype_stack_getter(duk_context *ctx);
+int duk_builtin_error_prototype_filename_getter(duk_context *ctx);
+int duk_builtin_error_prototype_linenumber_getter(duk_context *ctx);
+int duk_builtin_error_prototype_stack_getter(duk_context *ctx);
+int duk_builtin_error_prototype_nop_setter(duk_context *ctx);
 int duk_builtin_eval_error_constructor(duk_context *ctx);
 int duk_builtin_range_error_constructor(duk_context *ctx);
 int duk_builtin_reference_error_constructor(duk_context *ctx);
@@ -6201,6 +8442,10 @@ int duk_builtin_object_prototype_has_own_property(duk_context *ctx);
 int duk_builtin_object_prototype_is_prototype_of(duk_context *ctx);
 int duk_builtin_object_prototype_property_is_enumerable(duk_context *ctx);
 
+int duk_builtin_pointer_constructor(duk_context *ctx);
+int duk_builtin_pointer_prototype_to_string(duk_context *ctx);
+int duk_builtin_pointer_prototype_value_of(duk_context *ctx);
+
 int duk_builtin_regexp_prototype_exec(duk_context *ctx);
 int duk_builtin_regexp_prototype_test(duk_context *ctx);
 int duk_builtin_regexp_prototype_to_string(duk_context *ctx);
@@ -6228,15 +8473,18 @@ int duk_builtin_string_prototype_trim(duk_context *ctx);
 #if 1  /* FIXME: section B */
 int duk_builtin_string_prototype_substr(duk_context *ctx);
 #endif
+int duk_builtin_thread_constructor(duk_context *ctx);
+int duk_builtin_thread_resume(duk_context *ctx);
+int duk_builtin_thread_yield(duk_context *ctx);
+int duk_builtin_thread_current(duk_context *ctx);
 int duk_builtin_thread_prototype_to_string(duk_context *ctx);
+int duk_builtin_thread_prototype_value_of(duk_context *ctx);
 
 int duk_builtin_type_error_thrower(duk_context *ctx);
 
 #endif  /* DUK_BUILTIN_PROTOS_H_INCLUDED */
 
-/* already included: duk_strings.h */
-/* already included: duk_builtins.h */
-#line 75 "duk_internal.h"
+#line 58 "duk_internal.h"
 
 #endif  /* DUK_INTERNAL_H_INCLUDED */
 
@@ -6315,6 +8563,15 @@ void duk_torture_free_function(void *udata, void *ptr) {
 /* include removed: duk_internal.h */
 
 /*
+ *  Global state for working around missing variadic macros
+ */
+
+#ifndef DUK_USE_VARIADIC_MACROS
+const char *duk_api_global_filename = NULL;
+int duk_api_global_line = 0;
+#endif
+
+/*
  *  Helpers
  */
 
@@ -6332,7 +8589,7 @@ static int api_coerce_d2i(double d) {
 	 *  on platforms with a 64-bit int type, the full range is allowed.
 	 */
 
-	if (fpclassify(d) == FP_NAN) {
+	if (DUK_FPCLASSIFY(d) == DUK_FP_NAN) {
 		return 0;
 	} else if (d < INT_MIN) {
 		/* covers -Infinity */
@@ -6577,7 +8834,7 @@ static int resize_valstack(duk_context *ctx, size_t new_size) {
 	 */
 
 	new_alloc_size = sizeof(duk_tval) * new_size;
-	new_valstack = DUK_REALLOC_INDIRECT(thr->heap, (void **) &thr->valstack, new_alloc_size);
+	new_valstack = (duk_tval *) DUK_REALLOC_INDIRECT(thr->heap, (void **) &thr->valstack, new_alloc_size);
 	if (!new_valstack) {
 		DUK_DPRINT("failed to resize valstack to %d entries (%d bytes)",
 		           new_size, new_alloc_size);
@@ -6741,7 +8998,7 @@ static int check_valstack_resize_helper(duk_context *ctx,
 		DUK_DDPRINT("valstack resize failed");
 
 		if (throw_flag) {
-			DUK_ERROR(ctx, DUK_ERR_ALLOC_ERROR, "failed to extend valstack");
+			DUK_ERROR(thr, DUK_ERR_ALLOC_ERROR, "failed to extend valstack");
 		} else {
 			return 0;
 		}
@@ -6895,7 +9152,7 @@ void duk_insert(duk_context *ctx, int to_index) {
 	DUK_DDDPRINT("duk_insert: to_index=%p, p=%p, q=%p, nbytes=%d", to_index, p, q, nbytes);
 	if (nbytes > 0) {
 		DUK_TVAL_SET_TVAL(&tv, q);
-		memmove((void *) (p + 1), (void *) p, nbytes);
+		DUK_MEMMOVE((void *) (p + 1), (void *) p, nbytes);
 		DUK_TVAL_SET_TVAL(p, &tv);
 	} else {
 		/* nop: insert top to top */
@@ -6959,7 +9216,7 @@ void duk_remove(duk_context *ctx, int index) {
 
 	nbytes = (size_t) (((duk_u8 *) q) - ((duk_u8 *) p));  /* Note: 'q' is top-1 */
 	if (nbytes > 0) {
-		memmove(p, p + 1, nbytes);
+		DUK_MEMMOVE(p, p + 1, nbytes);
 	}
 	DUK_TVAL_SET_UNDEFINED_UNUSED(q);
 	thr->valstack_top--;
@@ -6992,7 +9249,7 @@ void duk_xmove(duk_context *ctx, duk_context *from_ctx, unsigned int count) {
 	}
 
 	/* copy values (no overlap even if ctx == from_ctx) */
-	memcpy((void *) thr->valstack_top, src, nbytes);
+	DUK_MEMCPY((void *) thr->valstack_top, src, nbytes);
 
 	/* incref them */
 	p = thr->valstack_top;
@@ -7128,7 +9385,7 @@ int duk_require_boolean(duk_context *ctx, int index) {
 }
 
 double duk_get_number(duk_context *ctx, int index) {
-	double ret = NAN;  /* default: NaN */
+	double ret = DUK_DOUBLE_NAN;  /* default: NaN */
 	duk_tval *tv;
 
 	DUK_ASSERT(ctx != NULL);
@@ -7140,13 +9397,14 @@ double duk_get_number(duk_context *ctx, int index) {
 	}
 
 	/*
-	 *  Number should already be in NAN-normalized form,
+	 *  Number should already be in NaN-normalized form,
 	 *  but let's normalize anyway.
 	 *
-	 *  XXX: NAN normalization for external API might be
+	 *  XXX: NaN normalization for external API might be
 	 *  different from internal normalization?
 	 */
 
+	/* FIXME: breaks strict aliasing rules */
 	DUK_DOUBLE_NORMALIZE_NAN_CHECK(&ret);
 
 	return ret;
@@ -7163,10 +9421,10 @@ double duk_require_number(duk_context *ctx, int index) {
 		double ret = DUK_TVAL_GET_NUMBER(tv);
 
 		/*
-		 *  Number should already be in NAN-normalized form,
+		 *  Number should already be in NaN-normalized form,
 		 *  but let's normalize anyway.
 		 *
-		 *  XXX: NAN normalization for external API might be
+		 *  XXX: NaN normalization for external API might be
 		 *  different from internal normalization?
 		 */
 		DUK_DOUBLE_NORMALIZE_NAN_CHECK(&ret);
@@ -7174,7 +9432,7 @@ double duk_require_number(duk_context *ctx, int index) {
 	}
 
 	DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "not number");
-	return NAN;  /* not reachable */
+	return DUK_DOUBLE_NAN;  /* not reachable */
 }
 
 int duk_get_int(duk_context *ctx, int index) {
@@ -7386,9 +9644,9 @@ duk_hobject *duk_get_hobject(duk_context *ctx, int index) {
 }
 
 /* internal */
-duk_hobject *duk_get_hobject_with_class(duk_context *ctx, int index, int class) {
+duk_hobject *duk_get_hobject_with_class(duk_context *ctx, int index, int classnum) {
 	duk_hobject *h = (duk_hobject *) get_tagged_heaphdr(ctx, index, DUK_TAG_OBJECT, 1);
-	if (h != NULL && DUK_HOBJECT_GET_CLASS_NUMBER(h) != class) {
+	if (h != NULL && DUK_HOBJECT_GET_CLASS_NUMBER(h) != classnum) {
 		h = NULL;
 	}
 	return h;
@@ -7400,12 +9658,12 @@ duk_hobject *duk_require_hobject(duk_context *ctx, int index) {
 }
 
 /* internal */
-duk_hobject *duk_require_hobject_with_class(duk_context *ctx, int index, int class) {
+duk_hobject *duk_require_hobject_with_class(duk_context *ctx, int index, int classnum) {
 	duk_hthread *thr = (duk_hthread *) ctx;
 	duk_hobject *h = (duk_hobject *) get_tagged_heaphdr(ctx, index, DUK_TAG_OBJECT, 0);
 	DUK_ASSERT(h != NULL);
-	if (DUK_HOBJECT_GET_CLASS_NUMBER(h) != class) {
-		DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "expected object with class number %d", class);
+	if (DUK_HOBJECT_GET_CLASS_NUMBER(h) != classnum) {
+		DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "expected object with class number %d", classnum);
 	}
 	return h;
 }
@@ -8070,7 +10328,7 @@ void *duk_to_buffer(duk_context *ctx, int index, size_t *out_size) {
 
 		buf = duk_push_fixed_buffer(ctx, DUK_HSTRING_GET_BYTELEN(h_str));
 		DUK_ASSERT(buf != NULL);
-		memcpy(buf, DUK_HSTRING_GET_DATA(h_str), DUK_HSTRING_GET_BYTELEN(h_str));
+		DUK_MEMCPY(buf, DUK_HSTRING_GET_DATA(h_str), DUK_HSTRING_GET_BYTELEN(h_str));
 		duk_replace(ctx, index);
 	}
 
@@ -8126,6 +10384,11 @@ void duk_to_object(duk_context *ctx, int index) {
 	duk_hthread *thr = (duk_hthread *) ctx;
 	duk_tval *tv;
 	duk_hobject *res;
+	int shared_flags = 0;   /* shared flags for a subset of types */
+	int shared_proto = 0;
+	int shared_string = 0;
+
+	/* FIXME: rework shared_XXX to fit into one reg? */
 
 	DUK_ASSERT(ctx != NULL);
 
@@ -8136,82 +10399,67 @@ void duk_to_object(duk_context *ctx, int index) {
 
 	switch (DUK_TVAL_GET_TAG(tv)) {
 	case DUK_TAG_UNDEFINED:
-	case DUK_TAG_NULL:
-	case DUK_TAG_BUFFER:
-	case DUK_TAG_POINTER: {
+	case DUK_TAG_NULL: {
 		DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "attempt to coerce incompatible value to object");
 		break;
 	}
 	case DUK_TAG_BOOLEAN: {
-		int val = DUK_TVAL_GET_BOOLEAN(tv);
-
-		(void) duk_push_object_helper(ctx,
-		                              DUK_HOBJECT_FLAG_EXTENSIBLE |
-		                              DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_BOOLEAN),
-		                              DUK_BIDX_BOOLEAN_PROTOTYPE);
-		res = duk_require_hobject(ctx, -1);
-		DUK_ASSERT(res != NULL);
-
-		/* Note: Boolean prototype's internal value property is not writable,
-		 * but duk_def_prop_stridx() disregards the write protection.  Boolean
-		 * instances are immutable.
-		 */
-		duk_push_boolean(ctx, val);
-		duk_def_prop_stridx(ctx, -2, DUK_STRIDX_INT_VALUE, DUK_PROPDESC_FLAGS_NONE);
-
-		duk_replace(ctx, index);
-		break;
+		shared_flags = DUK_HOBJECT_FLAG_EXTENSIBLE |
+		               DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_BOOLEAN);
+		shared_proto = DUK_BIDX_BOOLEAN_PROTOTYPE;
+		goto create_object;
 	}
 	case DUK_TAG_STRING: {
-		(void) duk_push_object_helper(ctx,
-		                              DUK_HOBJECT_FLAG_EXTENSIBLE |
-		                              DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_STRING),
-		                              DUK_BIDX_STRING_PROTOTYPE);
-		res = duk_require_hobject(ctx, -1);
-		DUK_ASSERT(res != NULL);
-
-		/* Note: String prototype's internal value property is not writable,
-		 * but duk_def_prop_stridx() disregards the write protection.  String
-		 * instances are immutable.
-		 */
-		duk_dup(ctx, index);
-		duk_def_prop_stridx(ctx, -2, DUK_STRIDX_INT_VALUE, DUK_PROPDESC_FLAGS_NONE);
-
-		/* Enable special string behavior only after internal value has been set */
-		DUK_HOBJECT_SET_SPECIAL_STRINGOBJ(res);
-
-		duk_replace(ctx, index);
-		break;
+		shared_flags = DUK_HOBJECT_FLAG_EXTENSIBLE |
+		               DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_STRING);
+		shared_proto = DUK_BIDX_STRING_PROTOTYPE;
+		shared_string = 1;
+		goto create_object;
 	}
 	case DUK_TAG_OBJECT: {
 		/* nop */
 		break;
 	}
+	case DUK_TAG_BUFFER: {
+		shared_flags = DUK_HOBJECT_FLAG_EXTENSIBLE |
+		               DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_BUFFER);
+		shared_proto = DUK_BIDX_BUFFER_PROTOTYPE;
+		goto create_object;
+	}
+	case DUK_TAG_POINTER: {
+		shared_flags = DUK_HOBJECT_FLAG_EXTENSIBLE |
+		               DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_POINTER);
+		shared_proto = DUK_BIDX_POINTER_PROTOTYPE;
+		goto create_object;
+	}
 	default: {
-		/* number */
-		double val;
-
-		DUK_ASSERT(DUK_TVAL_IS_NUMBER(tv));
-		val = DUK_TVAL_GET_NUMBER(tv);
-
-		(void) duk_push_object_helper(ctx,
-		                              DUK_HOBJECT_FLAG_EXTENSIBLE |
-		                              DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_NUMBER),
-		                              DUK_BIDX_NUMBER_PROTOTYPE);
-		res = duk_require_hobject(ctx, -1);
-		DUK_ASSERT(res != NULL);
-
-		/* Note: Number prototype's internal value property is not writable,
-		 * but duk_def_prop_stridx() disregards the write protection.  Number
-		 * instances are immutable.
-		 */
-		duk_push_number(ctx, val);
-		duk_def_prop_stridx(ctx, -2, DUK_STRIDX_INT_VALUE, DUK_PROPDESC_FLAGS_NONE);
-
-		duk_replace(ctx, index);
-		break;
+		shared_flags = DUK_HOBJECT_FLAG_EXTENSIBLE |
+		               DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_NUMBER);
+		shared_proto = DUK_BIDX_NUMBER_PROTOTYPE;
+		goto create_object;
 	}
 	}
+	return;
+
+ create_object:
+	(void) duk_push_object_helper(ctx, shared_flags, shared_proto);
+	res = duk_require_hobject(ctx, -1);
+	DUK_ASSERT(res != NULL);
+
+	/* Note: Boolean prototype's internal value property is not writable,
+	 * but duk_def_prop_stridx() disregards the write protection.  Boolean
+	 * instances are immutable.
+	 */
+	duk_dup(ctx, index);
+	duk_def_prop_stridx(ctx, -2, DUK_STRIDX_INT_VALUE, DUK_PROPDESC_FLAGS_NONE);
+
+	/* FIXME: fix this check to lookup class from shared_flags to minimize size */
+	if (shared_string) {
+		/* Enable special string behavior only after internal value has been set */
+		DUK_HOBJECT_SET_SPECIAL_STRINGOBJ(res);
+	}
+
+	duk_replace(ctx, index);
 }
 
 /*
@@ -8270,6 +10518,10 @@ int duk_get_type(duk_context *ctx, int index) {
 	DUK_NEVER_HERE();
 }
 
+int duk_check_type(duk_context *ctx, int index, int type) {
+	return (duk_get_type(ctx, index) == type) ? 1 : 0;
+}
+
 int duk_get_type_mask(duk_context *ctx, int index) {
 	duk_tval *tv;
 
@@ -8298,6 +10550,10 @@ int duk_get_type_mask(duk_context *ctx, int index) {
 		return DUK_TYPE_MASK_NUMBER;
 	}
 	DUK_NEVER_HERE();
+}
+
+int duk_check_type_mask(duk_context *ctx, int index, int mask) {
+	return (duk_get_type_mask(ctx, index) & mask) ? 1 : 0;
 }
 
 int duk_is_undefined(duk_context *ctx, int index) {
@@ -8351,7 +10607,7 @@ int duk_is_nan(duk_context *ctx, int index) {
 	 * coerce to NaN.  In particular, duk_get_number() returns a NaN for
 	 * non-numbers, so should this also return true for non-numbers?
 	 */
-	return duk_is_number(ctx, index) && isnan(duk_get_number(ctx, index));
+	return duk_is_number(ctx, index) && DUK_ISNAN(duk_get_number(ctx, index));
 }
 
 int duk_is_string(duk_context *ctx, int index) {
@@ -8460,13 +10716,12 @@ int duk_is_primitive(duk_context *ctx, int index) {
 }
 
 int duk_is_object_coercible(duk_context *ctx, int index) {
-	int mask = DUK_TYPE_MASK_BOOLEAN |
-	           DUK_TYPE_MASK_NUMBER |
-	           DUK_TYPE_MASK_STRING |
-	           DUK_TYPE_MASK_OBJECT;
-	/* FIXME: what about buffer and pointer? */
-
-	return (duk_get_type_mask(ctx, index) & mask ? 1 : 0);
+	return duk_check_type_mask(ctx, index, DUK_TYPE_MASK_BOOLEAN |
+	                                       DUK_TYPE_MASK_NUMBER |
+	                                       DUK_TYPE_MASK_STRING |
+	                                       DUK_TYPE_MASK_OBJECT |
+	                                       DUK_TYPE_MASK_BUFFER |
+	                                       DUK_TYPE_MASK_POINTER);
 }
 
 /*
@@ -8545,7 +10800,7 @@ void duk_push_int(duk_context *ctx, int val) {
 }
 
 void duk_push_nan(duk_context *ctx) {
-	duk_push_number(ctx, NAN);
+	duk_push_number(ctx, DUK_DOUBLE_NAN);
 }
 
 const char *duk_push_lstring(duk_context *ctx, const char *str, size_t len) {
@@ -8619,7 +10874,7 @@ const char *duk_push_string_file(duk_context *ctx, const char *path) {
 	if (fseek(f, 0, SEEK_SET) < 0) {
 		goto fail;
 	}
-	buf = duk_push_fixed_buffer(ctx, sz);
+	buf = (char *) duk_push_fixed_buffer(ctx, sz);
 	DUK_ASSERT(buf != NULL);
 	if (fread(buf, 1, sz, f) != sz) {
 		goto fail;
@@ -8816,7 +11071,7 @@ void duk_push_global_object(duk_context *ctx) {
 static int try_push_vsprintf(duk_context *ctx, void *buf, size_t sz, const char *fmt, va_list ap) {
 	int len;
 
-	len = vsnprintf((char *) buf, sz, fmt, ap);
+	len = DUK_VSNPRINTF((char *) buf, sz, fmt, ap);
 	if (len < sz) {
 		return len;
 	}
@@ -8866,7 +11121,7 @@ const char *duk_push_vsprintf(duk_context *ctx, const char *fmt, va_list ap) {
 	}
 
 	/* FIXME: buffer to string */
-	res = duk_push_lstring(ctx, buf, len);  /* [buf res] */
+	res = duk_push_lstring(ctx, (const char *) buf, (size_t) len);  /* [buf res] */
 	duk_remove(ctx, -2);
 	return res;
 }
@@ -8976,7 +11231,7 @@ int duk_push_thread(duk_context *ctx) {
 	obj = duk_hthread_alloc(thr->heap,
 	                        DUK_HOBJECT_FLAG_EXTENSIBLE |
 	                        DUK_HOBJECT_FLAG_THREAD |
-	                        DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_OBJECT));
+	                        DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_THREAD));
 	if (!obj) {
 		DUK_ERROR(thr, DUK_ERR_ALLOC_ERROR, "failed to allocate a thread object");
 	}
@@ -9110,17 +11365,14 @@ int duk_push_c_function(duk_context *ctx, duk_c_function func, int nargs) {
 	return 0;  /* not reached */
 }
 
-int duk_push_error_object(duk_context *ctx, int err_code, const char *fmt, ...) {
+static int duk_push_error_object_vsprintf(duk_context *ctx, int err_code, const char *filename, int line, const char *fmt, va_list ap) {
 	duk_hthread *thr = (duk_hthread *) ctx;
 	int retval;
-	va_list ap;
 	duk_hobject *errobj;
 	duk_hobject *proto;
 
 	DUK_ASSERT(ctx != NULL);
 	DUK_ASSERT(thr != NULL);
-
-	va_start(ap, fmt);
 
 	retval = duk_push_object_helper(ctx,
 	                                DUK_HOBJECT_FLAG_EXTENSIBLE |
@@ -9137,13 +11389,22 @@ int duk_push_error_object(duk_context *ctx, int err_code, const char *fmt, ...) 
 	if (fmt) {
 		duk_push_vsprintf(ctx, fmt, ap);
 		duk_def_prop_stridx(ctx, -2, DUK_STRIDX_MESSAGE, DUK_PROPDESC_FLAGS_WC);
+	} else {
+		/* If no explicit message given, put error code into message field
+		 * (as a number).  This is not fully in keeping with the Ecmascript
+		 * error model because messages are supposed to be strings (Error
+		 * constructors use ToString() on their argument).  However, it's
+		 * probably more useful than having a separate 'code' property.
+		 */
+		duk_push_int(ctx, err_code);
+		duk_def_prop_stridx(ctx, -2, DUK_STRIDX_MESSAGE, DUK_PROPDESC_FLAGS_WC);
 	}
 
-	/* 'code' property is custom */
+#if 0
+	/* Disabled for now, not sure this is a useful property */
 	duk_push_int(ctx, err_code);
 	duk_def_prop_stridx(ctx, -2, DUK_STRIDX_CODE, DUK_PROPDESC_FLAGS_WC);
-
-	va_end(ap);
+#endif
 
 	/* Note: errors should be augmented when they are created, not when
 	 * they are thrown or rethrown.  The caller should augment the newly
@@ -9151,11 +11412,39 @@ int duk_push_error_object(duk_context *ctx, int err_code, const char *fmt, ...) 
 	 */
 
 #ifdef DUK_USE_AUGMENT_ERRORS
-	duk_err_augment_error(thr, thr, -1);  /* may throw an error */
+	/* filename may be NULL in which case file/line is not recorded */
+	duk_err_augment_error(thr, thr, -1, filename, line);  /* may throw an error */
 #endif
 
 	return retval;
+
 }
+
+int duk_push_error_object_raw(duk_context *ctx, int err_code, const char *filename, int line, const char *fmt, ...) {
+	va_list ap;
+	int ret;
+
+	va_start(ap, fmt);
+	ret = duk_push_error_object_vsprintf(ctx, err_code, filename, line, fmt, ap);
+	va_end(ap);
+	return ret;
+}
+
+#ifndef DUK_USE_VARIADIC_MACROS
+int duk_push_error_object_stash(duk_context *ctx, int err_code, const char *fmt, ...) {
+	const char *filename = duk_api_global_filename;
+	int line = duk_api_global_line;
+	va_list ap;
+	int ret;
+
+	duk_api_global_filename = NULL;
+	duk_api_global_line = 0;
+	va_start(ap, fmt);
+	ret = duk_push_error_object_vsprintf(ctx, err_code, filename, line, fmt, ap);
+	va_end(ap);
+	return ret;
+}
+#endif
 
 /* FIXME: repetition, see duk_push_object */
 void *duk_push_buffer(duk_context *ctx, size_t size, int dynamic) {
@@ -9356,16 +11645,29 @@ void duk_fatal(duk_context *ctx, int err_code) {
 	DUK_NEVER_HERE();
 }
 
-void duk_error(duk_context *ctx, int err_code, const char *fmt, ...) {
-	/* FIXME: push_error_object_vsprintf? */
+void duk_error_raw(duk_context *ctx, int err_code, const char *filename, int line, const char *fmt, ...) {
 	va_list ap;
-
 	va_start(ap, fmt);
-	duk_push_vsprintf(ctx, fmt, ap);
+	duk_push_error_object_vsprintf(ctx, err_code, filename, line, fmt, ap);
 	va_end(ap);
-	duk_push_error_object(ctx, err_code, "%s", duk_get_string(ctx, -1));
 	duk_throw(ctx);
 }
+
+#ifndef DUK_USE_VARIADIC_MACROS
+void duk_error_stash(duk_context *ctx, int err_code, const char *fmt, ...) {
+	const char *filename = duk_api_global_filename;
+	int line = duk_api_global_line;
+	va_list ap;
+
+	duk_api_global_filename = NULL;
+	duk_api_global_line = 0;
+
+	va_start(ap, fmt);
+	duk_push_error_object_vsprintf(ctx, err_code, filename, line, fmt, ap);
+	va_end(ap);
+	duk_throw(ctx);
+}
+#endif
 
 int duk_equals(duk_context *ctx, int index1, int index2) {
 	duk_hthread *thr = (duk_hthread *) ctx;
@@ -9505,10 +11807,10 @@ void duk_to_fixed_buffer(duk_context *ctx, int index) {
 	}
 
 	size = DUK_HBUFFER_GET_SIZE(h_src);
-	data = duk_push_fixed_buffer(ctx, size);
+	data = (char *) duk_push_fixed_buffer(ctx, size);
 	if (size > 0) {
 		DUK_ASSERT(data != NULL);
-		memcpy(data, DUK_HBUFFER_DYNAMIC_GET_CURR_DATA_PTR(h_src), size);
+		DUK_MEMCPY(data, DUK_HBUFFER_DYNAMIC_GET_CURR_DATA_PTR(h_src), size);
 	}
 
 	duk_replace(ctx, index);
@@ -9568,7 +11870,7 @@ static int resolve_errhandler(duk_context *ctx, int pop_count, int errhandler_in
 	DUK_ASSERT(pop_count <= duk_get_top(ctx));  /* caller ensures */
 
 	duk_pop_n(ctx, pop_count);
-	(void) duk_push_error_object(ctx, DUK_ERR_API_ERROR, "invalid errhandler");
+	(void) duk_push_error_object_raw(ctx, DUK_ERR_API_ERROR, DUK_FILE_MACRO, DUK_LINE_MACRO, "invalid errhandler");
 	return 0;
 }
 
@@ -9612,7 +11914,7 @@ void duk_call(duk_context *ctx, int nargs) {
 	idx_func = duk_get_top(ctx) - nargs - 1;  /* must work for nargs <= 0 */
 	if (idx_func < 0 || nargs < 0) {
 		/* note that we can't reliably pop anything here */
-		DUK_ERROR(ctx, DUK_ERR_API_ERROR, "invalid call args");
+		DUK_ERROR(thr, DUK_ERR_API_ERROR, "invalid call args");
 	}
 
 	/* awkward; we assume there is space for this */
@@ -9643,7 +11945,7 @@ void duk_call_method(duk_context *ctx, int nargs) {
 	idx_func = duk_get_top(ctx) - nargs - 2;  /* must work for nargs <= 0 */
 	if (idx_func < 0 || nargs < 0) {
 		/* note that we can't reliably pop anything here */
-		DUK_ERROR(ctx, DUK_ERR_API_ERROR, "invalid call args");
+		DUK_ERROR(thr, DUK_ERR_API_ERROR, "invalid call args");
 	}
 
 	errhandler = thr->heap->lj.errhandler;  /* use existing one (if any) */
@@ -9685,7 +11987,7 @@ int duk_pcall(duk_context *ctx, int nargs, int errhandler_index) {
 	idx_func = duk_get_top(ctx) - nargs - 1;  /* must work for nargs <= 0 */
 	if (idx_func < 0 || nargs < 0) {
 		/* note that we can't reliably pop anything here */
-		DUK_ERROR(ctx, DUK_ERR_API_ERROR, "invalid call args");
+		DUK_ERROR(thr, DUK_ERR_API_ERROR, "invalid call args");
 		/* FIXME: actually terminate thread? */
 		return DUK_ERR_EXEC_TERM;
 	}
@@ -9937,13 +12239,14 @@ void duk_new(duk_context *ctx, int nargs) {
 	}
 
 	/*
-	 *  Augment created errors upon creation.
-	 *
-	 * Note: errors should be augmented when they are created, not when
-	 * they are thrown or rethrown.
+	 *  Augment created errors upon creation (not when they are thrown or
+	 *  rethrown).  __FILE__ and __LINE__ are not desirable here; the call
+	 *  stack reflects the caller which is correct.
 	 */
 
-	duk_err_augment_error(thr, thr, -1);
+#ifdef DUK_USE_AUGMENT_ERRORS
+	duk_err_augment_error(thr, thr, -1, NULL, 0);
+#endif
 
 	/* [... retval] */
 
@@ -10172,7 +12475,7 @@ const char *duk_base64_encode(duk_context *ctx, int index) {
 		goto type_error;
 	}
 	dstlen = (srclen + 2) / 3 * 4;
-	dst = duk_push_fixed_buffer(ctx, dstlen);
+	dst = (unsigned char *) duk_push_fixed_buffer(ctx, dstlen);
 
 	base64_encode_helper((const unsigned char *) src, (const unsigned char *) (src + srclen),
 	                     (unsigned char *) dst, (unsigned char *) (dst + dstlen));
@@ -10211,7 +12514,7 @@ void duk_base64_decode(duk_context *ctx, int index) {
 		goto type_error;
 	}
 	dstlen = (srclen + 3) / 4 * 3;  /* upper limit */
-	dst = duk_push_dynamic_buffer(ctx, dstlen);
+	dst = (unsigned char *) duk_push_dynamic_buffer(ctx, dstlen);
 	/* Note: for dstlen=0, dst may be NULL */
 
 	retval = base64_decode_helper((unsigned char *) src, (unsigned char *) (src + srclen),
@@ -10240,7 +12543,7 @@ const char *duk_hex_encode(duk_context *ctx, int index) {
 	/* FIXME: special case for input string, no need to coerce to buffer */
 
 	index = duk_require_normalize_index(ctx, index);
-	data = duk_to_buffer(ctx, index, &len);
+	data = (unsigned char *) duk_to_buffer(ctx, index, &len);
 	DUK_ASSERT(data != NULL);
 
 	buf = (unsigned char *) duk_push_fixed_buffer(ctx, len * 2);
@@ -10354,10 +12657,10 @@ void duk_json_decode(duk_context *ctx, int index) {
 /* FIXME: placeholder */
 
 /* Eval is just a wrapper now. */
-void duk_eval(duk_context *ctx) {
+void duk_eval_raw(duk_context *ctx) {
 	int comp_flags;
 
-	/* [ ... source ] */
+	/* [ ... source filename ] */
 
 	comp_flags = DUK_COMPILE_EVAL;
 	if (duk_is_strict_call(ctx)) {
@@ -10377,7 +12680,7 @@ void duk_compile(duk_context *ctx, int flags) {
 	int comp_flags;
 	duk_hcompiledfunction *h_templ;
 
-	/* [ ... source ] */
+	/* [ ... source filename ] */
 
 	/* FIXME: flags */
 	/* FIXME: unnecessary translation of flags */
@@ -10770,47 +13073,15 @@ void duk_def_prop_stridx_builtin(duk_context *ctx, int obj_index, unsigned int s
 }
 
 /* This is a rare property helper; it sets the global thrower (E5 Section 13.2.3)
- * setter/getter into an object property.  Since there are so few places where
- * accessor properties are created (by the implementation), there are almost no
- * other API calls for creating such properties (except calling Object.defineProperty()
- * properly).
- *
- * This is needed by the 'arguments' object creation code and by function instance
- * creation code.
+ * setter/getter into an object property.  This is needed by the 'arguments'
+ * object creation code and by function instance creation code.
  */
 
 void duk_def_prop_stridx_thrower(duk_context *ctx, int obj_index, unsigned int stridx, int desc_flags) {
 	duk_hthread *thr = (duk_hthread *) ctx;
-	duk_hobject *obj;
-	duk_hobject *thrower;
-	int e_idx;
-	int h_idx;
-
-	DUK_ASSERT(ctx != NULL);
-	DUK_ASSERT(stridx >= 0 && stridx < DUK_HEAP_NUM_STRINGS);
-
-	/*
-	 *  Since we don't have an internal define function for creating
-	 *  accessor values, first set the value to 'undefined', then get
-	 *  the storage slot and update in-place to an accessor.
-	 */
-
-	obj_index = duk_require_normalize_index(ctx, obj_index);
-
-	duk_push_undefined(ctx);
-	duk_def_prop_stridx(ctx, obj_index, stridx, desc_flags);
-
-	obj = duk_require_hobject(ctx, obj_index);
-	duk_hobject_find_existing_entry(obj, DUK_HTHREAD_GET_STRING(thr, stridx), &e_idx, &h_idx);
-	DUK_ASSERT(e_idx >= 0 && e_idx < obj->e_used);
-
-	/* no need to decref, as previous value is 'undefined' */
-	thrower = thr->builtins[DUK_BIDX_TYPE_ERROR_THROWER];
-	DUK_HOBJECT_E_SLOT_SET_ACCESSOR(obj, e_idx);
-	DUK_HOBJECT_E_SET_VALUE_GETTER(obj, e_idx, thrower);
-	DUK_HOBJECT_E_SET_VALUE_SETTER(obj, e_idx, thrower);
-	DUK_HOBJECT_INCREF(thr, thrower);
-	DUK_HOBJECT_INCREF(thr, thrower);  /* XXX: macro to increment a count directly */
+	duk_hobject *obj = duk_require_hobject(ctx, obj_index);
+	duk_hobject *thrower = thr->builtins[DUK_BIDX_TYPE_ERROR_THROWER];
+	duk_hobject_define_accessor_internal(thr, obj, DUK_HTHREAD_GET_STRING(thr, stridx), thrower, thrower, desc_flags);
 }
 
 /*
@@ -10888,7 +13159,7 @@ static void concat_and_join_helper(duk_context *ctx, int count, int is_join) {
 	DUK_DDDPRINT("join/concat %d strings, total length %d bytes", count, len);
 
 	/* use stack allocated buffer to ensure reachability in errors (e.g. intern error) */
-	buf = duk_push_fixed_buffer(ctx, len);
+	buf = (duk_u8 *) duk_push_fixed_buffer(ctx, len);
 	DUK_ASSERT(buf != NULL);
 
 	/* [... (sep) str1 str2 ... strN buf] */
@@ -10897,11 +13168,11 @@ static void concat_and_join_helper(duk_context *ctx, int count, int is_join) {
 	for (i = count; i >= 1; i--) {
 		if (is_join && i != count) {
 			h = duk_require_hstring(ctx, -count-2);  /* extra -1 for buffer */
-			memcpy(buf + idx, DUK_HSTRING_GET_DATA(h), DUK_HSTRING_GET_BYTELEN(h));
+			DUK_MEMCPY(buf + idx, DUK_HSTRING_GET_DATA(h), DUK_HSTRING_GET_BYTELEN(h));
 			idx += DUK_HSTRING_GET_BYTELEN(h);
 		}
 		h = duk_require_hstring(ctx, -i-1);  /* extra -1 for buffer */
-		memcpy(buf + idx, DUK_HSTRING_GET_DATA(h), DUK_HSTRING_GET_BYTELEN(h));
+		DUK_MEMCPY(buf + idx, DUK_HSTRING_GET_DATA(h), DUK_HSTRING_GET_BYTELEN(h));
 		idx += DUK_HSTRING_GET_BYTELEN(h);
 	}
 
@@ -12464,18 +14735,18 @@ static int tostring_valueof_helper(duk_context *ctx, int coerce_tostring) {
 }
 
 int duk_builtin_boolean_constructor(duk_context *ctx) {
-	duk_hobject *this;
+	duk_hobject *h_this;
 
 	duk_to_boolean(ctx, 0);
 
 	if (duk_is_constructor_call(ctx)) {
 		/* FIXME: helper; rely on Boolean.prototype as being non-writable, non-configurable */
 		duk_push_this(ctx);
-		this = duk_get_hobject(ctx, -1);
-		DUK_ASSERT(this != NULL);
-		DUK_ASSERT(this->prototype == ((duk_hthread *) ctx)->builtins[DUK_BIDX_BOOLEAN_PROTOTYPE]);
+		h_this = duk_get_hobject(ctx, -1);
+		DUK_ASSERT(h_this != NULL);
+		DUK_ASSERT(h_this->prototype == ((duk_hthread *) ctx)->builtins[DUK_BIDX_BOOLEAN_PROTOTYPE]);
 
-		DUK_HOBJECT_SET_CLASS_NUMBER(this, DUK_HOBJECT_CLASS_BOOLEAN);
+		DUK_HOBJECT_SET_CLASS_NUMBER(h_this, DUK_HOBJECT_CLASS_BOOLEAN);
 
 		duk_dup(ctx, 0);  /* -> [ val obj val ] */
 		duk_def_prop_stridx(ctx, -2, DUK_STRIDX_INT_VALUE, DUK_PROPDESC_FLAGS_NONE);  /* FIXME: proper flags? */
@@ -12490,6 +14761,89 @@ int duk_builtin_boolean_prototype_to_string(duk_context *ctx) {
 
 int duk_builtin_boolean_prototype_value_of(duk_context *ctx) {
 	return tostring_valueof_helper(ctx, 0 /*coerce_tostring*/);
+}
+
+#line 1 "duk_builtin_buffer.c"
+/*
+ *  Pointer built-ins
+ */
+
+/* include removed: duk_internal.h */
+
+/*
+ *  Constructor
+ */
+
+int duk_builtin_pointer_constructor(duk_context *ctx) {
+	/* FIXME: this behavior is quite useless now; it would be nice to be able
+	 * to create pointer values from e.g. numbers or strings.  Numbers are
+	 * problematic on 64-bit platforms though.  Hex encoded strings?
+	 */
+	if (duk_get_top(ctx) == 0) {
+		duk_push_pointer(ctx, NULL);
+	} else {
+		duk_to_pointer(ctx, 0);
+	}
+	DUK_ASSERT(duk_is_pointer(ctx, 0));
+	duk_set_top(ctx, 1);
+
+	if (duk_is_constructor_call(ctx)) {
+		duk_push_object_helper(ctx,
+		                       DUK_HOBJECT_FLAG_EXTENSIBLE |
+		                       DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_POINTER),
+		                       DUK_BIDX_POINTER_PROTOTYPE);
+
+		/* Pointer object internal value is immutable */
+		duk_dup(ctx, 0);
+		duk_def_prop_stridx(ctx, -2, DUK_STRIDX_INT_VALUE, DUK_PROPDESC_FLAGS_NONE);
+	}
+	/* Note: unbalanced stack on purpose */
+
+	return 1;
+}
+
+/*
+ *  toString(), valueOf()
+ */
+
+static int buffer_tostring_valueof_helper(duk_context *ctx, int to_string) {
+	duk_tval *tv;
+
+	duk_push_this(ctx);
+	tv = duk_require_tval(ctx, -1);
+	DUK_ASSERT(tv != NULL);
+
+	if (DUK_TVAL_IS_POINTER(tv)) {
+		/* nop */
+	} else if (DUK_TVAL_IS_OBJECT(tv)) {
+		duk_hobject *h = DUK_TVAL_GET_OBJECT(tv);
+		DUK_ASSERT(h != NULL);
+
+		/* Must be a "pointer object", i.e. class "Pointer" */
+		if (DUK_HOBJECT_GET_CLASS_NUMBER(h) != DUK_HOBJECT_CLASS_POINTER) {
+			goto type_error;
+		}
+
+		duk_get_prop_stridx(ctx, -1, DUK_STRIDX_INT_VALUE);
+	} else {
+		goto type_error;
+	}
+
+	if (to_string) {
+		duk_to_string(ctx, -1);
+	}
+	return 1;
+
+ type_error:
+	return DUK_RET_TYPE_ERROR;
+}
+
+int duk_builtin_pointer_prototype_to_string(duk_context *ctx) {
+	return buffer_tostring_valueof_helper(ctx, 1);
+}
+
+int duk_builtin_pointer_prototype_value_of(duk_context *ctx) {
+	return buffer_tostring_valueof_helper(ctx, 0);
 }
 
 #line 1 "duk_builtin_date.c"
@@ -12516,11 +14870,13 @@ int duk_builtin_boolean_prototype_value_of(duk_context *ctx) {
 
 #if defined(DUK_USE_DATE_NOW_GETTIMEOFDAY)
 #define  GET_NOW_TIMEVAL      get_now_timeval_gettimeofday
+#elif defined(DUK_USE_DATE_NOW_TIME)
+#define  GET_NOW_TIMEVAL      get_now_timeval_time
 #else
 #error no function to get current time
 #endif
 
-#if defined(DUK_USE_DATE_TZO_GMTIME)
+#if defined(DUK_USE_DATE_TZO_GMTIME) || defined(DUK_USE_DATE_TZO_GMTIME_R)
 #define  GET_LOCAL_TZOFFSET   get_local_tzoffset_gmtime
 #else
 #error no function to get local tzoffset
@@ -12606,16 +14962,27 @@ static double get_now_timeval_gettimeofday(duk_context *ctx) {
 }
 #endif  /* DUK_USE_DATE_NOW_GETTIMEOFDAY */
 
-#ifdef DUK_USE_DATE_TZO_GMTIME
+#ifdef DUK_USE_DATE_NOW_TIME
+/* Not a very good provider: only full seconds are available. */
+static double get_now_timeval_time(duk_context *ctx) {
+	time_t t = time(NULL);
+	return ((double) t) * 1000.0;
+}
+#endif  /* DUK_USE_DATE_NOW_TIME */
+
+#if defined(DUK_USE_DATE_TZO_GMTIME) || defined(DUK_USE_DATE_TZO_GMTIME_R)
 /* Get local time offset (in seconds) for a certain (UTC) instant 'd'. */
 static int get_local_tzoffset_gmtime(double d) {
 	time_t t, t1, t2;
 	int parts[NUM_PARTS];
 	double dparts[NUM_PARTS];
 	struct tm tms[2];
+#ifdef DUK_USE_DATE_TZO_GMTIME
+	struct tm *tm_ptr;
+#endif
 
 	/* For NaN/inf, the return value doesn't matter. */
-	if (!isfinite(d)) {
+	if (!DUK_ISFINITE(d)) {
 		return 0;
 	}
 
@@ -12660,10 +15027,18 @@ static int get_local_tzoffset_gmtime(double d) {
 
 	t1 = t;
 
-	memset((void *) tms, 0, sizeof(struct tm) * 2);
+	DUK_MEMSET((void *) tms, 0, sizeof(struct tm) * 2);
 
+#if defined(DUK_USE_DATE_TZO_GMTIME_R)
 	(void) gmtime_r(&t, &tms[0]);
-	memcpy((void *) &tms[1], &tms[0], sizeof(struct tm));
+#elif defined(DUK_USE_DATE_TZO_GMTIME)
+	tm_ptr = gmtime(&t);
+	DUK_MEMCPY((void *) &tms[0], tm_ptr, sizeof(struct tm));
+#else
+#error internal error
+#endif
+	DUK_MEMCPY((void *) &tms[1], &tms[0], sizeof(struct tm));
+
 	DUK_DDDPRINT("before mktime: tm={sec:%d,min:%d,hour:%d,mday:%d,mon:%d,year:%d,"
 	             "wday:%d,yday:%d,isdst:%d}",
 	             (int) tms[0].tm_sec, (int) tms[0].tm_min, (int) tms[0].tm_hour,
@@ -12711,12 +15086,12 @@ static int parse_string_strptime(duk_context *ctx, const char *str) {
 	char buf[STRPTIME_BUF_SIZE];
 
 	/* copy to buffer with spare to avoid Valgrind gripes from strptime */
-	memset(buf, 0, sizeof(buf));
-	snprintf(buf, sizeof(buf) - 1, "%s", str);
+	DUK_MEMSET(buf, 0, sizeof(buf));
+	DUK_SNPRINTF(buf, sizeof(buf) - 1, "%s", str);
 
 	DUK_DDDPRINT("parsing: '%s'", buf);
 
-	memset(&tm, 0, sizeof(tm));
+	DUK_MEMSET(&tm, 0, sizeof(tm));
 	if (strptime((const char *) buf, "%c", &tm) != NULL) {
 		DUK_DDDPRINT("before mktime: tm={sec:%d,min:%d,hour:%d,mday:%d,mon:%d,year:%d,"
 		             "wday:%d,yday:%d,isdst:%d}",
@@ -12747,7 +15122,7 @@ static int parse_string_getdate(duk_context *ctx, const char *str) {
 	 * convenient for an embeddable interpreter.
 	 */
 
-	memset(&tm, 0, sizeof(struct tm));
+	DUK_MEMSET(&tm, 0, sizeof(struct tm));
 	rc = getdate_r(str, &tm);
 	DUK_DDDPRINT("getdate_r() -> %d", rc);
 
@@ -12784,7 +15159,7 @@ static int format_parts_strftime(duk_context *ctx, int *parts, int tzoffset, int
 		return 0;
 	}
 
-	memset(&tm, 0, sizeof(tm));
+	DUK_MEMSET(&tm, 0, sizeof(tm));
 	tm.tm_sec = parts[IDX_SECOND];
 	tm.tm_min = parts[IDX_MINUTE];
 	tm.tm_hour = parts[IDX_HOUR];
@@ -12794,7 +15169,7 @@ static int format_parts_strftime(duk_context *ctx, int *parts, int tzoffset, int
 	tm.tm_wday = parts[IDX_WEEKDAY];
 	tm.tm_isdst = 0;
 
-	memset(buf, 0, sizeof(buf));
+	DUK_MEMSET(buf, 0, sizeof(buf));
 	if ((flags & FLAG_TOSTRING_DATE) && (flags & FLAG_TOSTRING_TIME)) {
 		fmt = "%c";
 	} else if (flags & FLAG_TOSTRING_DATE) {
@@ -12917,7 +15292,7 @@ static int parse_string_iso8601_subset(duk_context *ctx, const char *str) {
 	int i;
 
 	/* During parsing, month and day are one-based; set defaults here. */
-	memset(parts, 0, sizeof(parts));
+	DUK_MEMSET(parts, 0, sizeof(parts));
 	DUK_ASSERT(parts[IDX_YEAR] == 0);  /* don't care value, year is mandatory */
 	parts[IDX_MONTH] = 1;
 	parts[IDX_DAY] = 1;
@@ -13152,12 +15527,12 @@ static int is_leap_year(int year) {
 }
 
 static double timeclip(double x) {
-	if (!isfinite(x)) {
-		return NAN;
+	if (!DUK_ISFINITE(x)) {
+		return DUK_DOUBLE_NAN;
 	}
 
 	if (x > 8.64e15 || x < -8.64e15) {
-		return NAN;
+		return DUK_DOUBLE_NAN;
 	}
 
 	x = duk_js_tointeger_number(x);
@@ -13235,8 +15610,8 @@ static double make_day(double year, double month, double day) {
 	 * must return NaN or infinity to ensure time value becomes NaN.
 	 */
 
-	if (!isfinite(year) || !isfinite(month)) {
-		return NAN;
+	if (!DUK_ISFINITE(year) || !DUK_ISFINITE(month)) {
+		return DUK_DOUBLE_NAN;
 	}
 	
 	year += floor(month / 12);
@@ -13282,8 +15657,8 @@ static void timeval_to_parts(double d, int *parts, double *dparts, int flags) {
 	int i;
 	int is_leap;
 
-	DUK_ASSERT(isfinite(d));    /* caller checks */
-	DUK_ASSERT(floor(d) == d);  /* no fractions in internal time */
+	DUK_ASSERT(DUK_ISFINITE(d));    /* caller checks */
+	DUK_ASSERT(floor(d) == d);      /* no fractions in internal time */
 
 	/* these computations are guaranteed to be exact for the valid
 	 * E5 time value range, assuming milliseconds without fractions.
@@ -13371,7 +15746,7 @@ static double get_timeval_from_dparts(double *dparts, int flags) {
 	 */
 	for (i = 0; i <= IDX_MILLISECOND; i++) {
 		d = dparts[i];
-		if (isfinite(d)) {
+		if (DUK_ISFINITE(d)) {
 			dparts[i] = duk_js_tointeger_number(d);
 		}
 	}
@@ -13444,7 +15819,7 @@ static double push_this_and_get_timeval_tzoffset(duk_context *ctx, int flags, in
 	d = duk_to_number(ctx, -1);
 	duk_pop(ctx);
 
-	if (isnan(d)) {
+	if (DUK_ISNAN(d)) {
 		if (flags & FLAG_NAN_TO_ZERO) {
 			d = 0.0;
 		}
@@ -13503,19 +15878,19 @@ static int format_parts_iso8601(duk_context *ctx, int *parts, int tzoffset, int 
 	/* Note: %06d for positive value, %07d for negative value to include sign and
 	 * 6 digits.
 	 */
-	sprintf(yearstr,
-	        (parts[IDX_YEAR] >= 0 && parts[IDX_YEAR] <= 9999) ? "%04d" :
-		        ((parts[IDX_YEAR] >= 0) ? "+%06d" : "%07d"),
-	        parts[IDX_YEAR]);
+	DUK_SPRINTF(yearstr,
+	            (parts[IDX_YEAR] >= 0 && parts[IDX_YEAR] <= 9999) ? "%04d" :
+	                    ((parts[IDX_YEAR] >= 0) ? "+%06d" : "%07d"),
+	            parts[IDX_YEAR]);
 
 	if (flags_and_sep & FLAG_LOCALTIME) {
 		/* tzoffset seconds are dropped */
 		if (tzoffset >= 0) {
 			int tmp = tzoffset / 60;
-			sprintf(tzstr, "+%02d:%02d", tmp / 60, tmp % 60);
+			DUK_SPRINTF(tzstr, "+%02d:%02d", tmp / 60, tmp % 60);
 		} else {
 			int tmp = -tzoffset / 60;
-			sprintf(tzstr, "-%02d:%02d", tmp / 60, tmp % 60);
+			DUK_SPRINTF(tzstr, "-%02d:%02d", tmp / 60, tmp % 60);
 		}
 	} else {
 		tzstr[0] = 'Z';
@@ -13548,11 +15923,11 @@ static int to_string_helper(duk_context *ctx, int flags_and_sep) {
 	int rc;
 
 	d = push_this_and_get_timeval_tzoffset(ctx, flags_and_sep, &tzoffset);
-	if (isnan(d)) {
+	if (DUK_ISNAN(d)) {
 		duk_push_hstring_stridx(ctx, DUK_STRIDX_INVALID_DATE);
 		return 1;
 	}
-	DUK_ASSERT(isfinite(d));
+	DUK_ASSERT(DUK_ISFINITE(d));
 
 	/* formatters always get one-based month/day-of-month */
 	timeval_to_parts(d, parts, NULL, FLAG_ONEBASED);
@@ -13593,11 +15968,11 @@ static int get_part_helper(duk_context *ctx, int flags_and_idx) {
 	DUK_ASSERT(idx_part >= 0 && idx_part < NUM_PARTS);
 
 	d = push_this_and_get_timeval(ctx, flags_and_idx);
-	if (isnan(d)) {
+	if (DUK_ISNAN(d)) {
 		duk_push_nan(ctx);
 		return 1;
 	}
-	DUK_ASSERT(isfinite(d));
+	DUK_ASSERT(DUK_ISFINITE(d));
 
 	timeval_to_parts(d, parts, NULL, flags_and_idx);
 
@@ -13627,9 +16002,9 @@ static int set_part_helper(duk_context *ctx, int flags_and_maxnargs) {
 
 	nargs = duk_get_top(ctx);
 	d = push_this_and_get_timeval(ctx, flags_and_maxnargs);
-	DUK_ASSERT(isfinite(d) || isnan(d));
+	DUK_ASSERT(DUK_ISFINITE(d) || DUK_ISNAN(d));
 
-	if (isfinite(d)) {
+	if (DUK_ISFINITE(d)) {
 		timeval_to_parts(d, parts, dparts, flags_and_maxnargs);
 	} else {
 		/* NaN timevalue: we need to coerce the arguments, but
@@ -13696,7 +16071,7 @@ static int set_part_helper(duk_context *ctx, int flags_and_maxnargs) {
 	/* Leaves new timevalue on stack top and returns 1, which is correct
 	 * for part setters.
 	 */
-	if (isfinite(d)) {
+	if (DUK_ISFINITE(d)) {
 		return set_this_timeval_from_dparts(ctx, dparts, flags_and_maxnargs);
 	} else {
 		/* Internal timevalue is already NaN, so don't touch it. */
@@ -13905,7 +16280,7 @@ int duk_builtin_date_prototype_value_of(duk_context *ctx) {
 	 */
 
 	double d = push_this_and_get_timeval(ctx, 0 /*flags*/);  /* -> [ this ] */
-	DUK_ASSERT(isfinite(d) || isnan(d));
+	DUK_ASSERT(DUK_ISFINITE(d) || DUK_ISNAN(d));
 	duk_push_number(ctx, d);
 	return 1;
 }
@@ -13941,7 +16316,7 @@ int duk_builtin_date_prototype_to_json(duk_context *ctx) {
 	duk_to_primitive(ctx, -1, DUK_HINT_NUMBER);
 	if (duk_is_number(ctx, -1)) {
 		double d = duk_get_number(ctx, -1);
-		if (!isfinite(d)) {
+		if (!DUK_ISFINITE(d)) {
 			duk_push_null(ctx);
 			return 1;
 		}
@@ -13978,11 +16353,11 @@ int duk_builtin_date_prototype_get_timezone_offset(duk_context *ctx) {
 
 	/* Note: DST adjustment is determined using UTC time. */
 	d = push_this_and_get_timeval(ctx, 0 /*flags*/);
-	DUK_ASSERT(isfinite(d) || isnan(d));
-	if (isnan(d)) {
+	DUK_ASSERT(DUK_ISFINITE(d) || DUK_ISNAN(d));
+	if (DUK_ISNAN(d)) {
 		duk_push_nan(ctx);
 	} else {
-		DUK_ASSERT(isfinite(d));
+		DUK_ASSERT(DUK_ISFINITE(d));
 		tzoffset = GET_LOCAL_TZOFFSET(d);
 		duk_push_int(ctx, -tzoffset / 60);
 	}
@@ -14199,8 +16574,6 @@ int duk_builtin_date_prototype_set_year(duk_context *ctx) {
  *  __duk__ built-ins
  */
 
-#include <sys/time.h>
-
 /* include removed: duk_internal.h */
 
 int duk_builtin_duk_object_addr(duk_context *ctx) {
@@ -14263,301 +16636,17 @@ int duk_builtin_duk_object_set_finalizer(duk_context *ctx) {
 	return 0;
 }
 
-/*
- *  Spawn a thread.
+/* FIXME: disabled because time handling is a portability issue which
+ * is otherwise contained in duk_builtin_date.c.
  */
-
-int duk_builtin_duk_object_spawn(duk_context *ctx) {
-	duk_hthread *new_thr;
-	duk_hobject *func;
-
-	if (!duk_is_callable(ctx, 0)) {
-		return DUK_RET_TYPE_ERROR;
-	}
-	func = duk_get_hobject(ctx, 0);
-	DUK_ASSERT(func != NULL);
-
-	duk_push_thread(ctx);
-	new_thr = (duk_hthread *) duk_get_hobject(ctx, -1);
-	DUK_ASSERT(new_thr != NULL);
-	new_thr->state = DUK_HTHREAD_STATE_INACTIVE;
-
-	/* push initial function call to new thread stack; this is
-	 * picked up by resume().
-	 */
-	duk_push_hobject((duk_context *) new_thr, func);
-
-	return 1;  /* return thread */
-}
-
-/*
- *  Resume a thread.
- *
- *  The thread must be in resumable state, either (a) new thread which hasn't
- *  yet started, or (b) a thread which has previously yielded.  This method
- *  must be called from an Ecmascript function.
- *
- *  Args:
- *    - thread
- *    - value
- *    - isError (defaults to false)
- *
- *  Note: yield and resume handling is currently asymmetric.
- */
-
-int duk_builtin_duk_object_resume(duk_context *ctx) {
-	duk_hthread *thr = (duk_hthread *) ctx;
-	duk_hthread *thr_resume;
-	duk_tval tv_tmp;
-	duk_tval *tv;
-	duk_hobject *func;
-	int is_error;
-
-	DUK_DDDPRINT("__duk__.resume(): thread=%!T, value=%!T, is_error=%!T",
-	             duk_get_tval(ctx, 0),
-	             duk_get_tval(ctx, 1),
-	             duk_get_tval(ctx, 2));
-
-	DUK_ASSERT(thr->state == DUK_HTHREAD_STATE_RUNNING);
-	DUK_ASSERT(thr->heap->curr_thread == thr);
-
-	thr_resume = duk_require_hthread(ctx, 0);
-	is_error = duk_to_boolean(ctx, 2);
-
-	/*
-	 *  Thread state and calling context checks
-	 */
-
-	if (thr->callstack_top < 2) {
-		DUK_DDPRINT("resume state invalid: callstack should contain at least 2 entries (caller and __duk__.resume)");
-		goto state_error;
-	}
-	DUK_ASSERT((thr->callstack + thr->callstack_top - 1)->func != NULL);  /* us */
-	DUK_ASSERT(DUK_HOBJECT_IS_NATIVEFUNCTION((thr->callstack + thr->callstack_top - 1)->func));
-	DUK_ASSERT((thr->callstack + thr->callstack_top - 2)->func != NULL);  /* caller */
-
-	if (!DUK_HOBJECT_IS_COMPILEDFUNCTION((thr->callstack + thr->callstack_top - 2)->func)) {
-		DUK_DDPRINT("resume state invalid: caller must be Ecmascript code");
-		goto state_error;
-	}
-
-	/* Note: there is no requirement that: 'thr->callstack_preventcount == 1'
-	 * like for yield.
-	 */
-
-	if (thr_resume->state != DUK_HTHREAD_STATE_INACTIVE &&
-	    thr_resume->state != DUK_HTHREAD_STATE_YIELDED) {
-		DUK_DDPRINT("resume state invalid: target thread must be INACTIVE or YIELDED");
-		goto state_error;
-	}
-
-	DUK_ASSERT(thr_resume->state == DUK_HTHREAD_STATE_INACTIVE ||
-	           thr_resume->state == DUK_HTHREAD_STATE_YIELDED);
-
-	/* Further state-dependent pre-checks */
-
-	if (thr_resume->state == DUK_HTHREAD_STATE_YIELDED) {
-		/* no pre-checks now, assume a previous yield() has left things in
-		 * tip-top shape (longjmp handler will assert for these).
-		 */
-	} else {
-		DUK_ASSERT(thr_resume->state == DUK_HTHREAD_STATE_INACTIVE);
-
-		if ((thr_resume->callstack_top != 0) ||
-		    (thr_resume->valstack_top - thr_resume->valstack != 1)) {
-			goto state_invalid_initial;
-		}
-		tv = &thr_resume->valstack_top[-1];
-		DUK_ASSERT(tv >= thr_resume->valstack && tv < thr_resume->valstack_top);
-		if (!DUK_TVAL_IS_OBJECT(tv)) {
-			goto state_invalid_initial;
-		}
-		func = DUK_TVAL_GET_OBJECT(tv);
-		DUK_ASSERT(func != NULL);
-		if (!DUK_HOBJECT_IS_COMPILEDFUNCTION(func)) {
-			/* Note: cannot be a bound function either right now,
-			 * this would be easy to relax though.
-			 */
-			goto state_invalid_initial;
-		}
-
-	}
-
-	/*
-	 *  The error object has been augmented with a traceback and other
-	 *  info from its creation point -- usually another thread.  It might
-	 *  be nice to get a traceback from the resumee but this is not the
-	 *  case now.
-	 */
-
-#ifdef DUK_USE_DEBUG  /* debug logging */
-	if (is_error) {
-		DUK_DDDPRINT("RESUME ERROR: thread=%!T, value=%!T",
-		             duk_get_tval(ctx, 0),
-		             duk_get_tval(ctx, 1));
-	} else if (thr_resume->state == DUK_HTHREAD_STATE_YIELDED) {
-		DUK_DDDPRINT("RESUME NORMAL: thread=%!T, value=%!T",
-		             duk_get_tval(ctx, 0),
-		             duk_get_tval(ctx, 1));
-	} else {
-		DUK_DDDPRINT("RESUME INITIAL: thread=%!T, value=%!T",
-		             duk_get_tval(ctx, 0),
-		             duk_get_tval(ctx, 1));
-	}
-#endif
-
-	thr->heap->lj.type = DUK_LJ_TYPE_RESUME;
-
-	/* lj value2: thread */
-	DUK_ASSERT(thr->valstack_bottom < thr->valstack_top);
-	DUK_TVAL_SET_TVAL(&tv_tmp, &thr->heap->lj.value2);
-	DUK_TVAL_SET_TVAL(&thr->heap->lj.value2, &thr->valstack_bottom[0]);
-	DUK_TVAL_INCREF(thr, &thr->heap->lj.value2);
-	DUK_TVAL_DECREF(thr, &tv_tmp);
-
-	/* lj value1: value */
-	DUK_ASSERT(thr->valstack_bottom + 1 < thr->valstack_top);
-	DUK_TVAL_SET_TVAL(&tv_tmp, &thr->heap->lj.value1);
-	DUK_TVAL_SET_TVAL(&thr->heap->lj.value1, &thr->valstack_bottom[1]);
-	DUK_TVAL_INCREF(thr, &thr->heap->lj.value1);
-	DUK_TVAL_DECREF(thr, &tv_tmp);
-
-	thr->heap->lj.iserror = is_error;
-
-	DUK_ASSERT(thr->heap->lj.jmpbuf_ptr != NULL);  /* call is from executor, so we know we have a jmpbuf */
-	duk_err_longjmp(thr);  /* execution resumes in bytecode executor */
-	return 0;  /* never here */
-
- state_invalid_initial:
-	DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "invalid initial thread state/stack");
-	return 0;  /* never here */
-
- state_error:
-	DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "invalid state for resume");
-	return 0;  /* never here */
-}
-
-/*
- *  Yield the current thread.
- *
- *  The thread must be in yieldable state: it must have a resumer, and there
- *  must not be any yield-preventing calls (native calls and constructor calls,
- *  currently) in the thread's call stack (otherwise a resume would not be
- *  possible later).  This method must be called from an Ecmascript function.
- *
- *  Args:
- *    - value
- *    - isError (defaults to false)
- *
- *  Note: yield and resume handling is currently asymmetric.
- */
-
-int duk_builtin_duk_object_yield(duk_context *ctx) {
-	duk_hthread *thr = (duk_hthread *) ctx;
-	duk_tval tv_tmp;
-	int is_error;
-
-	DUK_DDDPRINT("__duk__.yield(): value=%!T, is_error=%!T",
-	             duk_get_tval(ctx, 0),
-	             duk_get_tval(ctx, 1));
-
-	DUK_ASSERT(thr->state == DUK_HTHREAD_STATE_RUNNING);
-	DUK_ASSERT(thr->heap->curr_thread == thr);
-
-	is_error = duk_to_boolean(ctx, 1);
-
-	/*
-	 *  Thread state and calling context checks
-	 */
-
-	if (!thr->resumer) {
-		DUK_DDPRINT("yield state invalid: current thread must have a resumer");
-		goto state_error;
-	}
-	DUK_ASSERT(thr->resumer->state == DUK_HTHREAD_STATE_RESUMED);
-
-	if (thr->callstack_top < 2) {
-		DUK_DDPRINT("yield state invalid: callstack should contain at least 2 entries (caller and __duk__.yield)");
-		goto state_error;
-	}
-	DUK_ASSERT((thr->callstack + thr->callstack_top - 1)->func != NULL);  /* us */
-	DUK_ASSERT(DUK_HOBJECT_IS_NATIVEFUNCTION((thr->callstack + thr->callstack_top - 1)->func));
-	DUK_ASSERT((thr->callstack + thr->callstack_top - 2)->func != NULL);  /* caller */
-
-	if (!DUK_HOBJECT_IS_COMPILEDFUNCTION((thr->callstack + thr->callstack_top - 2)->func)) {
-		DUK_DDPRINT("yield state invalid: caller must be Ecmascript code");
-		goto state_error;
-	}
-
-	DUK_ASSERT(thr->callstack_preventcount >= 1);  /* should never be zero, because we (__duk__.yield) are on the stack */
-	if (thr->callstack_preventcount != 1) {
-		/* Note: the only yield-preventing call is __duk__.yield(), hence check for 1, not 0 */
-		DUK_DDPRINT("yield state invalid: there must be no yield-preventing calls in current thread callstack (preventcount is %d)",
-		            thr->callstack_preventcount);
-		goto state_error;
-	}
-
-	/*
-	 *  The error object has been augmented with a traceback and other
-	 *  info from its creation point -- usually the current thread.
-	 */
-
-#ifdef DUK_USE_DEBUG
-	if (is_error) {
-		DUK_DDDPRINT("YIELD ERROR: value=%!T",
-		             duk_get_tval(ctx, 0));
-	} else {
-		DUK_DDDPRINT("YIELD NORMAL: value=%!T",
-		             duk_get_tval(ctx, 0));
-	}
-#endif
-
-	/*
-	 *  Process yield
-	 *
-	 *  After longjmp(), processing continues in bytecode executor longjmp
-	 *  handler, which will e.g. update thr->resumer to NULL.
-	 */
-
-	thr->heap->lj.type = DUK_LJ_TYPE_YIELD;
-
-	/* lj value1: value */
-	DUK_ASSERT(thr->valstack_bottom < thr->valstack_top);
-	DUK_TVAL_SET_TVAL(&tv_tmp, &thr->heap->lj.value1);
-	DUK_TVAL_SET_TVAL(&thr->heap->lj.value1, &thr->valstack_bottom[0]);
-	DUK_TVAL_INCREF(thr, &thr->heap->lj.value1);
-	DUK_TVAL_DECREF(thr, &tv_tmp);
-
-	thr->heap->lj.iserror = is_error;
-
-	DUK_ASSERT(thr->heap->lj.jmpbuf_ptr != NULL);  /* call is from executor, so we know we have a jmpbuf */
-	duk_err_longjmp(thr);  /* execution resumes in bytecode executor */
-	return 0;  /* never here */
-
- state_error:
-	DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "invalid state for yield");
-	return 0;  /* never here */
-}
-
-int duk_builtin_duk_object_curr(duk_context *ctx) {
-	duk_push_current_thread(ctx);
-	return 1;
-}
-
-int duk_builtin_duk_object_print(duk_context *ctx) {
-	return DUK_RET_UNIMPLEMENTED_ERROR;	/*FIXME*/
-}
-
+#if 0
 int duk_builtin_duk_object_time(duk_context *ctx) {
-	struct timeval tv;
-
-	memset(&tv, 0, sizeof(tv));
-	if (gettimeofday(&tv, NULL) != 0) {
-		return DUK_RET_ERROR;
-	}
-	duk_push_number(ctx, (double) tv.tv_sec + ((double) tv.tv_usec) / 1000000.0);
-	return 1;
+	return DUK_RET_UNIMPLEMENTED_ERROR;
 }
+int duk_builtin_duk_object_sleep(duk_context *ctx) {
+	return DUK_RET_UNIMPLEMENTED_ERROR;
+}
+#endif
 
 int duk_builtin_duk_object_enc(duk_context *ctx) {
 	duk_hthread *thr = (duk_hthread *) ctx;
@@ -14594,19 +16683,6 @@ int duk_builtin_duk_object_dec(duk_context *ctx) {
 		return DUK_RET_TYPE_ERROR;
 	}
 }
-
-int duk_builtin_duk_object_sleep(duk_context *ctx) {
-	struct timeval tv;
-	int msec;
-
-	/* FIXME: signal handling */
-	msec = duk_to_int(ctx, 0);
-	tv.tv_sec = msec / 1000;
-	tv.tv_usec = (msec % 1000) * 1000;
-	(void) select(0, NULL, NULL, NULL, &tv);
-	return 0;
-}
-
 #line 1 "duk_builtin_error.c"
 /*
  *  Error built-ins
@@ -14614,15 +16690,16 @@ int duk_builtin_duk_object_sleep(duk_context *ctx) {
 
 /* include removed: duk_internal.h */
 
-int duk_builtin_error_constructor(duk_context *ctx) {
+static int duk_error_constructor_helper(duk_context *ctx, int bidx_prototype) {
 	/* Behavior for constructor and non-constructor call is
 	 * exactly the same.
 	 */
 
-	duk_push_object_helper(ctx,
-	                       DUK_HOBJECT_FLAG_EXTENSIBLE |
-	                       DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_ERROR),
-	                       DUK_BIDX_ERROR_PROTOTYPE);
+	/* same for both error and each subclass like TypeError */
+	int flags_and_class = DUK_HOBJECT_FLAG_EXTENSIBLE |
+	                      DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_ERROR);
+	
+	duk_push_object_helper(ctx, flags_and_class, bidx_prototype);
 
 	if (!duk_is_undefined(ctx, 0)) {
 		duk_to_string(ctx, 0);
@@ -14633,28 +16710,32 @@ int duk_builtin_error_constructor(duk_context *ctx) {
 	return 1;
 }
 
+int duk_builtin_error_constructor(duk_context *ctx) {
+	return duk_error_constructor_helper(ctx, DUK_BIDX_ERROR_PROTOTYPE);
+}
+
 int duk_builtin_eval_error_constructor(duk_context *ctx) {
-	return DUK_RET_UNIMPLEMENTED_ERROR;
+	return duk_error_constructor_helper(ctx, DUK_BIDX_EVAL_ERROR_PROTOTYPE);
 }
 
 int duk_builtin_range_error_constructor(duk_context *ctx) {
-	return DUK_RET_UNIMPLEMENTED_ERROR;
+	return duk_error_constructor_helper(ctx, DUK_BIDX_RANGE_ERROR_PROTOTYPE);
 }
 
 int duk_builtin_reference_error_constructor(duk_context *ctx) {
-	return DUK_RET_UNIMPLEMENTED_ERROR;
+	return duk_error_constructor_helper(ctx, DUK_BIDX_REFERENCE_ERROR_PROTOTYPE);
 }
 
 int duk_builtin_syntax_error_constructor(duk_context *ctx) {
-	return DUK_RET_UNIMPLEMENTED_ERROR;
+	return duk_error_constructor_helper(ctx, DUK_BIDX_SYNTAX_ERROR_PROTOTYPE);
 }
 
 int duk_builtin_type_error_constructor(duk_context *ctx) {
-	return DUK_RET_UNIMPLEMENTED_ERROR;
+	return duk_error_constructor_helper(ctx, DUK_BIDX_TYPE_ERROR_PROTOTYPE);
 }
 
 int duk_builtin_uri_error_constructor(duk_context *ctx) {
-	return DUK_RET_UNIMPLEMENTED_ERROR;
+	return duk_error_constructor_helper(ctx, DUK_BIDX_URI_ERROR_PROTOTYPE);
 }
 
 int duk_builtin_error_prototype_to_string(duk_context *ctx) {
@@ -14710,6 +16791,237 @@ int duk_builtin_error_prototype_to_string(duk_context *ctx) {
 	return DUK_RET_TYPE_ERROR;
 }
 
+#ifdef DUK_USE_TRACEBACKS
+
+/*
+ *  Traceback handling
+ *
+ *  The unified helper decodes the traceback and produces various requested
+ *  outputs.  It should be optimized for size, and may leave garbage on stack,
+ *  only the topmost return value matters.  For instance, traceback separator
+ *  and decoded strings are pushed even when looking for filename only.
+ */
+
+/* constants arbitrary, chosen for small loads */
+#define  DUK__OUTPUT_TYPE_TRACEBACK   -1
+#define  DUK__OUTPUT_TYPE_FILENAME    0
+#define  DUK__OUTPUT_TYPE_LINENUMBER  1
+
+static int traceback_getter_helper(duk_context *ctx, int output_type) {
+	duk_hthread *thr = (duk_hthread *) ctx;
+	int idx_td;
+	int i;
+	const char *str_tailcalled = " tailcalled";
+	const char *str_strict = " strict";
+	const char *str_construct = " construct";
+	const char *str_prevyield = " preventsyield";
+	const char *str_directeval = " directeval";
+	const char *str_empty = "";
+
+	DUK_ASSERT_TOP(ctx, 0);  /* fixed arg count */
+
+	duk_push_this(ctx);
+	duk_get_prop_stridx(ctx, -1, DUK_STRIDX_TRACEDATA);
+	idx_td = duk_get_top_index(ctx);
+
+	duk_push_hstring_stridx(ctx, DUK_STRIDX_NEWLINE_TAB);
+	duk_push_this(ctx);
+	duk_to_string(ctx, -1);
+
+	/* [ ... this tracedata sep ToString(this) ] */
+
+	/* FIXME: skip null filename? */
+
+	if (duk_check_type(ctx, idx_td, DUK_TYPE_OBJECT)) {
+		int t;
+
+		/* Current tracedata contains 2 entries per callstack entry. */
+		for (i = 0; ; i += 2) {
+			int pc;
+			int line;
+			int flags;
+			double d;
+			const char *funcname;
+			duk_hobject *h_func;
+			duk_hstring *h_name;
+			duk_hbuffer_fixed *pc2line;
+
+			duk_require_stack(ctx, 5);
+			duk_get_prop_index(ctx, idx_td, i);
+			duk_get_prop_index(ctx, idx_td, i + 1);
+			d = duk_to_number(ctx, -1);
+			pc = (int) fmod(d, DUK_DOUBLE_2TO32);
+			flags = (int) floor(d / DUK_DOUBLE_2TO32);
+			t = duk_get_type(ctx, -2);
+
+			if (t == DUK_TYPE_OBJECT) {
+				/*
+				 *  Ecmascript/native function call
+				 */
+
+				/* [ ... v1(func) v2(pc+flags) ] */
+
+				h_func = duk_get_hobject(ctx, -2);
+				DUK_ASSERT(h_func != NULL);
+
+				duk_get_prop_stridx(ctx, -2, DUK_STRIDX_NAME);
+				duk_get_prop_stridx(ctx, -3, DUK_STRIDX_FILE_NAME);
+
+				duk_get_prop_stridx(ctx, -4, DUK_STRIDX_INT_PC2LINE);
+				if (duk_is_buffer(ctx, -1)) {
+					pc2line = (duk_hbuffer_fixed *) duk_get_hbuffer(ctx, -1);
+					DUK_ASSERT(!DUK_HBUFFER_HAS_DYNAMIC(pc2line));
+					line = duk_hobject_pc2line_query(pc2line, pc);
+				} else {
+					line = 0;
+				}
+				duk_pop(ctx);
+
+				/* [ ... v1 v2 name filename ] */
+
+				if (output_type == DUK__OUTPUT_TYPE_FILENAME) {
+					return 1;
+				} else if (output_type == DUK__OUTPUT_TYPE_LINENUMBER) {
+					duk_push_int(ctx, line);
+					return 1;
+				}
+
+				h_name = duk_get_hstring(ctx, -2);  /* may be NULL */
+				funcname = (h_name == NULL || h_name == DUK_HTHREAD_STRING_EMPTY_STRING(thr)) ?
+				           "anon" : (const char *) DUK_HSTRING_GET_DATA(h_name);
+				if (DUK_HOBJECT_HAS_NATIVEFUNCTION(h_func)) {
+					duk_push_sprintf(ctx, "%s %s native%s%s%s%s%s",
+					                 funcname,
+					                 duk_get_string(ctx, -1),
+					                 (flags & DUK_ACT_FLAG_STRICT) ? str_strict : str_empty,
+					                 (flags & DUK_ACT_FLAG_TAILCALLED) ? str_tailcalled : str_empty,
+					                 (flags & DUK_ACT_FLAG_CONSTRUCT) ? str_construct : str_empty,
+					                 (flags & DUK_ACT_FLAG_DIRECT_EVAL) ? str_directeval : str_empty,
+					                 (flags & DUK_ACT_FLAG_PREVENT_YIELD) ? str_prevyield : str_empty);
+
+				} else {
+					duk_push_sprintf(ctx, "%s %s:%d%s%s%s%s%s",
+					                 funcname,
+					                 duk_get_string(ctx, -1),
+					                 line,
+					                 (flags & DUK_ACT_FLAG_STRICT) ? str_strict : str_empty,
+					                 (flags & DUK_ACT_FLAG_TAILCALLED) ? str_tailcalled : str_empty,
+					                 (flags & DUK_ACT_FLAG_CONSTRUCT) ? str_construct : str_empty,
+					                 (flags & DUK_ACT_FLAG_DIRECT_EVAL) ? str_directeval : str_empty,
+					                 (flags & DUK_ACT_FLAG_PREVENT_YIELD) ? str_prevyield : str_empty);
+				}
+				duk_replace(ctx, -5);   /* [ ... v1 v2 name filename str ] -> [ ... str v2 name filename ] */
+				duk_pop_n(ctx, 3);      /* -> [ ... str ] */
+			} else if (t == DUK_TYPE_STRING) {
+				/*
+				 *  __FILE__ / __LINE__ entry, here 'pc' is line number directly.
+				 *
+				 *  FIXME: add a flag to indicate whether the __FILE__ / __LINE__
+				 *  should be returned as the error's fileName / lineNumber?  If
+				 *  __FILE__ / __LINE__ is recorded from the Duktape API return
+				 *  it as fileName / lineNumber.  If recorded from inside Duktape,
+				 *  ignore it as the fileName / lineNumber (except perhaps when it
+				 *  is the last traceback entry)?
+				 */
+
+				/* [ ... v1(filename) v2(line+flags) ] */
+
+				if (output_type == DUK__OUTPUT_TYPE_FILENAME) {
+					duk_pop(ctx);
+					return 1;
+				} else if (output_type == DUK__OUTPUT_TYPE_LINENUMBER) {
+					duk_push_int(ctx, pc);
+					return 1;
+				}
+
+				duk_push_sprintf(ctx, "%s:%d",
+				                      duk_get_string(ctx, -2), pc);
+				duk_replace(ctx, -3);  /* [ ... v1 v2 str ] -> [ ... str v2 ] */
+				duk_pop(ctx);          /* -> [ ... str ] */
+			} else {
+				/* unknown, ignore */
+				duk_pop_2(ctx);
+				break;
+			}
+		}
+
+		if (i >= DUK_OPT_TRACEBACK_DEPTH * 2) {
+			/* Possibly truncated; there is no explicit truncation
+			 * marker so this is the best we can do.
+			 */
+
+			duk_push_hstring_stridx(ctx, DUK_STRIDX_BRACKETED_ELLIPSIS);
+		}
+	}
+
+	/* [ ... this tracedata sep ToString(this) str1 ... strN ] */
+
+	if (output_type != DUK__OUTPUT_TYPE_TRACEBACK) {
+		return 0;
+	} else {
+		duk_join(ctx, duk_get_top(ctx) - (idx_td + 2) /*count, not including sep*/);
+		return 1;
+	}
+}
+
+/* FIXME: output type could be encoded into native function 'magic' value to
+ * save space.
+ */
+
+int duk_builtin_error_prototype_stack_getter(duk_context *ctx) {
+	return traceback_getter_helper(ctx, DUK__OUTPUT_TYPE_TRACEBACK);
+}
+
+int duk_builtin_error_prototype_filename_getter(duk_context *ctx) {
+	return traceback_getter_helper(ctx, DUK__OUTPUT_TYPE_FILENAME);
+}
+
+int duk_builtin_error_prototype_linenumber_getter(duk_context *ctx) {
+	return traceback_getter_helper(ctx, DUK__OUTPUT_TYPE_LINENUMBER);
+}
+
+#undef  DUK__OUTPUT_TYPE_TRACEBACK
+#undef  DUK__OUTPUT_TYPE_FILENAME
+#undef  DUK__OUTPUT_TYPE_LINENUMBER
+
+#else  /* DUK_USE_TRACEBACKS */
+
+/*
+ *  Traceback handling when tracebacks disabled.
+ *
+ *  The fileName / lineNumber stubs are now necessary because built-in
+ *  data will include the accessor properties in Error.prototype.  If those
+ *  are removed for builds without tracebacks, these can also be removed.
+ *  'stack' should still be present and produce a ToString() equivalent:
+ *  this is useful for user code which prints a stacktrace and expects to
+ *  see something useful.  A normal stacktrace also begins with a ToString()
+ *  of the error so this makes sense.
+ */
+
+int duk_builtin_error_prototype_stack_getter(duk_context *ctx) {
+	/* FIXME: remove this native function and map 'stack' accessor
+	 * to the toString() implementation directly.
+	 */
+	return duk_builtin_error_prototype_to_string(ctx);
+}
+
+int duk_builtin_error_prototype_filename_getter(duk_context *ctx) {
+	return 0;
+}
+
+int duk_builtin_error_prototype_linenumber_getter(duk_context *ctx) {
+	return 0;
+}
+
+#endif  /* DUK_USE_TRACEBACKS */
+
+int duk_builtin_error_prototype_nop_setter(duk_context *ctx) {
+	/* Attempt to write 'stack', 'fileName', 'lineNumber' is a silent no-op.
+	 * User can use Object.defineProperty() to override this behavior.
+	 */
+	DUK_ASSERT_TOP(ctx, 1);  /* fixed arg count */
+	return 0;
+}
 #line 1 "duk_builtin_function.c"
 /*
  *  Function built-ins
@@ -14767,6 +17079,7 @@ int duk_builtin_function_constructor(duk_context *ctx) {
 	/* strictness is not inherited, intentional */
 	comp_flags = DUK_JS_COMPILE_FLAG_FUNCEXPR;
 
+	duk_push_hstring_stridx(ctx, DUK_STRIDX_COMPILE);  /* XXX: copy from caller? */
 	duk_js_compile(thr, comp_flags);
 	func = (duk_hcompiledfunction *) duk_get_hobject(ctx, -1);
 	DUK_ASSERT(func != NULL);
@@ -15435,6 +17748,7 @@ int duk_builtin_global_object_eval(duk_context *ctx) {
 		comp_flags |= DUK_JS_COMPILE_FLAG_STRICT;
 	}
 
+	duk_push_hstring_stridx(ctx, DUK_STRIDX_INPUT);  /* XXX: copy from caller? */
 	duk_js_compile(thr, comp_flags);
 	func = (duk_hcompiledfunction *) duk_get_hobject(ctx, -1);
 	DUK_ASSERT(func != NULL);
@@ -15598,13 +17912,13 @@ int duk_builtin_global_object_parse_float(duk_context *ctx) {
  */
 int duk_builtin_global_object_is_nan(duk_context *ctx) {
 	double d = duk_to_number(ctx, 0);
-	duk_push_boolean(ctx, isnan(d));
+	duk_push_boolean(ctx, DUK_ISNAN(d));
 	return 1;
 }
 
 int duk_builtin_global_object_is_finite(duk_context *ctx) {
 	double d = duk_to_number(ctx, 0);
-	duk_push_boolean(ctx, isfinite(d));
+	duk_push_boolean(ctx, DUK_ISFINITE(d));
 	return 1;
 }
 
@@ -15655,7 +17969,7 @@ static int print_alert_helper(duk_context *ctx, FILE *f_out) {
 	if (nargs == 1 && duk_is_buffer(ctx, 0)) {
 		const char *buf = NULL;
 		size_t sz = 0;
-		buf = duk_get_buffer(ctx, 0, &sz);
+		buf = (const char *) duk_get_buffer(ctx, 0, &sz);
 		if (buf && sz > 0) {
 			fwrite(buf, 1, sz, f_out);
 		}
@@ -15731,7 +18045,7 @@ static void json_dec_reviver_walk(duk_json_dec_ctx *js_ctx);
 
 static void json_emit_1(duk_json_enc_ctx *js_ctx, char ch);
 static void json_emit_2(duk_json_enc_ctx *js_ctx, int chars);
-static void json_emit_esc(duk_json_enc_ctx *js_ctx, duk_u32 cp, char *esc_str, int digits);
+static void json_emit_esc(duk_json_enc_ctx *js_ctx, duk_u32 cp, const char *esc_str, int digits);
 static void json_emit_esc16(duk_json_enc_ctx *js_ctx, duk_u32 cp);
 static void json_emit_esc32(duk_json_enc_ctx *js_ctx, duk_u32 cp);
 static void json_emit_xutf8(duk_json_enc_ctx *js_ctx, duk_u32 cp);
@@ -16333,7 +18647,7 @@ static void json_emit_2(duk_json_enc_ctx *js_ctx, int chars) {
 	duk_hbuffer_append_bytes(js_ctx->thr, js_ctx->h_buf, (duk_u8 *) buf, 2);
 }
 
-static void json_emit_esc(duk_json_enc_ctx *js_ctx, duk_u32 cp, char *esc_str, int digits) {
+static void json_emit_esc(duk_json_enc_ctx *js_ctx, duk_u32 cp, const char *esc_str, int digits) {
 	int dig;
 
 	duk_hbuffer_append_cstring(js_ctx->thr, js_ctx->h_buf, esc_str);
@@ -16844,7 +19158,7 @@ static int json_enc_value1(duk_json_enc_ctx *js_ctx, int idx_holder) {
 	tv = duk_get_tval(ctx, -1);
 	DUK_ASSERT(tv != NULL);
 
-	if (duk_get_type_mask(ctx, -1) & js_ctx->mask_for_undefined) {
+	if (duk_check_type_mask(ctx, -1, js_ctx->mask_for_undefined)) {
 		/* will result in undefined */
 		DUK_DDDPRINT("-> will result in undefined (type mask check)");
 		goto undef;
@@ -16912,14 +19226,14 @@ static void json_enc_value2(duk_json_enc_ctx *js_ctx) {
 		const char *fmt;
 
 		/* FIXME: NULL results in '((nil))' now */
-		memset(buf, 0, sizeof(buf));
+		DUK_MEMSET(buf, 0, sizeof(buf));
 		if (js_ctx->flag_ext_custom) {
 			fmt = "(%p)";
 		} else {
 			DUK_ASSERT(js_ctx->flag_ext_compatible);
 			fmt = "{\"_ptr\":\"(%p)\"}";
 		}
-		snprintf(buf, sizeof(buf) - 1, fmt, (void *) DUK_TVAL_GET_POINTER(tv));
+		DUK_SNPRINTF(buf, sizeof(buf) - 1, fmt, (void *) DUK_TVAL_GET_POINTER(tv));
 		EMIT_CSTR(js_ctx, buf);
 		break;
 	}
@@ -16992,11 +19306,11 @@ static void json_enc_value2(duk_json_enc_ctx *js_ctx) {
 		DUK_ASSERT(DUK_TVAL_IS_NUMBER(tv));
 
 		d = DUK_TVAL_GET_NUMBER(tv);
-		c = fpclassify(d);
-		s = signbit(d);
+		c = DUK_FPCLASSIFY(d);
+		s = DUK_SIGNBIT(d);
 
-		if (!(c == FP_INFINITE || c == FP_NAN)) {
-			DUK_ASSERT(isfinite(d));
+		if (!(c == DUK_FP_INFINITE || c == DUK_FP_NAN)) {
+			DUK_ASSERT(DUK_ISFINITE(d));
 			n2s_flags = 0;
 			/* [ ... number ] -> [ ... string ] */
 			duk_numconv_stringify(ctx, 10 /*radix*/, 0 /*digits*/, n2s_flags);
@@ -17011,7 +19325,7 @@ static void json_enc_value2(duk_json_enc_ctx *js_ctx) {
 		if (!(js_ctx->flags & (DUK_JSON_ENC_FLAG_EXT_CUSTOM |
 		                       DUK_JSON_ENC_FLAG_EXT_COMPATIBLE))) {
 			stridx = DUK_STRIDX_NULL;
-		} else if (c == FP_NAN) {
+		} else if (c == DUK_FP_NAN) {
 			stridx = js_ctx->stridx_custom_nan;
 		} else if (s == 0) {
 			stridx = js_ctx->stridx_custom_neginf;
@@ -17068,7 +19382,7 @@ void duk_builtin_json_parse_helper(duk_context *ctx,
 	             duk_get_tval(ctx, idx_value), duk_get_tval(ctx, idx_reviver),
 	             flags, duk_get_top(ctx));
 
-	memset(&js_ctx_alloc, 0, sizeof(js_ctx_alloc));
+	DUK_MEMSET(&js_ctx_alloc, 0, sizeof(js_ctx_alloc));
 	js_ctx->thr = thr;
 #ifdef DUK_USE_EXPLICIT_NULL_INIT
 	/* nothing now */
@@ -17148,7 +19462,7 @@ void duk_builtin_json_stringify_helper(duk_context *ctx,
 	 *  Context init
 	 */
 
-	memset(&js_ctx_alloc, 0, sizeof(js_ctx_alloc));
+	DUK_MEMSET(&js_ctx_alloc, 0, sizeof(js_ctx_alloc));
 	js_ctx->thr = thr;
 #ifdef DUK_USE_EXPLICIT_NULL_INIT
 	js_ctx->h_replacer = NULL;
@@ -17427,21 +19741,20 @@ static int math_minmax(duk_context *ctx, double initial, two_arg_func min_max) {
 
 	/*
 	 *  Note: fmax() does not match the E5 semantics.  E5 requires
-	 *  that if -any- input to Math.max() is a NAN, the result is a
-	 *  NaN.  fmax() will return a NAN only if -both- inputs are NaN.
+	 *  that if -any- input to Math.max() is a NaN, the result is a
+	 *  NaN.  fmax() will return a NaN only if -both- inputs are NaN.
 	 *  Same applies to fmin().
 	 *
 	 *  Note: every input value must be coerced with ToNumber(), even
-	 *  if we know the result will be a NAN anyway: ToNumber() may have
+	 *  if we know the result will be a NaN anyway: ToNumber() may have
 	 *  side effects for which even order of evaluation matters.
 	 */
 
 	for (i = 0; i < n; i++) {
 		t = duk_to_number(ctx, i);
-		if (fpclassify(t) == FP_NAN || fpclassify(res) == FP_NAN) {
+		if (DUK_FPCLASSIFY(t) == DUK_FP_NAN || DUK_FPCLASSIFY(res) == DUK_FP_NAN) {
 			/* Note: not normalized, but duk_push_number() will normalize */
-			/* FIXME: best constant for NAN? */
-			res = NAN;
+			res = DUK_DOUBLE_NAN;
 		} else {
 			res = min_max(res, t);
 		}
@@ -17457,7 +19770,7 @@ static double fmin_fixed(double x, double y) {
 	 */
 	if (x == 0 && y == 0) {
 		/* XXX: what's the safest way of creating a negative zero? */
-		if (signbit(x) != 0 || signbit(y) != 0) {
+		if (DUK_SIGNBIT(x) != 0 || DUK_SIGNBIT(y) != 0) {
 			return -0.0;
 		} else {
 			return +0.0;
@@ -17475,7 +19788,7 @@ static double fmax_fixed(double x, double y) {
 	 * +0 as Ecmascript requires.
 	 */
 	if (x == 0 && y == 0) {
-		if (signbit(x) == 0 || signbit(y) == 0) {
+		if (DUK_SIGNBIT(x) == 0 || DUK_SIGNBIT(y) == 0) {
 			return +0.0;
 		} else {
 			return -0.0;
@@ -17497,8 +19810,8 @@ static double round_fixed(double x) {
 	 * which is incorrect for negative values.  Here we make do with floor().
 	 */
 
-	int c = fpclassify(x);
-	if (c == FP_NAN || c == FP_INFINITE || c == FP_ZERO) {
+	int c = DUK_FPCLASSIFY(x);
+	if (c == DUK_FP_NAN || c == DUK_FP_INFINITE || c == DUK_FP_ZERO) {
 		return x;
 	}
 
@@ -17538,19 +19851,19 @@ static double pow_fixed(double x, double y) {
 
 	int cy;
 
-	cy = fpclassify(y);
+	cy = DUK_FPCLASSIFY(y);
 
-	if (cy == FP_NAN) {
+	if (cy == DUK_FP_NAN) {
 		goto ret_nan;
 	}
-	if (fabs(x) == 1.0 && cy == FP_INFINITE) {
+	if (fabs(x) == 1.0 && cy == DUK_FP_INFINITE) {
 		goto ret_nan;
 	}
 
 	return pow(x, y);
 
  ret_nan:
-	return NAN;
+	return DUK_DOUBLE_NAN;
 }
 
 int duk_builtin_math_object_abs(duk_context *ctx) {
@@ -17594,13 +19907,11 @@ int duk_builtin_math_object_log(duk_context *ctx) {
 }
 
 int duk_builtin_math_object_max(duk_context *ctx) {
-	/* FIXME: compile warning here on gcc-4.0, floating constant exceeds range of 'float' */
-	return math_minmax(ctx, -((double) INFINITY), fmax_fixed);
+	return math_minmax(ctx, -DUK_DOUBLE_INFINITY, fmax_fixed);
 }
 
 int duk_builtin_math_object_min(duk_context *ctx) {
-	/* FIXME: compile warning here on gcc-4.0, floating constant exceeds range of 'float' */
-	return math_minmax(ctx, (double) INFINITY, fmin_fixed);
+	return math_minmax(ctx, DUK_DOUBLE_INFINITY, fmin_fixed);
 }
 
 int duk_builtin_math_object_pow(duk_context *ctx) {
@@ -17765,8 +20076,8 @@ int duk_builtin_number_prototype_to_fixed(duk_context *ctx) {
 	frac_digits = duk_to_int_check_range(ctx, 0, 0, 20);
 	d = push_this_number_plain(ctx);
 
-	c = fpclassify(d);
-	if (c == FP_NAN || c == FP_INFINITE) {
+	c = DUK_FPCLASSIFY(d);
+	if (c == DUK_FP_NAN || c == DUK_FP_INFINITE) {
 		goto use_to_string;
 	}
 
@@ -17801,8 +20112,8 @@ int duk_builtin_number_prototype_to_exponential(duk_context *ctx) {
 	frac_undefined = duk_is_undefined(ctx, 0);
 	duk_to_int(ctx, 0);  /* for side effects */
 
-	c = fpclassify(d);
-	if (c == FP_NAN || c == FP_INFINITE) {
+	c = DUK_FPCLASSIFY(d);
+	if (c == DUK_FP_NAN || c == DUK_FP_INFINITE) {
 		goto use_to_string;
 	}
 
@@ -17844,8 +20155,8 @@ int duk_builtin_number_prototype_to_precision(duk_context *ctx) {
 
 	duk_to_int(ctx, 0);  /* for side effects */
 
-	c = fpclassify(d);
-	if (c == FP_NAN || c == FP_INFINITE) {
+	c = DUK_FPCLASSIFY(d);
+	if (c == DUK_FP_NAN || c == DUK_FP_INFINITE) {
 		goto use_to_string;
 	}
 
@@ -17888,8 +20199,9 @@ int duk_builtin_object_constructor(duk_context *ctx) {
 		return 1;
 	}
 
-	if (duk_get_type_mask(ctx, 0) &
-	    (DUK_TYPE_MASK_STRING | DUK_TYPE_MASK_BOOLEAN | DUK_TYPE_MASK_NUMBER)) {
+	if (duk_check_type_mask(ctx, 0, DUK_TYPE_MASK_STRING |
+	                                DUK_TYPE_MASK_BOOLEAN |
+	                                DUK_TYPE_MASK_NUMBER)) {
 		duk_to_object(ctx, 0);
 		return 1;
 	}
@@ -18147,6 +20459,85 @@ int duk_builtin_object_prototype_has_own_property(duk_context *ctx) {
 
 int duk_builtin_object_prototype_property_is_enumerable(duk_context *ctx) {
 	return duk_hobject_object_ownprop_helper(ctx, DUK_PROPDESC_FLAG_ENUMERABLE /*required_desc_flags*/);
+}
+
+#line 1 "duk_builtin_pointer.c"
+/*
+ *  Buffer built-ins
+ */
+
+/* include removed: duk_internal.h */
+
+/*
+ *  Constructor
+ */
+
+int duk_builtin_buffer_constructor(duk_context *ctx) {
+	if (duk_get_top(ctx) == 0) {
+		(void) duk_push_fixed_buffer(ctx, 0);
+	} else {
+		duk_to_buffer(ctx, 0, NULL);
+	}
+	DUK_ASSERT(duk_is_buffer(ctx, 0));
+	duk_set_top(ctx, 1);
+
+	if (duk_is_constructor_call(ctx)) {
+		duk_push_object_helper(ctx,
+		                       DUK_HOBJECT_FLAG_EXTENSIBLE |
+		                       DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_BUFFER),
+		                       DUK_BIDX_BUFFER_PROTOTYPE);
+
+		/* Buffer object internal value is immutable */
+		duk_dup(ctx, 0);
+		duk_def_prop_stridx(ctx, -2, DUK_STRIDX_INT_VALUE, DUK_PROPDESC_FLAGS_NONE);
+	}
+	/* Note: unbalanced stack on purpose */
+
+	return 1;
+}
+
+/*
+ *  toString(), valueOf()
+ */
+
+static int pointer_tostring_valueof_helper(duk_context *ctx, int to_string) {
+	duk_tval *tv;
+
+	duk_push_this(ctx);
+	tv = duk_require_tval(ctx, -1);
+	DUK_ASSERT(tv != NULL);
+
+	if (DUK_TVAL_IS_BUFFER(tv)) {
+		/* nop */
+	} else if (DUK_TVAL_IS_OBJECT(tv)) {
+		duk_hobject *h = DUK_TVAL_GET_OBJECT(tv);
+		DUK_ASSERT(h != NULL);
+
+		/* Must be a "buffer object", i.e. class "Buffer" */
+		if (DUK_HOBJECT_GET_CLASS_NUMBER(h) != DUK_HOBJECT_CLASS_BUFFER) {
+			goto type_error;
+		}
+
+		duk_get_prop_stridx(ctx, -1, DUK_STRIDX_INT_VALUE);
+	} else {
+		goto type_error;
+	}
+
+	if (to_string) {
+		duk_to_string(ctx, -1);
+	}
+	return 1;
+
+ type_error:
+	return DUK_RET_TYPE_ERROR;
+}
+
+int duk_builtin_buffer_prototype_to_string(duk_context *ctx) {
+	return pointer_tostring_valueof_helper(ctx, 1);
+}
+
+int duk_builtin_buffer_prototype_value_of(duk_context *ctx) {
+	return pointer_tostring_valueof_helper(ctx, 0);
 }
 
 #line 1 "duk_builtin_regexp.c"
@@ -18485,7 +20876,7 @@ int duk_builtin_string_prototype_char_code_at(duk_context *ctx) {
 	                             DUK_HSTRING_GET_CHARLEN(h) - 1 /*max(incl*/,
 	                             &clamped /*clamped*/);
 	if (clamped) {
-		duk_push_number(ctx, NAN);  /* FIXME: best constant for NAN? */
+		duk_push_number(ctx, DUK_DOUBLE_NAN);
 		return 1;
 	}
 
@@ -18741,7 +21132,7 @@ static int string_indexof_helper(duk_context *ctx, int is_lastindexof) {
 
 		if ((t == firstbyte) && ((p_end - p) >= q_blen)) {
 			DUK_ASSERT(q_blen > 0);  /* no issues with memcmp() zero size, even if broken */
-			if (memcmp(p, q_start, q_blen) == 0) {
+			if (DUK_MEMCMP(p, q_start, q_blen) == 0) {
 				duk_push_int(ctx, cpos);
 				return 1;
 			}
@@ -18942,11 +21333,8 @@ int duk_builtin_string_prototype_replace(duk_context *ctx) {
 			match_start_coff = 0;
 
 			while (p <= p_end) {
-				/* FIXME: wrapped utility memcmp() which is guaranteed to work
-				 * even if byte count is zero?
-				 */
 				DUK_ASSERT(p + q_blen <= DUK_HSTRING_GET_DATA(h_input) + DUK_HSTRING_GET_BYTELEN(h_input));
-				if (memcmp((void *) p, (void *) q_start, (size_t) q_blen) == 0) {
+				if (DUK_MEMCMP((void *) p, (void *) q_start, (size_t) q_blen) == 0) {
 					duk_dup(ctx, 0);
 					h_match = duk_get_hstring(ctx, -1);
 					DUK_ASSERT(h_match != NULL);
@@ -19223,7 +21611,7 @@ int duk_builtin_string_prototype_split(duk_context *ctx) {
 		if (is_regexp) {
 			duk_dup(ctx, 0);
 			duk_dup(ctx, 2);
-			duk_regexp_match_force_global(ctx);  /* [ ... regexp input ] -> [ res_obj ] */
+			duk_regexp_match_force_global(thr);  /* [ ... regexp input ] -> [ res_obj ] */
 			if (!duk_is_object(ctx, -1)) {
 				duk_pop(ctx);
 				break;
@@ -19300,7 +21688,7 @@ int duk_builtin_string_prototype_split(duk_context *ctx) {
 			while (p <= p_end) {
 				DUK_ASSERT(p + q_blen <= DUK_HSTRING_GET_DATA(h_input) + DUK_HSTRING_GET_BYTELEN(h_input));
 				DUK_ASSERT(q_blen > 0);  /* no issues with empty memcmp() */
-				if (memcmp((void *) p, (void *) q_start, (size_t) q_blen) == 0) {
+				if (DUK_MEMCMP((void *) p, (void *) q_start, (size_t) q_blen) == 0) {
 					/* never an empty match, so step 13.c.iii can't be triggered */
 					goto found;
 				}
@@ -19594,6 +21982,7 @@ int duk_builtin_string_prototype_locale_compare(duk_context *ctx) {
 	h2_len = DUK_HSTRING_GET_BYTELEN(h2);
 	prefix_len = (h1_len <= h2_len ? h1_len : h2_len);
 
+	/* FIXME: this special case can be removed now with DUK_MEMCMP */
 	/* memcmp() should return zero (equal) for zero length, but avoid
 	 * it because there are some platform specific bugs.  Don't use
 	 * strncmp() because it stops comparing at a NUL.
@@ -19603,9 +21992,9 @@ int duk_builtin_string_prototype_locale_compare(duk_context *ctx) {
 		rc = 0;
 		goto skip_memcmp;
 	}
-	rc = memcmp((const char *) DUK_HSTRING_GET_DATA(h1),
-	            (const char *) DUK_HSTRING_GET_DATA(h2),
-	            prefix_len);
+	rc = DUK_MEMCMP((const char *) DUK_HSTRING_GET_DATA(h1),
+	                (const char *) DUK_HSTRING_GET_DATA(h2),
+	                prefix_len);
  skip_memcmp:
 
 	if (rc < 0) {
@@ -19639,10 +22028,284 @@ int duk_builtin_string_prototype_locale_compare(duk_context *ctx) {
 
 /* include removed: duk_internal.h */
 
-int duk_builtin_thread_prototype_to_string(duk_context *ctx) {
-	/* FIXME: what to print, something special or just [object Object]? */
-	/* FIXME: state */
-	duk_push_sprintf(ctx, "[object Thread]");
+/*
+ *  Constructor
+ */
+
+int duk_builtin_thread_constructor(duk_context *ctx) {
+	duk_hthread *new_thr;
+	duk_hobject *func;
+
+	if (!duk_is_callable(ctx, 0)) {
+		return DUK_RET_TYPE_ERROR;
+	}
+	func = duk_get_hobject(ctx, 0);
+	DUK_ASSERT(func != NULL);
+
+	duk_push_thread(ctx);
+	new_thr = (duk_hthread *) duk_get_hobject(ctx, -1);
+	DUK_ASSERT(new_thr != NULL);
+	new_thr->state = DUK_HTHREAD_STATE_INACTIVE;
+
+	/* push initial function call to new thread stack; this is
+	 * picked up by resume().
+	 */
+	duk_push_hobject((duk_context *) new_thr, func);
+
+	return 1;  /* return thread */
+}
+
+/*
+ *  Resume a thread.
+ *
+ *  The thread must be in resumable state, either (a) new thread which hasn't
+ *  yet started, or (b) a thread which has previously yielded.  This method
+ *  must be called from an Ecmascript function.
+ *
+ *  Args:
+ *    - thread
+ *    - value
+ *    - isError (defaults to false)
+ *
+ *  Note: yield and resume handling is currently asymmetric.
+ */
+
+int duk_builtin_thread_resume(duk_context *ctx) {
+	duk_hthread *thr = (duk_hthread *) ctx;
+	duk_hthread *thr_resume;
+	duk_tval tv_tmp;
+	duk_tval *tv;
+	duk_hobject *func;
+	int is_error;
+
+	DUK_DDDPRINT("__duk__.Thread.resume(): thread=%!T, value=%!T, is_error=%!T",
+	             duk_get_tval(ctx, 0),
+	             duk_get_tval(ctx, 1),
+	             duk_get_tval(ctx, 2));
+
+	DUK_ASSERT(thr->state == DUK_HTHREAD_STATE_RUNNING);
+	DUK_ASSERT(thr->heap->curr_thread == thr);
+
+	thr_resume = duk_require_hthread(ctx, 0);
+	is_error = duk_to_boolean(ctx, 2);
+
+	/*
+	 *  Thread state and calling context checks
+	 */
+
+	if (thr->callstack_top < 2) {
+		DUK_DDPRINT("resume state invalid: callstack should contain at least 2 entries (caller and __duk__.Thread.resume)");
+		goto state_error;
+	}
+	DUK_ASSERT((thr->callstack + thr->callstack_top - 1)->func != NULL);  /* us */
+	DUK_ASSERT(DUK_HOBJECT_IS_NATIVEFUNCTION((thr->callstack + thr->callstack_top - 1)->func));
+	DUK_ASSERT((thr->callstack + thr->callstack_top - 2)->func != NULL);  /* caller */
+
+	if (!DUK_HOBJECT_IS_COMPILEDFUNCTION((thr->callstack + thr->callstack_top - 2)->func)) {
+		DUK_DDPRINT("resume state invalid: caller must be Ecmascript code");
+		goto state_error;
+	}
+
+	/* Note: there is no requirement that: 'thr->callstack_preventcount == 1'
+	 * like for yield.
+	 */
+
+	if (thr_resume->state != DUK_HTHREAD_STATE_INACTIVE &&
+	    thr_resume->state != DUK_HTHREAD_STATE_YIELDED) {
+		DUK_DDPRINT("resume state invalid: target thread must be INACTIVE or YIELDED");
+		goto state_error;
+	}
+
+	DUK_ASSERT(thr_resume->state == DUK_HTHREAD_STATE_INACTIVE ||
+	           thr_resume->state == DUK_HTHREAD_STATE_YIELDED);
+
+	/* Further state-dependent pre-checks */
+
+	if (thr_resume->state == DUK_HTHREAD_STATE_YIELDED) {
+		/* no pre-checks now, assume a previous yield() has left things in
+		 * tip-top shape (longjmp handler will assert for these).
+		 */
+	} else {
+		DUK_ASSERT(thr_resume->state == DUK_HTHREAD_STATE_INACTIVE);
+
+		if ((thr_resume->callstack_top != 0) ||
+		    (thr_resume->valstack_top - thr_resume->valstack != 1)) {
+			goto state_invalid_initial;
+		}
+		tv = &thr_resume->valstack_top[-1];
+		DUK_ASSERT(tv >= thr_resume->valstack && tv < thr_resume->valstack_top);
+		if (!DUK_TVAL_IS_OBJECT(tv)) {
+			goto state_invalid_initial;
+		}
+		func = DUK_TVAL_GET_OBJECT(tv);
+		DUK_ASSERT(func != NULL);
+		if (!DUK_HOBJECT_IS_COMPILEDFUNCTION(func)) {
+			/* Note: cannot be a bound function either right now,
+			 * this would be easy to relax though.
+			 */
+			goto state_invalid_initial;
+		}
+
+	}
+
+	/*
+	 *  The error object has been augmented with a traceback and other
+	 *  info from its creation point -- usually another thread.  It might
+	 *  be nice to get a traceback from the resumee but this is not the
+	 *  case now.
+	 */
+
+#ifdef DUK_USE_DEBUG  /* debug logging */
+	if (is_error) {
+		DUK_DDDPRINT("RESUME ERROR: thread=%!T, value=%!T",
+		             duk_get_tval(ctx, 0),
+		             duk_get_tval(ctx, 1));
+	} else if (thr_resume->state == DUK_HTHREAD_STATE_YIELDED) {
+		DUK_DDDPRINT("RESUME NORMAL: thread=%!T, value=%!T",
+		             duk_get_tval(ctx, 0),
+		             duk_get_tval(ctx, 1));
+	} else {
+		DUK_DDDPRINT("RESUME INITIAL: thread=%!T, value=%!T",
+		             duk_get_tval(ctx, 0),
+		             duk_get_tval(ctx, 1));
+	}
+#endif
+
+	thr->heap->lj.type = DUK_LJ_TYPE_RESUME;
+
+	/* lj value2: thread */
+	DUK_ASSERT(thr->valstack_bottom < thr->valstack_top);
+	DUK_TVAL_SET_TVAL(&tv_tmp, &thr->heap->lj.value2);
+	DUK_TVAL_SET_TVAL(&thr->heap->lj.value2, &thr->valstack_bottom[0]);
+	DUK_TVAL_INCREF(thr, &thr->heap->lj.value2);
+	DUK_TVAL_DECREF(thr, &tv_tmp);
+
+	/* lj value1: value */
+	DUK_ASSERT(thr->valstack_bottom + 1 < thr->valstack_top);
+	DUK_TVAL_SET_TVAL(&tv_tmp, &thr->heap->lj.value1);
+	DUK_TVAL_SET_TVAL(&thr->heap->lj.value1, &thr->valstack_bottom[1]);
+	DUK_TVAL_INCREF(thr, &thr->heap->lj.value1);
+	DUK_TVAL_DECREF(thr, &tv_tmp);
+
+	thr->heap->lj.iserror = is_error;
+
+	DUK_ASSERT(thr->heap->lj.jmpbuf_ptr != NULL);  /* call is from executor, so we know we have a jmpbuf */
+	duk_err_longjmp(thr);  /* execution resumes in bytecode executor */
+	return 0;  /* never here */
+
+ state_invalid_initial:
+	DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "invalid initial thread state/stack");
+	return 0;  /* never here */
+
+ state_error:
+	DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "invalid state for resume");
+	return 0;  /* never here */
+}
+
+/*
+ *  Yield the current thread.
+ *
+ *  The thread must be in yieldable state: it must have a resumer, and there
+ *  must not be any yield-preventing calls (native calls and constructor calls,
+ *  currently) in the thread's call stack (otherwise a resume would not be
+ *  possible later).  This method must be called from an Ecmascript function.
+ *
+ *  Args:
+ *    - value
+ *    - isError (defaults to false)
+ *
+ *  Note: yield and resume handling is currently asymmetric.
+ */
+
+int duk_builtin_thread_yield(duk_context *ctx) {
+	duk_hthread *thr = (duk_hthread *) ctx;
+	duk_tval tv_tmp;
+	int is_error;
+
+	DUK_DDDPRINT("__duk__.Thread.yield(): value=%!T, is_error=%!T",
+	             duk_get_tval(ctx, 0),
+	             duk_get_tval(ctx, 1));
+
+	DUK_ASSERT(thr->state == DUK_HTHREAD_STATE_RUNNING);
+	DUK_ASSERT(thr->heap->curr_thread == thr);
+
+	is_error = duk_to_boolean(ctx, 1);
+
+	/*
+	 *  Thread state and calling context checks
+	 */
+
+	if (!thr->resumer) {
+		DUK_DDPRINT("yield state invalid: current thread must have a resumer");
+		goto state_error;
+	}
+	DUK_ASSERT(thr->resumer->state == DUK_HTHREAD_STATE_RESUMED);
+
+	if (thr->callstack_top < 2) {
+		DUK_DDPRINT("yield state invalid: callstack should contain at least 2 entries (caller and __duk__.Thread.yield)");
+		goto state_error;
+	}
+	DUK_ASSERT((thr->callstack + thr->callstack_top - 1)->func != NULL);  /* us */
+	DUK_ASSERT(DUK_HOBJECT_IS_NATIVEFUNCTION((thr->callstack + thr->callstack_top - 1)->func));
+	DUK_ASSERT((thr->callstack + thr->callstack_top - 2)->func != NULL);  /* caller */
+
+	if (!DUK_HOBJECT_IS_COMPILEDFUNCTION((thr->callstack + thr->callstack_top - 2)->func)) {
+		DUK_DDPRINT("yield state invalid: caller must be Ecmascript code");
+		goto state_error;
+	}
+
+	DUK_ASSERT(thr->callstack_preventcount >= 1);  /* should never be zero, because we (__duk__.Thread.yield) are on the stack */
+	if (thr->callstack_preventcount != 1) {
+		/* Note: the only yield-preventing call is __duk__.Thread.yield(), hence check for 1, not 0 */
+		DUK_DDPRINT("yield state invalid: there must be no yield-preventing calls in current thread callstack (preventcount is %d)",
+		            thr->callstack_preventcount);
+		goto state_error;
+	}
+
+	/*
+	 *  The error object has been augmented with a traceback and other
+	 *  info from its creation point -- usually the current thread.
+	 */
+
+#ifdef DUK_USE_DEBUG
+	if (is_error) {
+		DUK_DDDPRINT("YIELD ERROR: value=%!T",
+		             duk_get_tval(ctx, 0));
+	} else {
+		DUK_DDDPRINT("YIELD NORMAL: value=%!T",
+		             duk_get_tval(ctx, 0));
+	}
+#endif
+
+	/*
+	 *  Process yield
+	 *
+	 *  After longjmp(), processing continues in bytecode executor longjmp
+	 *  handler, which will e.g. update thr->resumer to NULL.
+	 */
+
+	thr->heap->lj.type = DUK_LJ_TYPE_YIELD;
+
+	/* lj value1: value */
+	DUK_ASSERT(thr->valstack_bottom < thr->valstack_top);
+	DUK_TVAL_SET_TVAL(&tv_tmp, &thr->heap->lj.value1);
+	DUK_TVAL_SET_TVAL(&thr->heap->lj.value1, &thr->valstack_bottom[0]);
+	DUK_TVAL_INCREF(thr, &thr->heap->lj.value1);
+	DUK_TVAL_DECREF(thr, &tv_tmp);
+
+	thr->heap->lj.iserror = is_error;
+
+	DUK_ASSERT(thr->heap->lj.jmpbuf_ptr != NULL);  /* call is from executor, so we know we have a jmpbuf */
+	duk_err_longjmp(thr);  /* execution resumes in bytecode executor */
+	return 0;  /* never here */
+
+ state_error:
+	DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "invalid state for yield");
+	return 0;  /* never here */
+}
+
+int duk_builtin_thread_current(duk_context *ctx) {
+	duk_push_current_thread(ctx);
 	return 1;
 }
 
@@ -19663,7 +22326,372 @@ int duk_builtin_type_error_thrower(duk_context *ctx) {
 
 /* include removed: duk_internal.h */
 
-/* native functions: 190 */
+#if defined(DUK_USE_DOUBLE_LE)
+char duk_strings_data[] = {
+(char)'\x37', (char)'\x66', (char)'\x78', (char)'\x90', (char)'\x03', 
+(char)'\x3f', (char)'\x5e', (char)'\xe4', (char)'\x36', (char)'\x64', 
+(char)'\x89', (char)'\xba', (char)'\x1a', (char)'\x14', (char)'\xa4', 
+(char)'\x89', (char)'\xba', (char)'\x32', (char)'\x0b', (char)'\xa4', 
+(char)'\x6d', (char)'\x4d', (char)'\xd7', (char)'\x05', (char)'\x3d', 
+(char)'\x23', (char)'\x6a', (char)'\x03', (char)'\x19', (char)'\x6e', 
+(char)'\x08', (char)'\x16', (char)'\x9e', (char)'\x82', (char)'\x26', 
+(char)'\xa3', (char)'\x08', (char)'\xd9', (char)'\xc8', (char)'\x9e', 
+(char)'\x4c', (char)'\x9c', (char)'\xd2', (char)'\x75', (char)'\x80', 
+(char)'\x99', (char)'\xcb', (char)'\xd2', (char)'\x46', (char)'\x2e', 
+(char)'\x89', (char)'\xbb', (char)'\x12', (char)'\x1b', (char)'\xa4', 
+(char)'\xbb', (char)'\xc9', (char)'\xd1', (char)'\x82', (char)'\x64', 
+(char)'\x37', (char)'\x5b', (char)'\x46', (char)'\x04', (char)'\x91', 
+(char)'\x3f', (char)'\x42', (char)'\xe7', (char)'\x2c', (char)'\x80', 
+(char)'\x69', (char)'\xbb', (char)'\x29', (char)'\xc5', (char)'\x0d', 
+(char)'\x31', (char)'\x7a', (char)'\x08', (char)'\xc4', (char)'\x18', 
+(char)'\x47', (char)'\x4b', (char)'\x46', (char)'\x8a', (char)'\x68', 
+(char)'\x73', (char)'\x4d', (char)'\xd7', (char)'\x05', (char)'\x24', 
+(char)'\x14', (char)'\xdd', (char)'\xff', (char)'\x7f', (char)'\x45', 
+(char)'\xa6', (char)'\xa1', (char)'\xa5', (char)'\xfa', (char)'\x2f', 
+(char)'\xba', (char)'\x9c', (char)'\x68', (char)'\x4f', (char)'\xfd', 
+(char)'\x6f', (char)'\xfd', (char)'\xfd', (char)'\x16', (char)'\x90', 
+(char)'\xd2', (char)'\xfd', (char)'\x17', (char)'\xdd', (char)'\x4e', 
+(char)'\x34', (char)'\x27', (char)'\xfe', (char)'\xb7', (char)'\xfe', 
+(char)'\xfe', (char)'\x8b', (char)'\x4d', (char)'\x03', (char)'\x7e', 
+(char)'\x8b', (char)'\xee', (char)'\xa7', (char)'\x1a', (char)'\x13', 
+(char)'\xff', (char)'\x67', (char)'\xff', (char)'\x7f', (char)'\x45', 
+(char)'\xaa', (char)'\x34', (char)'\x64', (char)'\x2a', (char)'\x1a', 
+(char)'\x41', (char)'\xfd', (char)'\x17', (char)'\xdd', (char)'\x4e', 
+(char)'\x34', (char)'\x27', (char)'\xfe', (char)'\x9c', (char)'\x54', 
+(char)'\x8c', (char)'\x48', (char)'\xd9', (char)'\x9a', (char)'\x24', 
+(char)'\x95', (char)'\x18', (char)'\x43', (char)'\x04', (char)'\x12', 
+(char)'\x27', (char)'\xdb', (char)'\x7d', (char)'\xa0', (char)'\xce', 
+(char)'\x4b', (char)'\x8c', (char)'\x64', (char)'\x10', (char)'\xc8', 
+(char)'\xd1', (char)'\x30', (char)'\xc4', (char)'\x9f', (char)'\x4a', 
+(char)'\x86', (char)'\x81', (char)'\x68', (char)'\xc9', (char)'\x22', 
+(char)'\xc9', (char)'\x12', (char)'\x7d', (char)'\x2a', (char)'\x1a', 
+(char)'\x05', (char)'\xa3', (char)'\x24', (char)'\x88', (char)'\x8c', 
+(char)'\x22', (char)'\x44', (char)'\x85', (char)'\x11', (char)'\x00', 
+(char)'\x31', (char)'\xc4', (char)'\xa1', (char)'\xa2', (char)'\x16', 
+(char)'\x33', (char)'\xd4', (char)'\x91', (char)'\x92', (char)'\x1c', 
+(char)'\xd3', (char)'\xeb', (char)'\x43', (char)'\xa2', (char)'\xb5', 
+(char)'\xa3', (char)'\x89', (char)'\xcc', (char)'\x7a', (char)'\x16', 
+(char)'\x44', (char)'\x6e', (char)'\x24', (char)'\x30', (char)'\x41', 
+(char)'\x22', (char)'\x1f', (char)'\x73', (char)'\x3c', (char)'\x48', 
+(char)'\x01', (char)'\xab', (char)'\x65', (char)'\x43', (char)'\x40', 
+(char)'\xb4', (char)'\x64', (char)'\x91', (char)'\x56', (char)'\xd8', 
+(char)'\x49', (char)'\x82', (char)'\x60', (char)'\x0a', (char)'\xc8', 
+(char)'\x7d', (char)'\x88', (char)'\x0b', (char)'\x59', (char)'\x08', 
+(char)'\x4d', (char)'\xb0', (char)'\x0f', (char)'\x2e', (char)'\xc1', 
+(char)'\x13', (char)'\x48', (char)'\xbb', (char)'\x99', (char)'\xd1', 
+(char)'\x24', (char)'\x6d', (char)'\xe2', (char)'\xfb', (char)'\x25', 
+(char)'\xa1', (char)'\xa4', (char)'\x3e', (char)'\xe4', (char)'\xea', 
+(char)'\x44', (char)'\x44', (char)'\x3e', (char)'\xea', (char)'\x08', 
+(char)'\x91', (char)'\xb5', (char)'\x3e', (char)'\xd6', (char)'\x4b', 
+(char)'\x91', (char)'\xb5', (char)'\x3e', (char)'\xea', (char)'\x08', 
+(char)'\xb0', (char)'\x0f', (char)'\x46', (char)'\xca', (char)'\xe8', 
+(char)'\xb0', (char)'\x0b', (char)'\x92', (char)'\x76', (char)'\x1c', 
+(char)'\x4c', (char)'\x82', (char)'\x70', (char)'\xc8', (char)'\x5d', 
+(char)'\xb4', (char)'\x97', (char)'\x99', (char)'\xf7', (char)'\x30', 
+(char)'\x44', (char)'\xc4', (char)'\x99', (char)'\xb7', (char)'\x50', 
+(char)'\x2e', (char)'\x84', (char)'\x3b', (char)'\xdc', (char)'\x86', 
+(char)'\xcc', (char)'\x91', (char)'\x30', (char)'\x68', (char)'\x52', 
+(char)'\x92', (char)'\x29', (char)'\x9c', (char)'\x40', (char)'\x22', 
+(char)'\x0c', (char)'\x13', (char)'\x02', (char)'\x96', (char)'\x86', 
+(char)'\x93', (char)'\xad', (char)'\xa3', (char)'\x02', (char)'\x48', 
+(char)'\xa0', (char)'\xa8', (char)'\x59', (char)'\x3a', (char)'\xd0', 
+(char)'\x30', (char)'\x82', (char)'\x78', (char)'\x8b', (char)'\x29', 
+(char)'\x80', (char)'\x4a', (char)'\x77', (char)'\x66', (char)'\x78', 
+(char)'\xba', (char)'\xdd', (char)'\x9e', (char)'\x1e', (char)'\x4e', 
+(char)'\x92', (char)'\x31', (char)'\x74', (char)'\x4c', (char)'\x20', 
+(char)'\x2d', (char)'\x64', (char)'\x23', (char)'\x3a', (char)'\x86', 
+(char)'\xd4', (char)'\x0b', (char)'\x40', (char)'\xfe', (char)'\x83', 
+(char)'\xa3', (char)'\x04', (char)'\xc8', (char)'\x5f', (char)'\xdb', 
+(char)'\xfa', (char)'\xef', (char)'\xae', (char)'\xfa', (char)'\xef', 
+(char)'\xdd', (char)'\x17', (char)'\xc5', (char)'\x7c', (char)'\x48', 
+(char)'\x7e', (char)'\x80', (char)'\x3f', (char)'\x58', (char)'\x2f', 
+(char)'\xad', (char)'\xfb', (char)'\x01', (char)'\x7d', (char)'\x5f', 
+(char)'\xd8', (char)'\x07', (char)'\xec', (char)'\x13', (char)'\xf5', 
+(char)'\xbd', (char)'\x43', (char)'\x4a', (char)'\x86', (char)'\xa2', 
+(char)'\x78', (char)'\x4f', (char)'\xd5', (char)'\xf5', (char)'\x0d', 
+(char)'\x2a', (char)'\x1a', (char)'\x89', (char)'\xe1', (char)'\x1d', 
+(char)'\x43', (char)'\x4a', (char)'\x86', (char)'\xa2', (char)'\x78', 
+(char)'\x33', (char)'\x82', (char)'\x92', (char)'\x0a', (char)'\x66', 
+(char)'\x94', (char)'\xe2', (char)'\x86', (char)'\x98', (char)'\xcd', 
+(char)'\xa3', (char)'\x02', (char)'\x48', (char)'\x9c', (char)'\x2e', 
+(char)'\x72', (char)'\xc8', (char)'\x06', (char)'\xa6', (char)'\x8d', 
+(char)'\x19', (char)'\x0a', (char)'\x86', (char)'\x90', (char)'\x69', 
+(char)'\x94', (char)'\xe2', (char)'\x86', (char)'\x99', (char)'\x05', 
+(char)'\xc0', (char)'\xe6', (char)'\x06', (char)'\x92', (char)'\x50', 
+(char)'\x8c', (char)'\xc7', (char)'\x24', (char)'\x34', (char)'\xb1', 
+(char)'\x75', (char)'\x1a', (char)'\x33', (char)'\x44', (char)'\x0d', 
+(char)'\x1b', (char)'\x98', (char)'\x37', (char)'\xba', (char)'\xc3', 
+(char)'\x62', (char)'\x1a', (char)'\x36', (char)'\x02', (char)'\xe3', 
+(char)'\x5b', (char)'\x8c', (char)'\x52', (char)'\xad', (char)'\xce', 
+(char)'\x88', (char)'\xc9', (char)'\x77', (char)'\x8c', (char)'\x4e', 
+(char)'\x91', (char)'\x04', (char)'\x44', (char)'\x2c', (char)'\xa0', 
+(char)'\x98', (char)'\x1b', (char)'\xf6', (char)'\x44', (char)'\x04', 
+(char)'\xc0', (char)'\xd2', (char)'\x02', (char)'\x48', (char)'\x69', 
+(char)'\x00', (char)'\x27', (char)'\x48', (char)'\x60', (char)'\x0c', 
+(char)'\x8b', (char)'\xe9', (char)'\x42', (char)'\x33', (char)'\xfb', 
+(char)'\x23', (char)'\xfa', (char)'\x50', (char)'\x8c', (char)'\xfe', 
+(char)'\xc7', (char)'\x5f', (char)'\x64', (char)'\x2f', (char)'\x3d', 
+(char)'\x06', (char)'\xf2', (char)'\xdc', (char)'\x6f', (char)'\xb1', 
+(char)'\xfb', (char)'\x02', (char)'\x17', (char)'\xcb', (char)'\x71', 
+(char)'\xbe', (char)'\xc8', (char)'\x83', (char)'\xf2', (char)'\xdb', 
+(char)'\xf6', (char)'\x44', (char)'\xf2', (char)'\xdb', (char)'\xf6', 
+(char)'\x3f', (char)'\x60', (char)'\x1e', (char)'\x90', (char)'\xec', 
+(char)'\x24', (char)'\xa4', (char)'\x03', (char)'\x10', (char)'\x8d', 
+(char)'\x03', (char)'\x08', (char)'\x54', (char)'\x35', (char)'\xf4', 
+(char)'\x99', (char)'\x50', (char)'\xd1', (char)'\x92', (char)'\xe4', 
+(char)'\xfa', (char)'\x8f', (char)'\xbf', (char)'\xfb', (char)'\xaf', 
+(char)'\xa9', (char)'\x4a', (char)'\xc1', (char)'\x29', (char)'\xf5', 
+(char)'\x0d', (char)'\x19', (char)'\x2e', (char)'\x96', (char)'\x51', 
+(char)'\x73', (char)'\x42', (char)'\xd0', (char)'\xd2', (char)'\x29', 
+(char)'\x06', (char)'\x6b', (char)'\xa2', (char)'\x4e', (char)'\x88', 
+(char)'\x12', (char)'\x21', (char)'\xa4', (char)'\xea', (char)'\x44', 
+(char)'\x44', (char)'\x24', (char)'\xc9', (char)'\x29', (char)'\x90', 
+(char)'\x97', (char)'\x20', (char)'\x97', (char)'\x37', (char)'\x78', 
+(char)'\xcc', (char)'\x9c', (char)'\xbd', (char)'\x38', (char)'\xa1', 
+(char)'\xa6', (char)'\x3c', (char)'\x89', (char)'\x3e', (char)'\xe0', 
+(char)'\x80', (char)'\x89', (char)'\xcc', (char)'\x49', (char)'\xf7', 
+(char)'\x04', (char)'\x04', (char)'\x4d', (char)'\x37', (char)'\x79', 
+(char)'\x32', (char)'\x73', (char)'\x57', (char)'\x37', (char)'\x79', 
+(char)'\x12', (char)'\x74', (char)'\xbd', (char)'\x38', (char)'\xa1', 
+(char)'\xa6', (char)'\x5c', (char)'\xdd', (char)'\xea', (char)'\x4c', 
+(char)'\x52', (char)'\xf4', (char)'\xe2', (char)'\x86', (char)'\x99', 
+(char)'\xd2', (char)'\x24', (char)'\xfd', (char)'\x49', (char)'\x88', 
+(char)'\xbe', (char)'\xa2', (char)'\xd7', (char)'\xdc', (char)'\x10', 
+(char)'\x11', (char)'\x5c', (char)'\x89', (char)'\x3e', (char)'\x96', 
+(char)'\x8b', (char)'\x5f', (char)'\x70', (char)'\x40', (char)'\x45', 
+(char)'\x72', (char)'\x24', (char)'\xfd', (char)'\x49', (char)'\x89', 
+(char)'\x9e', (char)'\x73', (char)'\x66', (char)'\x74', (char)'\x48', 
+(char)'\x93', (char)'\xeb', (char)'\x1c', (char)'\xd9', (char)'\x9d', 
+(char)'\x52', (char)'\x24', (char)'\xfd', (char)'\x49', (char)'\x88', 
+(char)'\x7e', (char)'\x04', (char)'\xc8', (char)'\x79', (char)'\x12', 
+(char)'\x7d', (char)'\x18', (char)'\x26', (char)'\x45', (char)'\xc8', 
+(char)'\x93', (char)'\xf5', (char)'\x26', (char)'\x23', (char)'\xf9', 
+(char)'\xd4', (char)'\x8c', (char)'\x91', (char)'\x22', (char)'\x4f', 
+(char)'\xa7', (char)'\x75', (char)'\x23', (char)'\x26', (char)'\xc8', 
+(char)'\x93', (char)'\xf5', (char)'\x26', (char)'\x26', (char)'\x79', 
+(char)'\x0d', (char)'\xa4', (char)'\xc9', (char)'\x25', (char)'\x48', 
+(char)'\x93', (char)'\xeb', (char)'\x10', (char)'\xda', (char)'\x4c', 
+(char)'\x92', (char)'\x6c', (char)'\x89', (char)'\x3f', (char)'\x52', 
+(char)'\x62', (char)'\x97', (char)'\x88', (char)'\x27', (char)'\x34', 
+(char)'\x72', (char)'\x54', (char)'\x89', (char)'\x3e', (char)'\xc8', 
+(char)'\x82', (char)'\x73', (char)'\x47', (char)'\x29', (char)'\x48', 
+(char)'\x93', (char)'\xf5', (char)'\x26', (char)'\x26', (char)'\x79', 
+(char)'\x0b', (char)'\x5a', (char)'\x24', (char)'\x41', (char)'\x39', 
+(char)'\xa3', (char)'\x93', (char)'\xe4', (char)'\x49', (char)'\xf5', 
+(char)'\x88', (char)'\x5a', (char)'\xd1', (char)'\x22', (char)'\x09', 
+(char)'\xcd', (char)'\x1c', (char)'\x8f', (char)'\x22', (char)'\x4f', 
+(char)'\xb3', (char)'\x43', (char)'\x09', (char)'\x13', (char)'\x12', 
+(char)'\x7d', (char)'\x9a', (char)'\x18', (char)'\x4c', (char)'\xb9', 
+(char)'\xa4', (char)'\xeb', (char)'\x8a', (char)'\x59', (char)'\x12', 
+(char)'\x72', (char)'\x31', (char)'\x27', (char)'\xea', (char)'\x4c', 
+(char)'\x4c', (char)'\xf2', (char)'\x16', (char)'\xb4', (char)'\x48', 
+(char)'\x82', (char)'\x73', (char)'\x47', (char)'\x27', (char)'\x98', 
+(char)'\x93', (char)'\xeb', (char)'\x10', (char)'\xb5', (char)'\xa2', 
+(char)'\x44', (char)'\x13', (char)'\x9a', (char)'\x39', (char)'\x34', 
+(char)'\xc4', (char)'\x9f', (char)'\xa9', (char)'\x31', (char)'\x4b', 
+(char)'\xc4', (char)'\x13', (char)'\x9a', (char)'\x39', (char)'\x28', 
+(char)'\xc4', (char)'\x9f', (char)'\x64', (char)'\x41', (char)'\x39', 
+(char)'\xa3', (char)'\x93', (char)'\x4c', (char)'\x49', (char)'\xfa', 
+(char)'\x93', (char)'\x13', (char)'\x3c', (char)'\x86', (char)'\xd2', 
+(char)'\x64', (char)'\x92', (char)'\x8c', (char)'\x49', (char)'\xf5', 
+(char)'\x88', (char)'\x6d', (char)'\x26', (char)'\x49', (char)'\x2c', 
+(char)'\xc4', (char)'\x9f', (char)'\xa9', (char)'\x31', (char)'\x1f', 
+(char)'\xce', (char)'\xa4', (char)'\x64', (char)'\x83', (char)'\x12', 
+(char)'\x7d', (char)'\x3b', (char)'\xa9', (char)'\x19', (char)'\x24', 
+(char)'\xc4', (char)'\x9f', (char)'\xa9', (char)'\x31', (char)'\x0f', 
+(char)'\xc0', (char)'\xc1', (char)'\x8c', (char)'\x49', (char)'\xf4', 
+(char)'\x60', (char)'\xc2', (char)'\x8c', (char)'\x49', (char)'\xfa', 
+(char)'\x93', (char)'\x10', (char)'\xfc', (char)'\x09', (char)'\x90', 
+(char)'\xe6', (char)'\x24', (char)'\xfa', (char)'\x30', (char)'\x4c', 
+(char)'\x8b', (char)'\x31', (char)'\x27', (char)'\xea', (char)'\x4c', 
+(char)'\x4c', (char)'\xf3', (char)'\x9b', (char)'\x33', (char)'\xa0', 
+(char)'\xc4', (char)'\x9f', (char)'\x58', (char)'\xe6', (char)'\xcc', 
+(char)'\xee', (char)'\x31', (char)'\x27', (char)'\xea', (char)'\x4c', 
+(char)'\x45', (char)'\xf5', (char)'\x16', (char)'\xbe', (char)'\xe0', 
+(char)'\x80', (char)'\x8a', (char)'\xcc', (char)'\x49', (char)'\xf4', 
+(char)'\xb4', (char)'\x5a', (char)'\xfb', (char)'\x82', (char)'\x02', 
+(char)'\x27', (char)'\x31', (char)'\x27', (char)'\xd9', (char)'\xa1', 
+(char)'\x84', (char)'\x94', (char)'\xdd', (char)'\xd5', (char)'\xb8', 
+(char)'\x40', (char)'\x59', (char)'\x3b', (char)'\x34', (char)'\x30', 
+(char)'\x9d', (char)'\x94', (char)'\xe2', (char)'\x86', (char)'\x9a', 
+(char)'\x53', (char)'\x77', (char)'\x56', (char)'\xe1', (char)'\x01', 
+(char)'\x64', (char)'\xe8', (char)'\xc1', (char)'\x32', (char)'\x76', 
+(char)'\x53', (char)'\x8a', (char)'\x1a', (char)'\x66', (char)'\x4d', 
+(char)'\xdd', (char)'\x9a', (char)'\x18', (char)'\x4e', (char)'\xca', 
+(char)'\x71', (char)'\x43', (char)'\x4c', (char)'\xc9', (char)'\xbb', 
+(char)'\xa3', (char)'\x04', (char)'\xc9', (char)'\xd9', (char)'\x4e', 
+(char)'\x28', (char)'\x69', (char)'\x86', (char)'\xd7', (char)'\x58', 
+(char)'\x7e', (char)'\xa4', (char)'\xc4', (char)'\x57', (char)'\x82', 
+(char)'\x32', (char)'\x22', (char)'\xe6', (char)'\xee', (char)'\xbe', 
+(char)'\x24', (char)'\x12', (char)'\x24', (char)'\x87', (char)'\x35', 
+(char)'\xb3', (char)'\x77', (char)'\x49', (char)'\x77', (char)'\xb9', 
+(char)'\xa4', (char)'\x6c', (char)'\xd0', (char)'\x05', (char)'\x9e', 
+(char)'\x6e', (char)'\xe9', (char)'\x51', (char)'\x72', (char)'\x0e', 
+(char)'\x3e', (char)'\x7b', (char)'\xa4', (char)'\x89', (char)'\xa2', 
+(char)'\xa4', (char)'\xd2', (char)'\x1a', (char)'\x54', (char)'\x35', 
+(char)'\x13', (char)'\xc4', (char)'\x7c', (char)'\xd2', (char)'\x18', 
+(char)'\x13', (char)'\x45', (char)'\x49', (char)'\xa4', (char)'\x34', 
+(char)'\xa8', (char)'\x6a', (char)'\x27', (char)'\x81', (char)'\xf5', 
+(char)'\xa0', (char)'\xeb', (char)'\x53', (char)'\xe6', (char)'\x21', 
+(char)'\xba', (char)'\xa8', (char)'\x17', (char)'\x42', (char)'\x27', 
+(char)'\xcc', (char)'\x05', (char)'\xf5', (char)'\x50', (char)'\x2e', 
+(char)'\x84', (char)'\x34', (char)'\xa8', (char)'\x19', (char)'\x4e', 
+(char)'\x24', (char)'\x9c', (char)'\x50', (char)'\xc8', (char)'\xcd', 
+(char)'\xdd', (char)'\x5b', (char)'\x84', (char)'\x05', (char)'\x93', 
+(char)'\xb4', (char)'\x7b', (char)'\xc9', (char)'\x1e', (char)'\x88', 
+(char)'\x12', (char)'\x22', (char)'\xe6', (char)'\xee', (char)'\xd1', 
+(char)'\xef', (char)'\x24', (char)'\x7a', (char)'\x20', (char)'\x48', 
+(char)'\x91', (char)'\x9b', (char)'\xba', (char)'\xb7', (char)'\x08', 
+(char)'\x0b', (char)'\x27', (char)'\x56', (char)'\xeb', (char)'\x12', 
+(char)'\x3d', (char)'\x10', (char)'\x24', (char)'\x45', (char)'\xcd', 
+(char)'\xdd', (char)'\x5b', (char)'\xac', (char)'\x48', (char)'\xf4', 
+(char)'\x40', (char)'\x91', (char)'\x13', (char)'\x2a', (char)'\x06', 
+(char)'\x53', (char)'\x8a', (char)'\x1a', (char)'\x62', (char)'\xc9', 
+(char)'\xeb', (char)'\x44', (char)'\xcd', (char)'\x22', (char)'\x02', 
+(char)'\x22', (char)'\x39', (char)'\xe2', (char)'\x47', (char)'\xac', 
+(char)'\x02', (char)'\x21', (char)'\x58', (char)'\x09', (char)'\x88', 
+(char)'\xed', (char)'\x5b', (char)'\x84', (char)'\x05', (char)'\x93', 
+(char)'\xa2', (char)'\x73', (char)'\x1e', (char)'\x08', (char)'\x91', 
+(char)'\x42', (char)'\x38', (char)'\x23', (char)'\xd1', (char)'\x38', 
+(char)'\x64', (char)'\xe8', (char)'\x26', (char)'\x61', (char)'\x1c', 
+(char)'\x11', (char)'\xe8', (char)'\x26', (char)'\xc2', (char)'\xc5', 
+(char)'\xcc', (char)'\xe8', (char)'\x8e', (char)'\x08', (char)'\xf4', 
+(char)'\x4e', (char)'\x19', (char)'\x17', (char)'\x12', (char)'\x0e', 
+(char)'\x82', (char)'\x27', (char)'\x62', (char)'\x83', (char)'\x1e', 
+(char)'\x66', (char)'\x89', (char)'\x07', (char)'\x41', (char)'\x10', 
+(char)'\xc5', (char)'\x42', (char)'\xe6', (char)'\x48', (char)'\x8d', 
+(char)'\x80', (char)'\x79', (char)'\xca', (char)'\xe8', (char)'\xf4', 
+(char)'\x80', (char)'\x11', (char)'\xc9', (char)'\x27', (char)'\x30', 
+(char)'\x85', (char)'\x25', (char)'\x49', (char)'\x1c', (char)'\x2d', 
+(char)'\x60', (char)'\x94', (char)'\xfa', (char)'\x86', (char)'\x8c', 
+(char)'\x97', (char)'\xeb', (char)'\x8a', (char)'\x74', (char)'\x34', 
+(char)'\x64', (char)'\xbf', (char)'\x5c', (char)'\x53', (char)'\xd1', 
+(char)'\xb2', (char)'\x3a', (char)'\x0b', (char)'\x33', (char)'\x49', 
+(char)'\xeb', (char)'\x40', (char)'\x88', (char)'\x49', (char)'\x3a', 
+(char)'\x33', (char)'\x2c', (char)'\x96', (char)'\x81', (char)'\x10', 
+(char)'\xb2', (char)'\x3a', (char)'\x0b', (char)'\x33', (char)'\xc4', 
+(char)'\x95', (char)'\x24', (char)'\x64', (char)'\x42', (char)'\x3e', 
+(char)'\x92', (char)'\x38', (char)'\xde', (char)'\xe7', (char)'\x91', 
+(char)'\x2e', (char)'\x43', (char)'\x4c', (char)'\x27', (char)'\x34', 
+(char)'\x40', (char)'\x99', (char)'\xd1', (char)'\x2e', (char)'\x82', 
+(char)'\x31', (char)'\x06', (char)'\x12', (char)'\x08', (char)'\x9a', 
+(char)'\x8c', (char)'\x23', (char)'\x67', (char)'\x23', (char)'\x08', 
+(char)'\x0b', (char)'\x59', (char)'\x22', (char)'\x40', (char)'\xa1', 
+(char)'\xa3', (char)'\x20', (char)'\x80', (char)'\xb5', (char)'\x94', 
+(char)'\x0f', (char)'\x7a', (char)'\xf1', (char)'\x47', (char)'\xc5', 
+(char)'\xcf', (char)'\x24', (char)'\x67', (char)'\x8e', (char)'\xa2', 
+(char)'\x5d', (char)'\x23', (char)'\x68', (char)'\xc2', (char)'\x44', 
+(char)'\x01', (char)'\x59', (char)'\x1a', (char)'\x89', (char)'\x75', 
+(char)'\xf1', (char)'\x74', (char)'\xdd', (char)'\x3c', (char)'\x3c', 
+(char)'\x9d', (char)'\x71', (char)'\x5c', (char)'\x70', (char)'\x4b', 
+(char)'\xae', (char)'\xb3', (char)'\x7a', (char)'\xf8', (char)'\xb9', 
+(char)'\xe4', (char)'\x8c', (char)'\xf0', (char)'\x7a', (char)'\x81', 
+(char)'\x74', (char)'\x27', (char)'\x5c', (char)'\x57', (char)'\x4d', 
+(char)'\xdd', (char)'\x5b', (char)'\x84', (char)'\x05', (char)'\x93', 
+(char)'\xb2', (char)'\x9c', (char)'\x50', (char)'\xd3', (char)'\x22', 
+(char)'\x6e', (char)'\xec', (char)'\xa7', (char)'\x14', (char)'\x34', 
+(char)'\xcb', (char)'\x13', (char)'\x9b', (char)'\x29', (char)'\xc6', 
+(char)'\x82', (char)'\x9b', (char)'\xa2', (char)'\xa2', (char)'\x36', 
+(char)'\x8c', (char)'\x24', (char)'\x40', (char)'\x15', (char)'\x91', 
+(char)'\x82', (char)'\x73', (char)'\x4a', (char)'\x83', (char)'\x52', 
+(char)'\x20', (char)'\x0a', (char)'\xc8', (char)'\x8b', (char)'\x45', 
+(char)'\x13', (char)'\x00', (char)'\x56', (char)'\x42', (char)'\xd4', 
+(char)'\x0b', (char)'\xa1', (char)'\x08', (char)'\xa2', (char)'\x62', 
+(char)'\x4c', (char)'\x44', (char)'\xba', (char)'\x4b', (char)'\xcc', 
+(char)'\x8d', (char)'\x92', (char)'\x02', (char)'\xb2', (char)'\x21', 
+(char)'\x12', (char)'\xe9', (char)'\x62', (char)'\xec', (char)'\x91', 
+(char)'\xa8', (char)'\x44', (char)'\xbb', (char)'\x22', (char)'\x01', 
+(char)'\x64', (char)'\x1c', (char)'\x5f', (char)'\x12', (char)'\x54', 
+(char)'\x8d', (char)'\x9f', (char)'\x49', (char)'\x79', (char)'\x91', 
+(char)'\xb2', (char)'\x43', (char)'\x9b', (char)'\x23', (char)'\x16', 
+(char)'\x24', (char)'\x26', (char)'\x48', (char)'\x49', (char)'\x10', 
+(char)'\x0b', (char)'\x80', (char)'\xc8', (char)'\x54', (char)'\x34', 
+(char)'\x9d', (char)'\x7c', (char)'\x5c', (char)'\xf2', (char)'\x46', 
+(char)'\x68', (char)'\x24', (char)'\x9c', (char)'\x32', (char)'\x15', 
+(char)'\x0d', (char)'\x27', (char)'\x5f', (char)'\x17', (char)'\x3c', 
+(char)'\x91', (char)'\x9e', (char)'\x0c', (char)'\x28', (char)'\x90', 
+(char)'\x13', (char)'\x24', (char)'\xcc', (char)'\x49', (char)'\xf5', 
+(char)'\xd6', (char)'\x6f', (char)'\x5f', (char)'\x17', (char)'\x3c', 
+(char)'\x91', (char)'\x9e', (char)'\x3a', (char)'\xd0', (char)'\x30', 
+(char)'\x92', (char)'\xc1', (char)'\x89', (char)'\x3e', (char)'\xba', 
+(char)'\xcd', (char)'\xeb', (char)'\xe2', (char)'\xe7', (char)'\x92', 
+(char)'\x33', (char)'\xc7', (char)'\x46', (char)'\x49', (char)'\x0a', 
+(char)'\x28', (char)'\x7c', (char)'\xdd', (char)'\x17', (char)'\x18', 
+(char)'\x93', (char)'\xeb', (char)'\xe2', (char)'\xe9', (char)'\xba', 
+(char)'\x78', (char)'\x79', (char)'\x3a', (char)'\xe2', (char)'\xa5', 
+(char)'\xf1', (char)'\x74', (char)'\xdd', (char)'\x3c', (char)'\x3c', 
+(char)'\x86', (char)'\x59', (char)'\x1a', (char)'\x69', (char)'\x9c', 
+(char)'\xa0', (char)'\x59', (char)'\x23', (char)'\x32', (char)'\xbe', 
+(char)'\x28', (char)'\x6c', (char)'\xd1', (char)'\x46', (char)'\x92', 
+(char)'\x42', (char)'\x03', (char)'\xc8', (char)'\x62', (char)'\x48', 
+(char)'\x40', (char)'\x79', (char)'\x24', (char)'\x46', (char)'\x89', 
+(char)'\xc3', (char)'\x27', (char)'\xa9', (char)'\x14', (char)'\x0b', 
+(char)'\xce', (char)'\x63', (char)'\xdc', (char)'\xd2', (char)'\x36', 
+(char)'\x69', (char)'\x23', (char)'\x44', (char)'\xe1', (char)'\x93', 
+(char)'\xd4', (char)'\x8a', (char)'\x24', (char)'\x32', (char)'\x09', 
+(char)'\xc3', (char)'\x27', (char)'\xa9', (char)'\x14', (char)'\x0b', 
+(char)'\xce', (char)'\x63', (char)'\xdc', (char)'\xd2', (char)'\x36', 
+(char)'\x69', (char)'\x19', (char)'\x04', (char)'\xe1', (char)'\x93', 
+(char)'\xd4', (char)'\x8a', (char)'\x10', (char)'\x89', (char)'\x74', 
+(char)'\xa8', (char)'\x6a', (char)'\x26', (char)'\x42', (char)'\xa2', 
+(char)'\x5d', (char)'\x68', (char)'\x3a', (char)'\xd5', (char)'\x3c', 
+(char)'\x11', (char)'\x91', (char)'\x3a', (char)'\x55', (char)'\xb8', 
+(char)'\x13', (char)'\x43', (char)'\xc1', (char)'\x19', (char)'\x13', 
+(char)'\xa8', (char)'\x6c', (char)'\xc8', (char)'\x4a', (char)'\x81', 
+(char)'\x68', (char)'\xf5', (char)'\x22', (char)'\x82', (char)'\x7a', 
+(char)'\x31', (char)'\x74', (char)'\x53', (char)'\xd9', (char)'\xe1', 
+(char)'\xe4', (char)'\xe9', (char)'\x23', (char)'\x17', (char)'\x45', 
+(char)'\x7d', (char)'\x96', (char)'\x1b', (char)'\x30', (char)'\x5f', 
+(char)'\xa4', (char)'\x8c', (char)'\x5d', (char)'\x17', (char)'\x76', 
+(char)'\x24', (char)'\x29', (char)'\x22', (char)'\x46', (char)'\x88', 
+(char)'\x9d', (char)'\x24', (char)'\x62', (char)'\xe8', (char)'\xab', 
+(char)'\xb1', (char)'\x03', (char)'\x4c', (char)'\x4e', (char)'\x92', 
+(char)'\x31', (char)'\x74', (char)'\x53', (char)'\xd2', (char)'\x54', 
+(char)'\x0b', (char)'\xe9', (char)'\x23', (char)'\x17', (char)'\x44', 
+(char)'\xa1', (char)'\x89', (char)'\x00', (char)'\xa2', (char)'\x08', 
+(char)'\x12', (char)'\x21', (char)'\x44', (char)'\x09', (char)'\x88', 
+(char)'\xe8', (char)'\x13', (char)'\x9b', (char)'\x34', (char)'\x36', 
+(char)'\x84', (char)'\x40', (char)'\xc8', (char)'\x1a', (char)'\x18', 
+(char)'\xc4', (char)'\x89', (char)'\xc6', (char)'\x42', (char)'\x82', 
+(char)'\x8b', (char)'\x99', (char)'\x86', (char)'\x45', (char)'\x92', 
+(char)'\x64', (char)'\x10', (char)'\xdc', (char)'\x42', (char)'\x2e', 
+(char)'\x44', (char)'\x39', (char)'\x50', (char)'\xd0', (char)'\x2d', 
+(char)'\x78', (char)'\x19', (char)'\x5d', (char)'\x14', (char)'\x16', 
+(char)'\x8d', (char)'\x14', (char)'\xd0', (char)'\xe6', (char)'\x89', 
+(char)'\x05', (char)'\x12', (char)'\x1a', (char)'\xa4', (char)'\x36', 
+(char)'\x53', (char)'\x03', (char)'\x44', (char)'\x47', (char)'\x14', 
+(char)'\x6d', (char)'\x25', (char)'\x8d', (char)'\x12', (char)'\x4e', 
+(char)'\x91', (char)'\x69', (char)'\xa5', (char)'\x64', (char)'\x4c', 
+(char)'\x47', (char)'\x24', (char)'\xce', (char)'\x89', (char)'\x16', 
+(char)'\x67', (char)'\x8b', (char)'\xac', (char)'\x39', (char)'\xc7', 
+(char)'\x06', (char)'\x9e', (char)'\x1e', (char)'\x47', (char)'\x14', 
+(char)'\x75', (char)'\x04', (char)'\x49', (char)'\x57', (char)'\x20', 
+(char)'\x65', (char)'\xb1', (char)'\xd0', (char)'\xb2', (char)'\x12', 
+(char)'\xc8', (char)'\x99', (char)'\xca', (char)'\x25', (char)'\x82', 
+(char)'\x52', (char)'\x28', (char)'\x9c', (char)'\xd9', (char)'\x4c', 
+(char)'\x84', (char)'\x6d', (char)'\x18', (char)'\x62', (char)'\x5d', 
+(char)'\xee', (char)'\x8c', (char)'\xce', (char)'\x4b', (char)'\xcc', 
+(char)'\x8d', (char)'\x1c', (char)'\x8c', (char)'\x86', (char)'\x3d', 
+(char)'\xd1', (char)'\x99', (char)'\x65', (char)'\x47', (char)'\x92', 
+(char)'\x24', (char)'\x6d', (char)'\x16', (char)'\xb2', (char)'\x4e', 
+(char)'\x34', (char)'\x21', (char)'\x4a', (char)'\x05', (char)'\xc8', 
+(char)'\x83', (char)'\x31', (char)'\x26', (char)'\x39', (char)'\x12', 
+(char)'\x6a', (char)'\x43', (char)'\x1e', (char)'\xb2', (char)'\x30', 
+(char)'\x8d', (char)'\x9c', (char)'\x92', (char)'\x86', (char)'\xcc', 
+(char)'\x91', (char)'\x28', (char)'\x04', (char)'\x41', (char)'\xac', 
+(char)'\x93', (char)'\x3b', (char)'\xc0', (char)'\x25', (char)'\x00', 
+(char)'\xc4', (char)'\x3b', (char)'\xe2', (char)'\x8a', (char)'\x82', 
+(char)'\x64', (char)'\x4b', (char)'\xe2', (char)'\xe9', (char)'\x90', 
+(char)'\x53', (char)'\x20', (char)'\xcc', (char)'\xfa', (char)'\x05', 
+(char)'\x68', (char)'\x11', (char)'\xa5', (char)'\x30', (char)'\x4d', 
+(char)'\x02', (char)'\x2e', (char)'\x10', (char)'\x45', (char)'\x8c', 
+};
+
+/* to convert a heap stridx to a token number, subtract
+ * DUK_STRIDX_START_RESERVED and add DUK_TOK_START_RESERVED.
+ */
+
+/* native functions: 588 */
 duk_c_function duk_builtin_native_functions[] = {
 	(duk_c_function) duk_builtin_array_constructor,
 	(duk_c_function) duk_builtin_array_constructor_is_array,
@@ -19691,6 +22719,9 @@ duk_c_function duk_builtin_native_functions[] = {
 	(duk_c_function) duk_builtin_boolean_constructor,
 	(duk_c_function) duk_builtin_boolean_prototype_to_string,
 	(duk_c_function) duk_builtin_boolean_prototype_value_of,
+	(duk_c_function) duk_builtin_buffer_constructor,
+	(duk_c_function) duk_builtin_buffer_prototype_to_string,
+	(duk_c_function) duk_builtin_buffer_prototype_value_of,
 	(duk_c_function) duk_builtin_date_constructor,
 	(duk_c_function) duk_builtin_date_constructor_now,
 	(duk_c_function) duk_builtin_date_constructor_parse,
@@ -19740,20 +22771,17 @@ duk_c_function duk_builtin_native_functions[] = {
 	(duk_c_function) duk_builtin_date_prototype_to_utc_string,
 	(duk_c_function) duk_builtin_date_prototype_value_of,
 	(duk_c_function) duk_builtin_duk_object_addr,
-	(duk_c_function) duk_builtin_duk_object_curr,
 	(duk_c_function) duk_builtin_duk_object_dec,
 	(duk_c_function) duk_builtin_duk_object_enc,
 	(duk_c_function) duk_builtin_duk_object_gc,
 	(duk_c_function) duk_builtin_duk_object_get_finalizer,
-	(duk_c_function) duk_builtin_duk_object_print,
 	(duk_c_function) duk_builtin_duk_object_refc,
-	(duk_c_function) duk_builtin_duk_object_resume,
 	(duk_c_function) duk_builtin_duk_object_set_finalizer,
-	(duk_c_function) duk_builtin_duk_object_sleep,
-	(duk_c_function) duk_builtin_duk_object_spawn,
-	(duk_c_function) duk_builtin_duk_object_time,
-	(duk_c_function) duk_builtin_duk_object_yield,
 	(duk_c_function) duk_builtin_error_constructor,
+	(duk_c_function) duk_builtin_error_prototype_filename_getter,
+	(duk_c_function) duk_builtin_error_prototype_linenumber_getter,
+	(duk_c_function) duk_builtin_error_prototype_nop_setter,
+	(duk_c_function) duk_builtin_error_prototype_stack_getter,
 	(duk_c_function) duk_builtin_error_prototype_to_string,
 	(duk_c_function) duk_builtin_eval_error_constructor,
 	(duk_c_function) duk_builtin_function_constructor,
@@ -19822,6 +22850,9 @@ duk_c_function duk_builtin_native_functions[] = {
 	(duk_c_function) duk_builtin_object_prototype_to_locale_string,
 	(duk_c_function) duk_builtin_object_prototype_to_string,
 	(duk_c_function) duk_builtin_object_prototype_value_of,
+	(duk_c_function) duk_builtin_pointer_constructor,
+	(duk_c_function) duk_builtin_pointer_prototype_to_string,
+	(duk_c_function) duk_builtin_pointer_prototype_value_of,
 	(duk_c_function) duk_builtin_range_error_constructor,
 	(duk_c_function) duk_builtin_reference_error_constructor,
 	(duk_c_function) duk_builtin_regexp_constructor,
@@ -19851,247 +22882,3067 @@ duk_c_function duk_builtin_native_functions[] = {
 	(duk_c_function) duk_builtin_string_prototype_trim,
 	(duk_c_function) duk_builtin_string_prototype_value_of,
 	(duk_c_function) duk_builtin_syntax_error_constructor,
-	(duk_c_function) duk_builtin_thread_prototype_to_string,
+	(duk_c_function) duk_builtin_thread_constructor,
+	(duk_c_function) duk_builtin_thread_current,
+	(duk_c_function) duk_builtin_thread_resume,
+	(duk_c_function) duk_builtin_thread_yield,
+	(duk_c_function) duk_builtin_type_error_constructor,
+	(duk_c_function) duk_builtin_type_error_thrower,
+	(duk_c_function) duk_builtin_uri_error_constructor,
+	(duk_c_function) duk_builtin_array_constructor,
+	(duk_c_function) duk_builtin_array_constructor_is_array,
+	(duk_c_function) duk_builtin_array_prototype_concat,
+	(duk_c_function) duk_builtin_array_prototype_every,
+	(duk_c_function) duk_builtin_array_prototype_filter,
+	(duk_c_function) duk_builtin_array_prototype_for_each,
+	(duk_c_function) duk_builtin_array_prototype_index_of,
+	(duk_c_function) duk_builtin_array_prototype_join,
+	(duk_c_function) duk_builtin_array_prototype_last_index_of,
+	(duk_c_function) duk_builtin_array_prototype_map,
+	(duk_c_function) duk_builtin_array_prototype_pop,
+	(duk_c_function) duk_builtin_array_prototype_push,
+	(duk_c_function) duk_builtin_array_prototype_reduce,
+	(duk_c_function) duk_builtin_array_prototype_reduce_right,
+	(duk_c_function) duk_builtin_array_prototype_reverse,
+	(duk_c_function) duk_builtin_array_prototype_shift,
+	(duk_c_function) duk_builtin_array_prototype_slice,
+	(duk_c_function) duk_builtin_array_prototype_some,
+	(duk_c_function) duk_builtin_array_prototype_sort,
+	(duk_c_function) duk_builtin_array_prototype_splice,
+	(duk_c_function) duk_builtin_array_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_array_prototype_to_string,
+	(duk_c_function) duk_builtin_array_prototype_unshift,
+	(duk_c_function) duk_builtin_boolean_constructor,
+	(duk_c_function) duk_builtin_boolean_prototype_to_string,
+	(duk_c_function) duk_builtin_boolean_prototype_value_of,
+	(duk_c_function) duk_builtin_buffer_constructor,
+	(duk_c_function) duk_builtin_buffer_prototype_to_string,
+	(duk_c_function) duk_builtin_buffer_prototype_value_of,
+	(duk_c_function) duk_builtin_date_constructor,
+	(duk_c_function) duk_builtin_date_constructor_now,
+	(duk_c_function) duk_builtin_date_constructor_parse,
+	(duk_c_function) duk_builtin_date_constructor_utc,
+	(duk_c_function) duk_builtin_date_prototype_get_date,
+	(duk_c_function) duk_builtin_date_prototype_get_day,
+	(duk_c_function) duk_builtin_date_prototype_get_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_month,
+	(duk_c_function) duk_builtin_date_prototype_get_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_timezone_offset,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_day,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_year,
+	(duk_c_function) duk_builtin_date_prototype_set_date,
+	(duk_c_function) duk_builtin_date_prototype_set_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_month,
+	(duk_c_function) duk_builtin_date_prototype_set_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_time,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_year,
+	(duk_c_function) duk_builtin_date_prototype_to_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_iso_string,
+	(duk_c_function) duk_builtin_date_prototype_to_json,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_string,
+	(duk_c_function) duk_builtin_date_prototype_to_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_utc_string,
+	(duk_c_function) duk_builtin_date_prototype_value_of,
+	(duk_c_function) duk_builtin_duk_object_addr,
+	(duk_c_function) duk_builtin_duk_object_dec,
+	(duk_c_function) duk_builtin_duk_object_enc,
+	(duk_c_function) duk_builtin_duk_object_gc,
+	(duk_c_function) duk_builtin_duk_object_get_finalizer,
+	(duk_c_function) duk_builtin_duk_object_refc,
+	(duk_c_function) duk_builtin_duk_object_set_finalizer,
+	(duk_c_function) duk_builtin_error_constructor,
+	(duk_c_function) duk_builtin_error_prototype_filename_getter,
+	(duk_c_function) duk_builtin_error_prototype_linenumber_getter,
+	(duk_c_function) duk_builtin_error_prototype_nop_setter,
+	(duk_c_function) duk_builtin_error_prototype_stack_getter,
+	(duk_c_function) duk_builtin_error_prototype_to_string,
+	(duk_c_function) duk_builtin_eval_error_constructor,
+	(duk_c_function) duk_builtin_function_constructor,
+	(duk_c_function) duk_builtin_function_prototype,
+	(duk_c_function) duk_builtin_function_prototype_apply,
+	(duk_c_function) duk_builtin_function_prototype_bind,
+	(duk_c_function) duk_builtin_function_prototype_call,
+	(duk_c_function) duk_builtin_function_prototype_to_string,
+	(duk_c_function) duk_builtin_global_object_alert,
+	(duk_c_function) duk_builtin_global_object_decode_uri,
+	(duk_c_function) duk_builtin_global_object_decode_uri_component,
+	(duk_c_function) duk_builtin_global_object_encode_uri,
+	(duk_c_function) duk_builtin_global_object_encode_uri_component,
+	(duk_c_function) duk_builtin_global_object_escape,
+	(duk_c_function) duk_builtin_global_object_eval,
+	(duk_c_function) duk_builtin_global_object_is_finite,
+	(duk_c_function) duk_builtin_global_object_is_nan,
+	(duk_c_function) duk_builtin_global_object_parse_float,
+	(duk_c_function) duk_builtin_global_object_parse_int,
+	(duk_c_function) duk_builtin_global_object_print,
+	(duk_c_function) duk_builtin_global_object_unescape,
+	(duk_c_function) duk_builtin_json_object_parse,
+	(duk_c_function) duk_builtin_json_object_stringify,
+	(duk_c_function) duk_builtin_math_object_abs,
+	(duk_c_function) duk_builtin_math_object_acos,
+	(duk_c_function) duk_builtin_math_object_asin,
+	(duk_c_function) duk_builtin_math_object_atan,
+	(duk_c_function) duk_builtin_math_object_atan2,
+	(duk_c_function) duk_builtin_math_object_ceil,
+	(duk_c_function) duk_builtin_math_object_cos,
+	(duk_c_function) duk_builtin_math_object_exp,
+	(duk_c_function) duk_builtin_math_object_floor,
+	(duk_c_function) duk_builtin_math_object_log,
+	(duk_c_function) duk_builtin_math_object_max,
+	(duk_c_function) duk_builtin_math_object_min,
+	(duk_c_function) duk_builtin_math_object_pow,
+	(duk_c_function) duk_builtin_math_object_random,
+	(duk_c_function) duk_builtin_math_object_round,
+	(duk_c_function) duk_builtin_math_object_sin,
+	(duk_c_function) duk_builtin_math_object_sqrt,
+	(duk_c_function) duk_builtin_math_object_tan,
+	(duk_c_function) duk_builtin_number_constructor,
+	(duk_c_function) duk_builtin_number_prototype_to_exponential,
+	(duk_c_function) duk_builtin_number_prototype_to_fixed,
+	(duk_c_function) duk_builtin_number_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_number_prototype_to_precision,
+	(duk_c_function) duk_builtin_number_prototype_to_string,
+	(duk_c_function) duk_builtin_number_prototype_value_of,
+	(duk_c_function) duk_builtin_object_constructor,
+	(duk_c_function) duk_builtin_object_constructor_create,
+	(duk_c_function) duk_builtin_object_constructor_define_properties,
+	(duk_c_function) duk_builtin_object_constructor_define_property,
+	(duk_c_function) duk_builtin_object_constructor_freeze,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_descriptor,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_names,
+	(duk_c_function) duk_builtin_object_constructor_get_prototype_of,
+	(duk_c_function) duk_builtin_object_constructor_is_extensible,
+	(duk_c_function) duk_builtin_object_constructor_is_frozen,
+	(duk_c_function) duk_builtin_object_constructor_is_sealed,
+	(duk_c_function) duk_builtin_object_constructor_keys,
+	(duk_c_function) duk_builtin_object_constructor_prevent_extensions,
+	(duk_c_function) duk_builtin_object_constructor_seal,
+	(duk_c_function) duk_builtin_object_prototype_has_own_property,
+	(duk_c_function) duk_builtin_object_prototype_is_prototype_of,
+	(duk_c_function) duk_builtin_object_prototype_property_is_enumerable,
+	(duk_c_function) duk_builtin_object_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_object_prototype_to_string,
+	(duk_c_function) duk_builtin_object_prototype_value_of,
+	(duk_c_function) duk_builtin_pointer_constructor,
+	(duk_c_function) duk_builtin_pointer_prototype_to_string,
+	(duk_c_function) duk_builtin_pointer_prototype_value_of,
+	(duk_c_function) duk_builtin_range_error_constructor,
+	(duk_c_function) duk_builtin_reference_error_constructor,
+	(duk_c_function) duk_builtin_regexp_constructor,
+	(duk_c_function) duk_builtin_regexp_prototype_exec,
+	(duk_c_function) duk_builtin_regexp_prototype_test,
+	(duk_c_function) duk_builtin_regexp_prototype_to_string,
+	(duk_c_function) duk_builtin_string_constructor,
+	(duk_c_function) duk_builtin_string_constructor_from_char_code,
+	(duk_c_function) duk_builtin_string_prototype_char_at,
+	(duk_c_function) duk_builtin_string_prototype_char_code_at,
+	(duk_c_function) duk_builtin_string_prototype_concat,
+	(duk_c_function) duk_builtin_string_prototype_index_of,
+	(duk_c_function) duk_builtin_string_prototype_last_index_of,
+	(duk_c_function) duk_builtin_string_prototype_locale_compare,
+	(duk_c_function) duk_builtin_string_prototype_match,
+	(duk_c_function) duk_builtin_string_prototype_replace,
+	(duk_c_function) duk_builtin_string_prototype_search,
+	(duk_c_function) duk_builtin_string_prototype_slice,
+	(duk_c_function) duk_builtin_string_prototype_split,
+	(duk_c_function) duk_builtin_string_prototype_substr,
+	(duk_c_function) duk_builtin_string_prototype_substring,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_to_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_string,
+	(duk_c_function) duk_builtin_string_prototype_to_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_trim,
+	(duk_c_function) duk_builtin_string_prototype_value_of,
+	(duk_c_function) duk_builtin_syntax_error_constructor,
+	(duk_c_function) duk_builtin_thread_constructor,
+	(duk_c_function) duk_builtin_thread_current,
+	(duk_c_function) duk_builtin_thread_resume,
+	(duk_c_function) duk_builtin_thread_yield,
+	(duk_c_function) duk_builtin_type_error_constructor,
+	(duk_c_function) duk_builtin_type_error_thrower,
+	(duk_c_function) duk_builtin_uri_error_constructor,
+	(duk_c_function) duk_builtin_array_constructor,
+	(duk_c_function) duk_builtin_array_constructor_is_array,
+	(duk_c_function) duk_builtin_array_prototype_concat,
+	(duk_c_function) duk_builtin_array_prototype_every,
+	(duk_c_function) duk_builtin_array_prototype_filter,
+	(duk_c_function) duk_builtin_array_prototype_for_each,
+	(duk_c_function) duk_builtin_array_prototype_index_of,
+	(duk_c_function) duk_builtin_array_prototype_join,
+	(duk_c_function) duk_builtin_array_prototype_last_index_of,
+	(duk_c_function) duk_builtin_array_prototype_map,
+	(duk_c_function) duk_builtin_array_prototype_pop,
+	(duk_c_function) duk_builtin_array_prototype_push,
+	(duk_c_function) duk_builtin_array_prototype_reduce,
+	(duk_c_function) duk_builtin_array_prototype_reduce_right,
+	(duk_c_function) duk_builtin_array_prototype_reverse,
+	(duk_c_function) duk_builtin_array_prototype_shift,
+	(duk_c_function) duk_builtin_array_prototype_slice,
+	(duk_c_function) duk_builtin_array_prototype_some,
+	(duk_c_function) duk_builtin_array_prototype_sort,
+	(duk_c_function) duk_builtin_array_prototype_splice,
+	(duk_c_function) duk_builtin_array_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_array_prototype_to_string,
+	(duk_c_function) duk_builtin_array_prototype_unshift,
+	(duk_c_function) duk_builtin_boolean_constructor,
+	(duk_c_function) duk_builtin_boolean_prototype_to_string,
+	(duk_c_function) duk_builtin_boolean_prototype_value_of,
+	(duk_c_function) duk_builtin_buffer_constructor,
+	(duk_c_function) duk_builtin_buffer_prototype_to_string,
+	(duk_c_function) duk_builtin_buffer_prototype_value_of,
+	(duk_c_function) duk_builtin_date_constructor,
+	(duk_c_function) duk_builtin_date_constructor_now,
+	(duk_c_function) duk_builtin_date_constructor_parse,
+	(duk_c_function) duk_builtin_date_constructor_utc,
+	(duk_c_function) duk_builtin_date_prototype_get_date,
+	(duk_c_function) duk_builtin_date_prototype_get_day,
+	(duk_c_function) duk_builtin_date_prototype_get_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_month,
+	(duk_c_function) duk_builtin_date_prototype_get_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_timezone_offset,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_day,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_year,
+	(duk_c_function) duk_builtin_date_prototype_set_date,
+	(duk_c_function) duk_builtin_date_prototype_set_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_month,
+	(duk_c_function) duk_builtin_date_prototype_set_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_time,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_year,
+	(duk_c_function) duk_builtin_date_prototype_to_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_iso_string,
+	(duk_c_function) duk_builtin_date_prototype_to_json,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_string,
+	(duk_c_function) duk_builtin_date_prototype_to_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_utc_string,
+	(duk_c_function) duk_builtin_date_prototype_value_of,
+	(duk_c_function) duk_builtin_duk_object_addr,
+	(duk_c_function) duk_builtin_duk_object_dec,
+	(duk_c_function) duk_builtin_duk_object_enc,
+	(duk_c_function) duk_builtin_duk_object_gc,
+	(duk_c_function) duk_builtin_duk_object_get_finalizer,
+	(duk_c_function) duk_builtin_duk_object_refc,
+	(duk_c_function) duk_builtin_duk_object_set_finalizer,
+	(duk_c_function) duk_builtin_error_constructor,
+	(duk_c_function) duk_builtin_error_prototype_filename_getter,
+	(duk_c_function) duk_builtin_error_prototype_linenumber_getter,
+	(duk_c_function) duk_builtin_error_prototype_nop_setter,
+	(duk_c_function) duk_builtin_error_prototype_stack_getter,
+	(duk_c_function) duk_builtin_error_prototype_to_string,
+	(duk_c_function) duk_builtin_eval_error_constructor,
+	(duk_c_function) duk_builtin_function_constructor,
+	(duk_c_function) duk_builtin_function_prototype,
+	(duk_c_function) duk_builtin_function_prototype_apply,
+	(duk_c_function) duk_builtin_function_prototype_bind,
+	(duk_c_function) duk_builtin_function_prototype_call,
+	(duk_c_function) duk_builtin_function_prototype_to_string,
+	(duk_c_function) duk_builtin_global_object_alert,
+	(duk_c_function) duk_builtin_global_object_decode_uri,
+	(duk_c_function) duk_builtin_global_object_decode_uri_component,
+	(duk_c_function) duk_builtin_global_object_encode_uri,
+	(duk_c_function) duk_builtin_global_object_encode_uri_component,
+	(duk_c_function) duk_builtin_global_object_escape,
+	(duk_c_function) duk_builtin_global_object_eval,
+	(duk_c_function) duk_builtin_global_object_is_finite,
+	(duk_c_function) duk_builtin_global_object_is_nan,
+	(duk_c_function) duk_builtin_global_object_parse_float,
+	(duk_c_function) duk_builtin_global_object_parse_int,
+	(duk_c_function) duk_builtin_global_object_print,
+	(duk_c_function) duk_builtin_global_object_unescape,
+	(duk_c_function) duk_builtin_json_object_parse,
+	(duk_c_function) duk_builtin_json_object_stringify,
+	(duk_c_function) duk_builtin_math_object_abs,
+	(duk_c_function) duk_builtin_math_object_acos,
+	(duk_c_function) duk_builtin_math_object_asin,
+	(duk_c_function) duk_builtin_math_object_atan,
+	(duk_c_function) duk_builtin_math_object_atan2,
+	(duk_c_function) duk_builtin_math_object_ceil,
+	(duk_c_function) duk_builtin_math_object_cos,
+	(duk_c_function) duk_builtin_math_object_exp,
+	(duk_c_function) duk_builtin_math_object_floor,
+	(duk_c_function) duk_builtin_math_object_log,
+	(duk_c_function) duk_builtin_math_object_max,
+	(duk_c_function) duk_builtin_math_object_min,
+	(duk_c_function) duk_builtin_math_object_pow,
+	(duk_c_function) duk_builtin_math_object_random,
+	(duk_c_function) duk_builtin_math_object_round,
+	(duk_c_function) duk_builtin_math_object_sin,
+	(duk_c_function) duk_builtin_math_object_sqrt,
+	(duk_c_function) duk_builtin_math_object_tan,
+	(duk_c_function) duk_builtin_number_constructor,
+	(duk_c_function) duk_builtin_number_prototype_to_exponential,
+	(duk_c_function) duk_builtin_number_prototype_to_fixed,
+	(duk_c_function) duk_builtin_number_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_number_prototype_to_precision,
+	(duk_c_function) duk_builtin_number_prototype_to_string,
+	(duk_c_function) duk_builtin_number_prototype_value_of,
+	(duk_c_function) duk_builtin_object_constructor,
+	(duk_c_function) duk_builtin_object_constructor_create,
+	(duk_c_function) duk_builtin_object_constructor_define_properties,
+	(duk_c_function) duk_builtin_object_constructor_define_property,
+	(duk_c_function) duk_builtin_object_constructor_freeze,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_descriptor,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_names,
+	(duk_c_function) duk_builtin_object_constructor_get_prototype_of,
+	(duk_c_function) duk_builtin_object_constructor_is_extensible,
+	(duk_c_function) duk_builtin_object_constructor_is_frozen,
+	(duk_c_function) duk_builtin_object_constructor_is_sealed,
+	(duk_c_function) duk_builtin_object_constructor_keys,
+	(duk_c_function) duk_builtin_object_constructor_prevent_extensions,
+	(duk_c_function) duk_builtin_object_constructor_seal,
+	(duk_c_function) duk_builtin_object_prototype_has_own_property,
+	(duk_c_function) duk_builtin_object_prototype_is_prototype_of,
+	(duk_c_function) duk_builtin_object_prototype_property_is_enumerable,
+	(duk_c_function) duk_builtin_object_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_object_prototype_to_string,
+	(duk_c_function) duk_builtin_object_prototype_value_of,
+	(duk_c_function) duk_builtin_pointer_constructor,
+	(duk_c_function) duk_builtin_pointer_prototype_to_string,
+	(duk_c_function) duk_builtin_pointer_prototype_value_of,
+	(duk_c_function) duk_builtin_range_error_constructor,
+	(duk_c_function) duk_builtin_reference_error_constructor,
+	(duk_c_function) duk_builtin_regexp_constructor,
+	(duk_c_function) duk_builtin_regexp_prototype_exec,
+	(duk_c_function) duk_builtin_regexp_prototype_test,
+	(duk_c_function) duk_builtin_regexp_prototype_to_string,
+	(duk_c_function) duk_builtin_string_constructor,
+	(duk_c_function) duk_builtin_string_constructor_from_char_code,
+	(duk_c_function) duk_builtin_string_prototype_char_at,
+	(duk_c_function) duk_builtin_string_prototype_char_code_at,
+	(duk_c_function) duk_builtin_string_prototype_concat,
+	(duk_c_function) duk_builtin_string_prototype_index_of,
+	(duk_c_function) duk_builtin_string_prototype_last_index_of,
+	(duk_c_function) duk_builtin_string_prototype_locale_compare,
+	(duk_c_function) duk_builtin_string_prototype_match,
+	(duk_c_function) duk_builtin_string_prototype_replace,
+	(duk_c_function) duk_builtin_string_prototype_search,
+	(duk_c_function) duk_builtin_string_prototype_slice,
+	(duk_c_function) duk_builtin_string_prototype_split,
+	(duk_c_function) duk_builtin_string_prototype_substr,
+	(duk_c_function) duk_builtin_string_prototype_substring,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_to_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_string,
+	(duk_c_function) duk_builtin_string_prototype_to_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_trim,
+	(duk_c_function) duk_builtin_string_prototype_value_of,
+	(duk_c_function) duk_builtin_syntax_error_constructor,
+	(duk_c_function) duk_builtin_thread_constructor,
+	(duk_c_function) duk_builtin_thread_current,
+	(duk_c_function) duk_builtin_thread_resume,
+	(duk_c_function) duk_builtin_thread_yield,
 	(duk_c_function) duk_builtin_type_error_constructor,
 	(duk_c_function) duk_builtin_type_error_thrower,
 	(duk_c_function) duk_builtin_uri_error_constructor,
 };
 
 char duk_builtins_data[] = {
-(char)'\xd7', (char)'\x1a', (char)'\x62', (char)'\x41', (char)'\xad', 
-(char)'\x1a', (char)'\x56', (char)'\xc1', (char)'\x9f', (char)'\x68', 
-(char)'\x5c', (char)'\x00', (char)'\x0d', (char)'\x20', (char)'\x00', 
-(char)'\xbf', (char)'\x94', (char)'\x34', (char)'\xd1', (char)'\x82', 
-(char)'\xbf', (char)'\x86', (char)'\x91', (char)'\x70', (char)'\x4a', 
-(char)'\x66', (char)'\x98', (char)'\x20', (char)'\x47', (char)'\xe4', 
-(char)'\xde', (char)'\x34', (char)'\x07', (char)'\xfa', (char)'\x1a', 
-(char)'\xa7', (char)'\xc0', (char)'\xcd', (char)'\x9a', (char)'\x56', 
-(char)'\x00', (char)'\xaa', (char)'\x9a', (char)'\x56', (char)'\xa0', 
-(char)'\x0a', (char)'\x9a', (char)'\x67', (char)'\x5f', (char)'\xea', 
-(char)'\x9a', (char)'\x67', (char)'\x9f', (char)'\xca', (char)'\x9a', 
-(char)'\x6e', (char)'\x5f', (char)'\xaa', (char)'\x9a', (char)'\x6e', 
-(char)'\xdf', (char)'\x8a', (char)'\x9a', (char)'\x6f', (char)'\x5f', 
-(char)'\x6a', (char)'\xa0', (char)'\xe6', (char)'\x8b', (char)'\xc2', 
-(char)'\x01', (char)'\x4a', (char)'\x28', (char)'\x3f', (char)'\xff', 
-(char)'\x55', (char)'\x53', (char)'\x00', (char)'\x00', (char)'\x00', 
-(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x03', (char)'\xe1', 
-(char)'\xfc', (char)'\x95', (char)'\x00', (char)'\x00', (char)'\x00', 
-(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x03', (char)'\xc1', 
-(char)'\xfc', (char)'\x9f', (char)'\x10', (char)'\x1a', (char)'\x61', 
-(char)'\x03', (char)'\x0c', (char)'\x40', (char)'\x59', (char)'\x8c', 
-(char)'\x0a', (char)'\x32', (char)'\x01', (char)'\x26', (char)'\x50', 
-(char)'\x20', (char)'\xcc', (char)'\x03', (char)'\x99', (char)'\xc0', 
-(char)'\x63', (char)'\x40', (char)'\x0a', (char)'\x69', (char)'\x40', 
-(char)'\x0d', (char)'\x47', (char)'\xf9', (char)'\xac', (char)'\xfe', 
-(char)'\x36', (char)'\x1f', (char)'\xa6', (char)'\xd3', (char)'\xf0', 
-(char)'\xdc', (char)'\x7d', (char)'\x9b', (char)'\xc0', (char)'\x43', 
-(char)'\x80', (char)'\x06', (char)'\x70', (char)'\x88', (char)'\x8e', 
-(char)'\x33', (char)'\x5f', (char)'\x4c', (char)'\xe4', (char)'\xf9', 
-(char)'\x6b', (char)'\x47', (char)'\xc3', (char)'\x51', (char)'\x3d', 
-(char)'\xda', (char)'\x49', (char)'\xec', (char)'\xd0', (char)'\x4f', 
-(char)'\x56', (char)'\x22', (char)'\x7a', (char)'\x31', (char)'\x93', 
-(char)'\xcd', (char)'\x90', (char)'\x9e', (char)'\x4c', (char)'\xa4', 
-(char)'\xf1', (char)'\x66', (char)'\x27', (char)'\x83', (char)'\x69', 
-(char)'\x3b', (char)'\xdb', (char)'\x07', (char)'\xbb', (char)'\x98', 
-(char)'\x47', (char)'\xff', (char)'\xff', (char)'\xe0', (char)'\x8d', 
-(char)'\x21', (char)'\x80', (char)'\x00', (char)'\xa1', (char)'\xfe', 
-(char)'\x01', (char)'\xae', (char)'\xb9', (char)'\x02', (char)'\x75', 
-(char)'\x47', (char)'\x23', (char)'\xa6', (char)'\x3c', (char)'\x9d', 
-(char)'\x11', (char)'\x48', (char)'\xe7', (char)'\x8c', (char)'\x67', 
-(char)'\x34', (char)'\x5a', (char)'\x39', (char)'\x65', (char)'\x89', 
-(char)'\xc9', (char)'\x1a', (char)'\x4e', (char)'\x39', (char)'\x52', 
-(char)'\x71', (char)'\x49', (char)'\x93', (char)'\x86', (char)'\x48', 
-(char)'\x9c', (char)'\x12', (char)'\x24', (char)'\xdf', (char)'\x94', 
-(char)'\x2f', (char)'\xff', (char)'\x08', (char)'\x01', (char)'\x9b', 
-(char)'\x33', (char)'\x60', (char)'\xd8', (char)'\x9a', (char)'\x06', 
-(char)'\xbc', (char)'\xe0', (char)'\x35', (char)'\xa5', (char)'\xc9', 
-(char)'\xab', (char)'\x30', (char)'\x4d', (char)'\x49', (char)'\x92', 
-(char)'\x14', (char)'\x5f', (char)'\xc0', (char)'\x00', (char)'\x3f', 
-(char)'\xc4', (char)'\x00', (char)'\x46', (char)'\xcb', (char)'\x01', 
-(char)'\x34', (char)'\xd7', (char)'\x51', (char)'\xa4', (char)'\xbe', 
-(char)'\x7d', (char)'\xa2', (char)'\xbc', (char)'\x7c', (char)'\x51', 
-(char)'\xff', (char)'\x00', (char)'\x16', (char)'\x70', (char)'\x09', 
-(char)'\x07', (char)'\xf8', (char)'\xc0', (char)'\x2a', (char)'\xd9', 
-(char)'\x15', (char)'\x06', (char)'\xc0', (char)'\xa0', (char)'\x33', 
-(char)'\x40', (char)'\x8f', (char)'\xb3', (char)'\x01', (char)'\xc9', 
-(char)'\x96', (char)'\x14', (char)'\x0c', (char)'\xa0', (char)'\xb3', 
-(char)'\xec', (char)'\x90', (char)'\xe0', (char)'\x64', (char)'\x07', 
-(char)'\x83', (char)'\x1c', (char)'\x41', (char)'\x18', (char)'\xc2', 
-(char)'\x44', (char)'\xc5', (char)'\x13', (char)'\x5e', (char)'\xc4', 
-(char)'\x16', (char)'\x3e', (char)'\xc3', (char)'\x06', (char)'\x3e', 
-(char)'\xc2', (char)'\x08', (char)'\x3e', (char)'\xc1', (char)'\x03', 
-(char)'\x34', (char)'\xc0', (char)'\x11', (char)'\x34', (char)'\xbf', 
-(char)'\x05', (char)'\x34', (char)'\xbe', (char)'\x09', (char)'\x34', 
-(char)'\xbd', (char)'\x04', (char)'\x34', (char)'\xbc', (char)'\x0c', 
-(char)'\x3e', (char)'\xbb', (char)'\x0d', (char)'\x3e', (char)'\x29', 
-(char)'\x3f', (char)'\x80', (char)'\x0a', (char)'\xea', (char)'\x90', 
-(char)'\xf8', (char)'\x7f', (char)'\x90', (char)'\x08', (char)'\xd6', 
-(char)'\x10', (char)'\x01', (char)'\x46', (char)'\xcd', (char)'\xa8', 
-(char)'\x35', (char)'\xee', (char)'\x01', (char)'\x73', (char)'\x4a', 
-(char)'\x4b', (char)'\x8a', (char)'\x62', (char)'\x66', (char)'\xd3', 
-(char)'\x9f', (char)'\x61', (char)'\xd4', (char)'\x1a', (char)'\x61', 
-(char)'\x54', (char)'\x9a', (char)'\x5b', (char)'\xd5', (char)'\x12', 
-(char)'\xda', (char)'\xac', (char)'\x96', (char)'\xb5', (char)'\x88', 
-(char)'\xb4', (char)'\xad', (char)'\x26', (char)'\x3d', (char)'\x72', 
-(char)'\x2c', (char)'\xeb', (char)'\xd1', (char)'\x65', (char)'\x62', 
-(char)'\x8b', (char)'\x1b', (char)'\x40', (char)'\x58', (char)'\x59', 
-(char)'\x02', (char)'\xbe', (char)'\xd8', (char)'\x15', (char)'\xd6', 
-(char)'\x60', (char)'\xad', (char)'\xb7', (char)'\x05', (char)'\x65', 
-(char)'\x82', (char)'\x0a', (char)'\x5f', (char)'\xe0', (char)'\x00', 
-(char)'\x1f', (char)'\xe5', (char)'\x02', (char)'\x35', (char)'\x8c', 
-(char)'\x13', (char)'\x64', (char)'\x60', (char)'\x1a', (char)'\xe3', 
-(char)'\x20', (char)'\x29', (char)'\xbf', (char)'\x8a', (char)'\xab', 
-(char)'\x81', (char)'\xff', (char)'\xff', (char)'\xff', (char)'\xff', 
-(char)'\xff', (char)'\xff', (char)'\xde', (char)'\xfe', (char)'\xaa', 
-(char)'\x80', (char)'\x02', (char)'\x00', (char)'\x00', (char)'\x00', 
-(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\xa9', 
-(char)'\x80', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
-(char)'\x00', (char)'\x01', (char)'\xf0', (char)'\xfe', (char)'\xa7', 
-(char)'\x80', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
-(char)'\x00', (char)'\x01', (char)'\xe0', (char)'\xfe', (char)'\xa8', 
-(char)'\x80', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
-(char)'\x00', (char)'\x01', (char)'\xe1', (char)'\xfe', (char)'\x00', 
-(char)'\x7f', (char)'\x98', (char)'\x08', (char)'\xd6', (char)'\x00', 
+(char)'\x69', (char)'\xc3', (char)'\x4c', (char)'\x48', (char)'\x49', 
+(char)'\x50', (char)'\xd2', (char)'\xb6', (char)'\x11', (char)'\xf9', 
+(char)'\xa1', (char)'\x70', (char)'\x0a', (char)'\x1a', (char)'\x40', 
+(char)'\x02', (char)'\x1f', (char)'\x14', (char)'\x1a', (char)'\x69', 
+(char)'\x81', (char)'\xff', (char)'\x60', (char)'\xd2', (char)'\x2e', 
+(char)'\x0e', (char)'\x46', (char)'\x34', (char)'\xc1', (char)'\x03', 
+(char)'\x7e', (char)'\x91', (char)'\xbc', (char)'\x74', (char)'\x19', 
+(char)'\xf2', (char)'\x0d', (char)'\x54', (char)'\x40', (char)'\xb5', 
+(char)'\x63', (char)'\x4a', (char)'\xa0', (char)'\x29', (char)'\x28', 
+(char)'\xd2', (char)'\xb5', (char)'\x01', (char)'\x4a', (char)'\x34', 
+(char)'\xd0', (char)'\x40', (char)'\x12', (char)'\x8d', (char)'\x34', 
+(char)'\x2f', (char)'\xf4', (char)'\xa3', (char)'\x4d', (char)'\xe3', 
+(char)'\xf9', (char)'\x28', (char)'\xd3', (char)'\x82', (char)'\xfd', 
+(char)'\x4a', (char)'\x34', (char)'\xe1', (char)'\xbf', (char)'\x12', 
+(char)'\x90', (char)'\x38', (char)'\xd1', (char)'\x84', (char)'\x3f', 
+(char)'\x14', (char)'\x34', (char)'\xde', (char)'\x80', (char)'\x3f', 
+(char)'\x21', (char)'\xa4', (char)'\x68', (char)'\x05', (char)'\xf8', 
+(char)'\x0d', (char)'\x33', (char)'\xa0', (char)'\x1f', (char)'\xc4', 
+(char)'\x50', (char)'\x7f', (char)'\xfe', (char)'\xaa', (char)'\xaa', 
 (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
-(char)'\x00', (char)'\x00', (char)'\x00', (char)'\xcd', (char)'\x98', 
-(char)'\x72', (char)'\x6c', (char)'\x42', (char)'\x93', (char)'\x5e', 
-(char)'\x20', (char)'\x14', (char)'\xd0', (char)'\x84', (char)'\xa5', 
-(char)'\x83', (char)'\x25', (char)'\x24', (char)'\x31', (char)'\x0a', 
-(char)'\x7f', (char)'\xe0', (char)'\x06', (char)'\xa3', (char)'\x1c', 
-(char)'\x25', (char)'\x10', (char)'\xef', (char)'\xf5', (char)'\x08', 
-(char)'\xd8', (char)'\x07', (char)'\xf9', (char)'\xc0', (char)'\x8d', 
-(char)'\x64', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
-(char)'\x00', (char)'\x00', (char)'\x7c', (char)'\x3f', (char)'\xda', 
-(char)'\xd9', (char)'\x46', (char)'\x05', (char)'\x02', (char)'\x00', 
-(char)'\x27', (char)'\xd1', (char)'\xc1', (char)'\xb0', (char)'\x88', 
-(char)'\x09', (char)'\xe4', (char)'\x30', (char)'\x4e', (char)'\xa2', 
-(char)'\x83', (char)'\x5d', (char)'\x24', (char)'\x13', (char)'\x89', 
-(char)'\x20', (char)'\x9b', (char)'\x20', (char)'\x04', (char)'\xd1', 
-(char)'\x48', (char)'\x26', (char)'\x49', (char)'\x01', (char)'\x30', 
-(char)'\x5a', (char)'\x09', (char)'\x71', (char)'\xe0', (char)'\x4b', 
-(char)'\x13', (char)'\x82', (char)'\x54', (char)'\x7c', (char)'\x12', 
-(char)'\x85', (char)'\x00', (char)'\x93', (char)'\x21', (char)'\x04', 
-(char)'\x91', (char)'\x50', (char)'\x24', (char)'\x48', (char)'\xc1', 
-(char)'\x20', (char)'\x58', (char)'\x08', (char)'\xf2', (char)'\x50', 
-(char)'\x47', (char)'\x17', (char)'\x02', (char)'\x34', (char)'\x88', 
-(char)'\x11', (char)'\x85', (char)'\x60', (char)'\x8b', (char)'\x26', 
-(char)'\x04', (char)'\x51', (char)'\xb9', (char)'\x22', (char)'\x4c', 
-(char)'\xc9', (char)'\x10', (char)'\x76', (char)'\x48', (char)'\x73', 
-(char)'\x65', (char)'\xe8', (char)'\x63', (char)'\xe5', (char)'\xe8', 
-(char)'\x53', (char)'\x47', (char)'\xe8', (char)'\x43', (char)'\xc7', 
-(char)'\xe8', (char)'\x33', (char)'\x29', (char)'\xe8', (char)'\x23', 
-(char)'\xa9', (char)'\xe8', (char)'\x13', (char)'\x02', (char)'\x40', 
-(char)'\x1c', (char)'\x11', (char)'\xfc', (char)'\xd5', (char)'\x79', 
-(char)'\xf8', (char)'\xf5', (char)'\x79', (char)'\xf4', (char)'\xc5', 
-(char)'\xf9', (char)'\xf0', (char)'\xe5', (char)'\xf9', (char)'\xed', 
-(char)'\x20', (char)'\x0f', (char)'\x48', (char)'\x20', (char)'\x79', 
-(char)'\x42', (char)'\x23', (char)'\xc1', (char)'\x78', (char)'\x1d', 
-(char)'\xcf', (char)'\xc8', (char)'\x54', (char)'\x7f', (char)'\x00', 
-(char)'\x00', (char)'\xff', (char)'\x40', (char)'\x61', (char)'\x94', 
-(char)'\x10', (char)'\x30', (char)'\x00', (char)'\x80', (char)'\x9c', 
-(char)'\xe1', (char)'\x1b', (char)'\xc0', (char)'\x31', (char)'\x8e', 
-(char)'\x51', (char)'\x8e', (char)'\x31', (char)'\x8e', (char)'\x12', 
+(char)'\x00', (char)'\x07', (char)'\xc3', (char)'\xf9', (char)'\x2e', 
 (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
-(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x03', (char)'\x3a', 
-(char)'\xd0', (char)'\x11', (char)'\xd2', (char)'\x84', (char)'\x9b', 
-(char)'\x34', (char)'\x40', (char)'\x2a', (char)'\x7f', (char)'\x80', 
-(char)'\x00', (char)'\x7f', (char)'\xa4', (char)'\x11', (char)'\xb0', 
-(char)'\x80', (char)'\xa6', (char)'\xb2', (char)'\x00', (char)'\x02', 
-(char)'\xd9', (char)'\x59', (char)'\x01', (char)'\x55', (char)'\xfc', 
-(char)'\x00', (char)'\x13', (char)'\xfd', (char)'\x40', (char)'\x8d', 
-(char)'\x85', (char)'\x00', (char)'\x35', (char)'\x90', (char)'\x00', 
-(char)'\x01', (char)'\x57', (char)'\xfc', (char)'\x00', (char)'\x13', 
-(char)'\xfd', (char)'\x60', (char)'\x8d', (char)'\x84', (char)'\xff', 
-(char)'\x35', (char)'\x90', (char)'\x00', (char)'\x01', (char)'\x59', 
-(char)'\xfc', (char)'\x00', (char)'\x13', (char)'\xfd', (char)'\x80', 
-(char)'\x8d', (char)'\x84', (char)'\xfe', (char)'\x35', (char)'\x90', 
-(char)'\x00', (char)'\x01', (char)'\x5b', (char)'\xfc', (char)'\x00', 
-(char)'\x13', (char)'\xfd', (char)'\xa0', (char)'\x8d', (char)'\x84', 
-(char)'\xfd', (char)'\x35', (char)'\x90', (char)'\x00', (char)'\x01', 
-(char)'\x5d', (char)'\xfc', (char)'\x00', (char)'\x13', (char)'\xfd', 
-(char)'\xc0', (char)'\x8d', (char)'\x84', (char)'\xfc', (char)'\x35', 
-(char)'\x90', (char)'\x00', (char)'\x01', (char)'\x5f', (char)'\xfc', 
-(char)'\x00', (char)'\x13', (char)'\xfd', (char)'\xe0', (char)'\x8d', 
-(char)'\x84', (char)'\xfb', (char)'\x35', (char)'\x90', (char)'\x00', 
-(char)'\x00', (char)'\xff', (char)'\xfc', (char)'\x83', (char)'\x54', 
-(char)'\x06', (char)'\x95', (char)'\x71', (char)'\x48', (char)'\xb0', 
-(char)'\xab', (char)'\xf0', (char)'\x54', (char)'\x03', (char)'\x4c', 
-(char)'\x01', (char)'\x65', (char)'\x5b', (char)'\x5b', (char)'\xbb', 
-(char)'\x16', (char)'\xb0', (char)'\x24', (char)'\x03', (char)'\x44', 
-(char)'\x0e', (char)'\xf3', (char)'\x9f', (char)'\xaf', (char)'\xe4', 
-(char)'\x22', (char)'\xee', (char)'\x63', (char)'\xf3', (char)'\x3c', 
-(char)'\x0f', (char)'\xe8', (char)'\x22', (char)'\xb6', (char)'\x54', 
-(char)'\x71', (char)'\x5f', (char)'\x73', (char)'\xf3', (char)'\x34', 
-(char)'\x00', (char)'\xee', (char)'\x52', (char)'\x61', (char)'\x57', 
-(char)'\xbc', (char)'\xbd', (char)'\xb3', (char)'\xf3', (char)'\x2c', 
-(char)'\x01', (char)'\x82', (char)'\xd4', (char)'\x45', (char)'\x4f', 
-(char)'\xb2', (char)'\x10', (char)'\x94', (char)'\x03', (char)'\x24', 
-(char)'\x0c', (char)'\xd3', (char)'\xb7', (char)'\xf6', (char)'\x69', 
-(char)'\xea', (char)'\x0e', (char)'\x63', (char)'\xf3', (char)'\x1c', 
-(char)'\x0c', (char)'\xd3', (char)'\xb7', (char)'\xf6', (char)'\x69', 
-(char)'\xea', (char)'\x0f', (char)'\x63', (char)'\xf4', (char)'\x8c', 
-(char)'\x4e', (char)'\x04', (char)'\x61', (char)'\x71', (char)'\x23', 
-(char)'\x03', (char)'\x91', (char)'\x17', (char)'\xdc', (char)'\xc8', 
-(char)'\xbc', (char)'\xe8', (char)'\x85', (char)'\xd7', (char)'\x52', 
-(char)'\x2e', (char)'\x3b', (char)'\x11', (char)'\x6d', (char)'\xdc', 
-(char)'\x8b', (char)'\x4f', (char)'\x04', (char)'\x59', (char)'\x79', 
-(char)'\x22', (char)'\xc3', (char)'\xd2', (char)'\xf2', (char)'\xbb', 
-(char)'\xda', (char)'\xf2', (char)'\xb3', (char)'\xe2', (char)'\x15', 
-(char)'\x5f', (char)'\x40', (char)'\xa8', (char)'\xfc', (char)'\x45', 
-(char)'\x37', (char)'\xf2', (char)'\x29', (char)'\x40', (char)'\x11', 
-(char)'\x46', (char)'\x04', (char)'\x83', (char)'\xff', (char)'\xf0', 
-(char)'\x02', (char)'\x51', (char)'\xb7', (char)'\x21', (char)'\x41', 
-(char)'\xbd', (char)'\x85', (char)'\xff', (char)'\xf0', (char)'\x00', 
-(char)'\x0f', (char)'\xff', (char)'\xc2', (char)'\x10', (char)'\xc1', 
-(char)'\x01', (char)'\x62', (char)'\x20', (char)'\x83', (char)'\x54', 
-(char)'\xc9', (char)'\x83', (char)'\x16', (char)'\x6b', (char)'\x58', 
-(char)'\x39', (char)'\x5a', (char)'\xc9', (char)'\x8b', (char)'\xb4', 
-(char)'\x13', (char)'\x34', (char)'\xee', (char)'\xeb', (char)'\xe1', 
-(char)'\x07', (char)'\x0c', (char)'\x3c', (char)'\x38', (char)'\x61', 
-(char)'\xe9', (char)'\xd7', (char)'\x77', (char)'\x4e', (char)'\x78', 
-(char)'\x50', (char)'\x33', (char)'\x5c', (char)'\xd1', (char)'\x73', 
-(char)'\x05', (char)'\xac', (char)'\x19', (char)'\xb0', (char)'\x68', 
-(char)'\xc1', (char)'\x82', (char)'\xdc', (char)'\xf9', (char)'\x77', 
-(char)'\x65', (char)'\xe5', (char)'\xa7', (char)'\x1a', (char)'\x04', 
-(char)'\x6c', (char)'\x98', (char)'\x31', (char)'\x64', (char)'\xc1', 
-(char)'\xab', (char)'\x26', (char)'\x2c', (char)'\x1a', (char)'\xb2', 
-(char)'\x62', (char)'\x82', (char)'\x9c', (char)'\xda', (char)'\x08', 
-(char)'\x26', (char)'\xef', (char)'\xdc', (char)'\x82', (char)'\x6e', 
-(char)'\x1f', (char)'\x28', (char)'\x19', (char)'\x31', (char)'\x40', 
-(char)'\xc1', (char)'\xcb', (char)'\xa6', (char)'\x4c', (char)'\x9d', 
-(char)'\x30', (char)'\x64', (char)'\x82', (char)'\xad', (char)'\x48', 
-(char)'\x68', (char)'\x19', (char)'\x30', (char)'\x62', (char)'\xc9', 
-(char)'\x07', (char)'\x87', (char)'\x0d', (char)'\xaf', (char)'\xb6', 
-(char)'\x68', (char)'\x83', (char)'\xc3', (char)'\x86', (char)'\xd7', 
-(char)'\xdb', (char)'\x34', (char)'\x41', (char)'\xe1', (char)'\xc3', 
-(char)'\x6b', (char)'\xed', (char)'\x9a', (char)'\x20', (char)'\x8f', 
-(char)'\x3a', (char)'\xaa', (char)'\xf9', (char)'\x9a', (char)'\x77', 
-(char)'\x75', (char)'\xf0', (char)'\xed', (char)'\x06', (char)'\x16', 
-(char)'\x4d', (char)'\x1c', (char)'\xb4', (char)'\x6a', (char)'\xc3', 
-(char)'\x16', (char)'\x46', (char)'\xb9', (char)'\x18', (char)'\x63', 
-(char)'\xc8', (char)'\xd5', (char)'\xc3', (char)'\x37', (char)'\x0c', 
-(char)'\xb3', (char)'\x32', (char)'\xcc', (char)'\xc1', (char)'\xcb', 
-(char)'\x3c', (char)'\x4e', (char)'\x70', (char)'\xb3', (char)'\xc2', 
-(char)'\xe7', (char)'\x26', (char)'\x56', (char)'\x6d', (char)'\xd9', 
-(char)'\x37', (char)'\xc2', (char)'\xc9', (char)'\x89', (char)'\xce', 
-(char)'\xf5', (char)'\x03', (char)'\xe1', (char)'\xf4', (char)'\xa2', 
-(char)'\x0f', (char)'\x28', (char)'\x90', (char)'\x69', (char)'\x38', 
-(char)'\x82', (char)'\xe9', (char)'\xe4', (char)'\x18', (char)'\x53', 
-(char)'\x40', (char)'\xea', (char)'\xa9', (char)'\x4b', (char)'\xd5', 
-(char)'\xd0', (char)'\x38', (char)'\xa4', (char)'\xc1', (char)'\xb4', 
-(char)'\xb0', (char)'\x0c', (char)'\xab', (char)'\x00', (char)'\x59', 
-(char)'\x35', (char)'\x02', (char)'\xa9', (char)'\x88', (char)'\x12', 
-(char)'\x54', (char)'\x20', (char)'\xff', (char)'\xfc', (char)'\x00', 
-(char)'\x5b', (char)'\x37', (char)'\x40', (char)'\x9f', (char)'\xff', 
-(char)'\x84', (char)'\x6c', (char)'\x82', (char)'\x17', (char)'\x13', 
-(char)'\x7f', (char)'\x5c', (char)'\x5b', (char)'\x32', (char)'\xc5', 
-(char)'\xe5', (char)'\xcb', (char)'\x7f', (char)'\x23', (char)'\x5c', 
-(char)'\x11', (char)'\x7c', (char)'\xbc', (char)'\xb9', (char)'\x6f', 
-(char)'\xe4', (char)'\x83', (char)'\x4e', (char)'\xe4', (char)'\x19', 
-(char)'\x79', (char)'\x72', (char)'\xdf', (char)'\xc9', (char)'\x06', 
-(char)'\x8c', (char)'\x3b', (char)'\xb2', (char)'\x6c', (char)'\xd3', 
-(char)'\xbb', (char)'\x38', (char)'\x00', 
+(char)'\x00', (char)'\x07', (char)'\x83', (char)'\xf9', (char)'\x42', 
+(char)'\x20', (char)'\x48', (char)'\xc2', (char)'\x08', (char)'\x98', 
+(char)'\x81', (char)'\x03', (char)'\x18', (char)'\x1e', (char)'\x64', 
+(char)'\x03', (char)'\x8c', (char)'\xa0', (char)'\x69', (char)'\x98', 
+(char)'\x0c', (char)'\x33', (char)'\x81', (char)'\x66', (char)'\x80', 
+(char)'\x28', (char)'\xd2', (char)'\x80', (char)'\x9a', (char)'\x90', 
+(char)'\x03', (char)'\x59', (char)'\xfe', (char)'\x6c', (char)'\x3f', 
+(char)'\x8d', (char)'\xa7', (char)'\xe9', (char)'\xb8', (char)'\xfc', 
+(char)'\x37', (char)'\x81', (char)'\x27', (char)'\x00', (char)'\x20', 
+(char)'\xe1', (char)'\x12', (char)'\x1c', (char)'\x66', (char)'\xbe', 
+(char)'\xd9', (char)'\xc9', (char)'\xf4', (char)'\xd6', (char)'\x8f', 
+(char)'\x96', (char)'\xa2', (char)'\x7c', (char)'\x34', (char)'\x93', 
+(char)'\xdd', (char)'\xa0', (char)'\x9e', (char)'\xcc', (char)'\x44', 
+(char)'\xf5', (char)'\x63', (char)'\x27', (char)'\xa3', (char)'\x21', 
+(char)'\x3c', (char)'\xd9', (char)'\x49', (char)'\xe4', (char)'\xcc', 
+(char)'\x4f', (char)'\x16', (char)'\xd2', (char)'\x78', (char)'\x36', 
+(char)'\x0f', (char)'\x77', (char)'\xb0', (char)'\x8f', (char)'\xff', 
+(char)'\xff', (char)'\xc1', (char)'\x1b', (char)'\x43', (char)'\x00', 
+(char)'\x01', (char)'\x43', (char)'\xfc', (char)'\x03', (char)'\x5d', 
+(char)'\x92', (char)'\x04', (char)'\xeb', (char)'\x8e', (char)'\x47', 
+(char)'\x54', (char)'\x79', (char)'\x3a', (char)'\x62', (char)'\x91', 
+(char)'\xd1', (char)'\x18', (char)'\xce', (char)'\x78', (char)'\xb4', 
+(char)'\x73', (char)'\x4b', (char)'\x13', (char)'\x96', (char)'\x34', 
+(char)'\x9c', (char)'\x92', (char)'\xa4', (char)'\xe3', (char)'\x93', 
+(char)'\x27', (char)'\x14', (char)'\x91', (char)'\x38', (char)'\x64', 
+(char)'\x49', (char)'\xc1', (char)'\x28', (char)'\x5f', (char)'\xfe', 
+(char)'\x10', (char)'\x03', (char)'\x36', (char)'\xa6', (char)'\xc1', 
+(char)'\xb3', (char)'\x34', (char)'\x0d', (char)'\x89', (char)'\xc0', 
+(char)'\x6b', (char)'\xcb', (char)'\x93', (char)'\x5a', (char)'\x60', 
+(char)'\x9a', (char)'\xb3', (char)'\x24', (char)'\x28', (char)'\xbf', 
+(char)'\x80', (char)'\x00', (char)'\x7f', (char)'\x88', (char)'\x00', 
+(char)'\x8d', (char)'\xa6', (char)'\x02', (char)'\x6a', (char)'\x2e', 
+(char)'\xa3', (char)'\x4d', (char)'\x7c', (char)'\xfb', (char)'\x49', 
+(char)'\x78', (char)'\xf8', (char)'\xa3', (char)'\xfe', (char)'\x00', 
+(char)'\x2c', (char)'\xf0', (char)'\x12', (char)'\x0f', (char)'\xf1', 
+(char)'\x80', (char)'\x55', (char)'\xb4', (char)'\x2a', (char)'\x0d', 
+(char)'\x91', (char)'\x40', (char)'\x67', (char)'\x01', (char)'\x1f', 
+(char)'\x66', (char)'\x83', (char)'\x93', (char)'\x30', (char)'\x28', 
+(char)'\x19', (char)'\x61', (char)'\x67', (char)'\xd9', (char)'\x41', 
+(char)'\xc0', (char)'\xc9', (char)'\x0f', (char)'\x06', (char)'\x40', 
+(char)'\x82', (char)'\x31', (char)'\xc4', (char)'\x89', (char)'\x8c', 
+(char)'\x26', (char)'\xbd', (char)'\x8a', (char)'\x2c', (char)'\x7d', 
+(char)'\x88', (char)'\x0c', (char)'\x7d', (char)'\x86', (char)'\x10', 
+(char)'\x7d', (char)'\x84', (char)'\x06', (char)'\x69', (char)'\x82', 
+(char)'\x22', (char)'\x69', (char)'\x80', (char)'\x0a', (char)'\x69', 
+(char)'\x7e', (char)'\x12', (char)'\x69', (char)'\x7c', (char)'\x08', 
+(char)'\x69', (char)'\x7a', (char)'\x18', (char)'\x7d', (char)'\x78', 
+(char)'\x1a', (char)'\x7c', (char)'\x52', (char)'\x7f', (char)'\x00', 
+(char)'\x15', (char)'\xdd', (char)'\x39', (char)'\xf0', (char)'\xff', 
+(char)'\x20', (char)'\x11', (char)'\xbc', (char)'\x20', (char)'\x2a', 
+(char)'\x8d', (char)'\xab', (char)'\x80', (char)'\x6c', (char)'\x5d', 
+(char)'\x82', (char)'\xea', (char)'\xa0', (char)'\x97', (char)'\x35', 
+(char)'\x24', (char)'\xce', (char)'\xaa', (char)'\x3e', (char)'\xc4', 
+(char)'\xab', (char)'\x34', (char)'\xc3', (char)'\xac', (char)'\x34', 
+(char)'\xb8', (char)'\xad', (char)'\x25', (char)'\xbd', (char)'\x71', 
+(char)'\x2d', (char)'\xab', (char)'\xd1', (char)'\x6b', (char)'\x60', 
+(char)'\x4c', (char)'\x8b', (char)'\x14', (char)'\x5a', (char)'\x59', 
+(char)'\x22', (char)'\xce', (char)'\xd1', (char)'\x16', (char)'\x56', 
+(char)'\xe0', (char)'\xb1', (char)'\xb5', (char)'\x05', (char)'\x85', 
+(char)'\xc8', (char)'\x2b', (char)'\xed', (char)'\x81', (char)'\x5d', 
+(char)'\x74', (char)'\x0a', (char)'\xdb', (char)'\x34', (char)'\x14', 
+(char)'\xbf', (char)'\xc0', (char)'\x00', (char)'\x3f', (char)'\xca', 
+(char)'\x04', (char)'\x6f', (char)'\x18', (char)'\x26', (char)'\xd0', 
+(char)'\xc0', (char)'\x36', (char)'\x06', (char)'\x40', (char)'\x53', 
+(char)'\x7f', (char)'\x15', (char)'\x59', (char)'\x03', (char)'\xff', 
+(char)'\xff', (char)'\xff', (char)'\xff', (char)'\xff', (char)'\xff', 
+(char)'\xbd', (char)'\xfd', (char)'\x57', (char)'\x00', (char)'\x04', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x01', (char)'\x55', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x03', 
+(char)'\xe1', (char)'\xfd', (char)'\x51', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x03', 
+(char)'\xc1', (char)'\xfd', (char)'\x53', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x03', 
+(char)'\xc3', (char)'\xfc', (char)'\x00', (char)'\xff', (char)'\x30', 
+(char)'\x11', (char)'\xbc', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x01', (char)'\x9b', (char)'\x50', (char)'\xe4', (char)'\xd9', 
+(char)'\x85', (char)'\x26', (char)'\xc4', (char)'\x40', (char)'\x29', 
+(char)'\xe1', (char)'\x09', (char)'\x4d', (char)'\x06', (char)'\x4a', 
+(char)'\x58', (char)'\x62', (char)'\x14', (char)'\xff', (char)'\xc0', 
+(char)'\x0d', (char)'\x48', (char)'\x3e', (char)'\x4a', (char)'\x32', 
+(char)'\x0f', (char)'\xea', (char)'\x21', (char)'\xe0', (char)'\x0f', 
+(char)'\xf3', (char)'\x81', (char)'\x1b', (char)'\xc8', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\xf8', (char)'\x7f', (char)'\xb5', (char)'\xb4', (char)'\x92', 
+(char)'\x0a', (char)'\x14', (char)'\x30', (char)'\x50', (char)'\x25', 
+(char)'\x03', (char)'\x65', (char)'\x1c', (char)'\x13', (char)'\xe8', 
+(char)'\xc0', (char)'\x9e', (char)'\x48', (char)'\x06', (char)'\xc2', 
+(char)'\x60', (char)'\x27', (char)'\x53', (char)'\x01', (char)'\x38', 
+(char)'\x46', (char)'\x09', (char)'\xb2', (char)'\xc0', (char)'\x4d', 
+(char)'\x13', (char)'\x82', (char)'\x64', (char)'\xc0', (char)'\x13', 
+(char)'\x04', (char)'\x20', (char)'\x97', (char)'\x2a', (char)'\x04', 
+(char)'\xb1', (char)'\x10', (char)'\x25', (char)'\x4a', (char)'\xc1', 
+(char)'\x28', (char)'\x48', (char)'\x09', (char)'\x32', (char)'\xd0', 
+(char)'\x49', (char)'\x13', (char)'\x02', (char)'\x44', (char)'\xbc', 
+(char)'\x12', (char)'\x05', (char)'\x00', (char)'\x8f', (char)'\x31', 
+(char)'\x04', (char)'\x71', (char)'\x28', (char)'\x23', (char)'\x4b', 
+(char)'\x81', (char)'\x18', (char)'\x52', (char)'\x08', (char)'\xb3', 
+(char)'\xa2', (char)'\x45', (char)'\x1b', (char)'\x12', (char)'\x24', 
+(char)'\xf8', (char)'\x91', (char)'\x07', (char)'\x2b', (char)'\xd0', 
+(char)'\xe8', (char)'\x2b', (char)'\xd0', (char)'\xc6', (char)'\xef', 
+(char)'\xd0', (char)'\xa7', (char)'\xef', (char)'\xd0', (char)'\x86', 
+(char)'\xb3', (char)'\xd0', (char)'\x67', (char)'\xb3', (char)'\xd0', 
+(char)'\x46', (char)'\x64', (char)'\x81', (char)'\x3b', (char)'\x24', 
+(char)'\x01', (char)'\xc2', (char)'\xf3', (char)'\xfa', (char)'\x02', 
+(char)'\xf3', (char)'\xf1', (char)'\xa3', (char)'\xf3', (char)'\xe9', 
+(char)'\xe3', (char)'\xf3', (char)'\xe2', (char)'\x58', (char)'\x1e', 
+(char)'\xd1', (char)'\x00', (char)'\xf4', (char)'\x8a', (char)'\x47', 
+(char)'\x93', (char)'\x20', (char)'\x3c', (char)'\x21', (char)'\x10', 
+(char)'\xa8', (char)'\xfe', (char)'\x00', (char)'\x01', (char)'\xfe', 
+(char)'\x80', (char)'\xc3', (char)'\x48', (char)'\x20', (char)'\x60', 
+(char)'\x01', (char)'\x01', (char)'\x3a', (char)'\x42', (char)'\x38', 
+(char)'\x01', (char)'\xa3', (char)'\x1c', (char)'\xe3', (char)'\x1c', 
+(char)'\xa3', (char)'\x1c', (char)'\x64', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x06', (char)'\x76', (char)'\xa3', (char)'\x23', 
+(char)'\xad', (char)'\x21', (char)'\x36', (char)'\xa9', (char)'\x40', 
+(char)'\x54', (char)'\xff', (char)'\x00', (char)'\x00', (char)'\xff', 
+(char)'\x48', (char)'\x53', (char)'\x69', (char)'\x02', (char)'\x8d', 
+(char)'\x84', (char)'\x05', (char)'\x1f', (char)'\x3a', (char)'\xc2', 
+(char)'\xb8', (char)'\xf1', (char)'\xd5', (char)'\x55', (char)'\xc7', 
+(char)'\x6e', (char)'\xac', (char)'\xae', (char)'\x0b', (char)'\x69', 
+(char)'\x64', (char)'\x05', (char)'\x57', (char)'\xf0', (char)'\x00', 
+(char)'\x4f', (char)'\xf5', (char)'\x02', (char)'\x36', (char)'\x94', 
+(char)'\x04', (char)'\xd8', (char)'\x40', (char)'\x50', (char)'\x05', 
+(char)'\x5f', (char)'\xf0', (char)'\x00', (char)'\x4f', (char)'\xf5', 
+(char)'\x82', (char)'\x36', (char)'\x94', (char)'\x00', (char)'\xd8', 
+(char)'\x40', (char)'\x50', (char)'\x05', (char)'\x67', (char)'\xf0', 
+(char)'\x00', (char)'\x4f', (char)'\xf6', (char)'\x02', (char)'\x36', 
+(char)'\x93', (char)'\xfc', (char)'\xd8', (char)'\x40', (char)'\x50', 
+(char)'\x05', (char)'\x6f', (char)'\xf0', (char)'\x00', (char)'\x4f', 
+(char)'\xf6', (char)'\x82', (char)'\x36', (char)'\x93', (char)'\xf8', 
+(char)'\xd8', (char)'\x40', (char)'\x50', (char)'\x05', (char)'\x77', 
+(char)'\xf0', (char)'\x00', (char)'\x4f', (char)'\xf7', (char)'\x02', 
+(char)'\x36', (char)'\x93', (char)'\xf4', (char)'\xd8', (char)'\x40', 
+(char)'\x50', (char)'\x05', (char)'\x7f', (char)'\xf0', (char)'\x00', 
+(char)'\x4f', (char)'\xf7', (char)'\x82', (char)'\x36', (char)'\x93', 
+(char)'\xf0', (char)'\xd8', (char)'\x40', (char)'\x50', (char)'\x03', 
+(char)'\xff', (char)'\xf2', (char)'\x0d', (char)'\x70', (char)'\x1a', 
+(char)'\x55', (char)'\xc5', (char)'\x22', (char)'\xc2', (char)'\xaf', 
+(char)'\xc1', (char)'\x50', (char)'\x0d', (char)'\x50', (char)'\x05', 
+(char)'\x95', (char)'\x6d', (char)'\x6e', (char)'\xec', (char)'\x5a', 
+(char)'\xc0', (char)'\x90', (char)'\x0d', (char)'\x30', (char)'\x3b', 
+(char)'\xce', (char)'\x7e', (char)'\xbf', (char)'\x90', (char)'\x8b', 
+(char)'\xb9', (char)'\x8f', (char)'\xcd', (char)'\x10', (char)'\x3f', 
+(char)'\xa0', (char)'\x8a', (char)'\xd9', (char)'\x51', (char)'\xc5', 
+(char)'\x7d', (char)'\xcf', (char)'\xcc', (char)'\xf0', (char)'\x03', 
+(char)'\xb9', (char)'\x49', (char)'\x85', (char)'\x5e', (char)'\xf2', 
+(char)'\xf6', (char)'\xcf', (char)'\xcc', (char)'\xd0', (char)'\x06', 
+(char)'\x0b', (char)'\x51', (char)'\x15', (char)'\x3e', (char)'\xc8', 
+(char)'\x42', (char)'\x50', (char)'\x0c', (char)'\xb0', (char)'\x33', 
+(char)'\x4e', (char)'\xdf', (char)'\xd9', (char)'\xa7', (char)'\xa8', 
+(char)'\x39', (char)'\x8f', (char)'\xcc', (char)'\x90', (char)'\x33', 
+(char)'\x4e', (char)'\xdf', (char)'\xd9', (char)'\xa7', (char)'\xa8', 
+(char)'\x3d', (char)'\x8f', (char)'\xd2', (char)'\x31', (char)'\xb8', 
+(char)'\x11', (char)'\x89', (char)'\xc4', (char)'\x8c', (char)'\x2e', 
+(char)'\x44', (char)'\x60', (char)'\x73', (char)'\x22', (char)'\xfb', 
+(char)'\xa2', (char)'\x17', (char)'\x9d', (char)'\x48', (char)'\xba', 
+(char)'\xec', (char)'\x45', (char)'\xc7', (char)'\x72', (char)'\x2d', 
+(char)'\xbc', (char)'\x11', (char)'\x69', (char)'\xe4', (char)'\x8b', 
+(char)'\x2f', (char)'\x4b', (char)'\xcb', (char)'\x0f', (char)'\x6b', 
+(char)'\xca', (char)'\xef', (char)'\x88', (char)'\x56', (char)'\x7d', 
+(char)'\x02', (char)'\xab', (char)'\xf1', (char)'\x15', (char)'\x1f', 
+(char)'\xc8', (char)'\xa7', (char)'\x00', (char)'\x45', (char)'\x28', 
+(char)'\x12', (char)'\x0f', (char)'\xff', (char)'\xc0', (char)'\x09', 
+(char)'\x48', (char)'\xdc', (char)'\x85', (char)'\x16', (char)'\xf6', 
+(char)'\x17', (char)'\xff', (char)'\xc0', (char)'\x00', (char)'\x3f', 
+(char)'\xff', (char)'\x14', (char)'\x47', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x03', (char)'\x82', 
+(char)'\x15', (char)'\x00', (char)'\x45', (char)'\x06', (char)'\xc9', 
+(char)'\x93', (char)'\x06', (char)'\x2c', (char)'\xd6', (char)'\xb1', 
+(char)'\x60', (char)'\xb5', (char)'\x9b', (char)'\x07', (char)'\x68', 
+(char)'\x26', (char)'\x69', (char)'\xdd', (char)'\xd7', (char)'\xc2', 
+(char)'\x0e', (char)'\x18', (char)'\x78', (char)'\x70', (char)'\xc3', 
+(char)'\xd3', (char)'\xae', (char)'\xee', (char)'\x9c', (char)'\xf0', 
+(char)'\xa0', (char)'\x66', (char)'\xb9', (char)'\xa2', (char)'\xe6', 
+(char)'\x0b', (char)'\x58', (char)'\x33', (char)'\x60', (char)'\xd1', 
+(char)'\x83', (char)'\x05', (char)'\xb9', (char)'\xf2', (char)'\xee', 
+(char)'\xcb', (char)'\xcb', (char)'\x4e', (char)'\x34', (char)'\x08', 
+(char)'\xd9', (char)'\x30', (char)'\x62', (char)'\xc9', (char)'\x83', 
+(char)'\x56', (char)'\x4c', (char)'\x58', (char)'\x35', (char)'\x64', 
+(char)'\xc5', (char)'\x05', (char)'\x39', (char)'\xb4', (char)'\x10', 
+(char)'\x4d', (char)'\xdf', (char)'\xb9', (char)'\x04', (char)'\xdc', 
+(char)'\x3e', (char)'\x50', (char)'\x32', (char)'\x62', (char)'\x81', 
+(char)'\x83', (char)'\x97', (char)'\x4c', (char)'\x99', (char)'\x3a', 
+(char)'\x60', (char)'\xc9', (char)'\x05', (char)'\x5a', (char)'\x90', 
+(char)'\xd0', (char)'\x32', (char)'\x60', (char)'\xc5', (char)'\x92', 
+(char)'\x0f', (char)'\x0e', (char)'\x1b', (char)'\x5f', (char)'\x6c', 
+(char)'\xd1', (char)'\x07', (char)'\x87', (char)'\x0d', (char)'\xaf', 
+(char)'\xb6', (char)'\x68', (char)'\x83', (char)'\xc3', (char)'\x86', 
+(char)'\xd7', (char)'\xdb', (char)'\x34', (char)'\x41', (char)'\x1e', 
+(char)'\x75', (char)'\x55', (char)'\xf3', (char)'\x34', (char)'\xee', 
+(char)'\xeb', (char)'\xe1', (char)'\xda', (char)'\x06', (char)'\x6c', 
+(char)'\xb2', (char)'\x61', (char)'\x6a', (char)'\xdb', (char)'\x2e', 
+(char)'\x46', (char)'\xf8', (char)'\xda', (char)'\x36', (char)'\x63', 
+(char)'\x87', (char)'\x0e', (char)'\x46', (char)'\x4e', (char)'\x19', 
+(char)'\xb9', (char)'\x6e', (char)'\xe5', (char)'\x8e', (char)'\x66', 
+(char)'\xec', (char)'\x19', (char)'\x61', (char)'\xcb', (char)'\x99', 
+(char)'\xc3', (char)'\x86', (char)'\x6c', (char)'\x5b', (char)'\x62', 
+(char)'\x6f', (char)'\x8f', (char)'\x0e', (char)'\x67', (char)'\x68', 
+(char)'\x36', (char)'\x69', (char)'\xe9', (char)'\xd3', (char)'\x66', 
+(char)'\x50', (char)'\x11', (char)'\xcc', (char)'\x01', (char)'\x3a', 
+(char)'\x00', (char)'\x07', (char)'\x20', (char)'\xe2', (char)'\x14', 
+(char)'\xd2', (char)'\x10', (char)'\x29', (char)'\x10', (char)'\x7d', 
+(char)'\x40', (char)'\x83', (char)'\xaa', (char)'\x24', (char)'\x1e', 
+(char)'\x53', (char)'\x40', (char)'\xe2', (char)'\x7a', (char)'\x06', 
+(char)'\xd3', (char)'\x90', (char)'\x59', (char)'\x7f', (char)'\x00', 
+(char)'\x39', (char)'\x86', (char)'\x02', (char)'\x06', (char)'\x2f', 
+(char)'\xd8', (char)'\x2f', (char)'\x7c', (char)'\x01', (char)'\xff', 
+(char)'\x20', (char)'\x00', (char)'\x0b', (char)'\x3f', (char)'\xe0', 
+(char)'\x00', (char)'\x1f', (char)'\xf3', (char)'\x00', (char)'\x13', 
+(char)'\x68', (char)'\x6c', (char)'\x1b', (char)'\x03', (char)'\x80', 
+(char)'\x2d', (char)'\x3f', (char)'\x80', (char)'\x00', (char)'\x7f', 
+(char)'\xd0', (char)'\x00', (char)'\x4d', (char)'\xa9', (char)'\xe0', 
+(char)'\x6c', (char)'\x4f', (char)'\x82', (char)'\x7f', (char)'\xfe', 
+(char)'\x11', (char)'\xb6', (char)'\x08', (char)'\x5c', (char)'\x4d', 
+(char)'\xfd', (char)'\x71', (char)'\x6c', (char)'\xcb', (char)'\x17', 
+(char)'\x97', (char)'\x2d', (char)'\xfc', (char)'\x8d', (char)'\x90', 
+(char)'\x45', (char)'\xf2', (char)'\xf2', (char)'\xe5', (char)'\xbf', 
+(char)'\x92', (char)'\x0d', (char)'\x3b', (char)'\x90', (char)'\x65', 
+(char)'\xe5', (char)'\xcb', (char)'\x7f', (char)'\x24', (char)'\x1a', 
+(char)'\x30', (char)'\xee', (char)'\xc9', (char)'\xb3', (char)'\x4e', 
+(char)'\xec', (char)'\xe0', (char)'\x00', 
 };
+#elif defined(DUK_USE_DOUBLE_BE)
+char duk_strings_data[] = {
+(char)'\x37', (char)'\x66', (char)'\x78', (char)'\x90', (char)'\x03', 
+(char)'\x3f', (char)'\x5e', (char)'\xe4', (char)'\x36', (char)'\x64', 
+(char)'\x89', (char)'\xba', (char)'\x1a', (char)'\x14', (char)'\xa4', 
+(char)'\x89', (char)'\xba', (char)'\x32', (char)'\x0b', (char)'\xa4', 
+(char)'\x6d', (char)'\x4d', (char)'\xd7', (char)'\x05', (char)'\x3d', 
+(char)'\x23', (char)'\x6a', (char)'\x03', (char)'\x19', (char)'\x6e', 
+(char)'\x08', (char)'\x16', (char)'\x9e', (char)'\x82', (char)'\x26', 
+(char)'\xa3', (char)'\x08', (char)'\xd9', (char)'\xc8', (char)'\x9e', 
+(char)'\x4c', (char)'\x9c', (char)'\xd2', (char)'\x75', (char)'\x80', 
+(char)'\x99', (char)'\xcb', (char)'\xd2', (char)'\x46', (char)'\x2e', 
+(char)'\x89', (char)'\xbb', (char)'\x12', (char)'\x1b', (char)'\xa4', 
+(char)'\xbb', (char)'\xc9', (char)'\xd1', (char)'\x82', (char)'\x64', 
+(char)'\x37', (char)'\x5b', (char)'\x46', (char)'\x04', (char)'\x91', 
+(char)'\x3f', (char)'\x42', (char)'\xe7', (char)'\x2c', (char)'\x80', 
+(char)'\x69', (char)'\xbb', (char)'\x29', (char)'\xc5', (char)'\x0d', 
+(char)'\x31', (char)'\x7a', (char)'\x08', (char)'\xc4', (char)'\x18', 
+(char)'\x47', (char)'\x4b', (char)'\x46', (char)'\x8a', (char)'\x68', 
+(char)'\x73', (char)'\x4d', (char)'\xd7', (char)'\x05', (char)'\x24', 
+(char)'\x14', (char)'\xdd', (char)'\xff', (char)'\x7f', (char)'\x45', 
+(char)'\xa6', (char)'\xa1', (char)'\xa5', (char)'\xfa', (char)'\x2f', 
+(char)'\xba', (char)'\x9c', (char)'\x68', (char)'\x4f', (char)'\xfd', 
+(char)'\x6f', (char)'\xfd', (char)'\xfd', (char)'\x16', (char)'\x90', 
+(char)'\xd2', (char)'\xfd', (char)'\x17', (char)'\xdd', (char)'\x4e', 
+(char)'\x34', (char)'\x27', (char)'\xfe', (char)'\xb7', (char)'\xfe', 
+(char)'\xfe', (char)'\x8b', (char)'\x4d', (char)'\x03', (char)'\x7e', 
+(char)'\x8b', (char)'\xee', (char)'\xa7', (char)'\x1a', (char)'\x13', 
+(char)'\xff', (char)'\x67', (char)'\xff', (char)'\x7f', (char)'\x45', 
+(char)'\xaa', (char)'\x34', (char)'\x64', (char)'\x2a', (char)'\x1a', 
+(char)'\x41', (char)'\xfd', (char)'\x17', (char)'\xdd', (char)'\x4e', 
+(char)'\x34', (char)'\x27', (char)'\xfe', (char)'\x9c', (char)'\x54', 
+(char)'\x8c', (char)'\x48', (char)'\xd9', (char)'\x9a', (char)'\x24', 
+(char)'\x95', (char)'\x18', (char)'\x43', (char)'\x04', (char)'\x12', 
+(char)'\x27', (char)'\xdb', (char)'\x7d', (char)'\xa0', (char)'\xce', 
+(char)'\x4b', (char)'\x8c', (char)'\x64', (char)'\x10', (char)'\xc8', 
+(char)'\xd1', (char)'\x30', (char)'\xc4', (char)'\x9f', (char)'\x4a', 
+(char)'\x86', (char)'\x81', (char)'\x68', (char)'\xc9', (char)'\x22', 
+(char)'\xc9', (char)'\x12', (char)'\x7d', (char)'\x2a', (char)'\x1a', 
+(char)'\x05', (char)'\xa3', (char)'\x24', (char)'\x88', (char)'\x8c', 
+(char)'\x22', (char)'\x44', (char)'\x85', (char)'\x11', (char)'\x00', 
+(char)'\x31', (char)'\xc4', (char)'\xa1', (char)'\xa2', (char)'\x16', 
+(char)'\x33', (char)'\xd4', (char)'\x91', (char)'\x92', (char)'\x1c', 
+(char)'\xd3', (char)'\xeb', (char)'\x43', (char)'\xa2', (char)'\xb5', 
+(char)'\xa3', (char)'\x89', (char)'\xcc', (char)'\x7a', (char)'\x16', 
+(char)'\x44', (char)'\x6e', (char)'\x24', (char)'\x30', (char)'\x41', 
+(char)'\x22', (char)'\x1f', (char)'\x73', (char)'\x3c', (char)'\x48', 
+(char)'\x01', (char)'\xab', (char)'\x65', (char)'\x43', (char)'\x40', 
+(char)'\xb4', (char)'\x64', (char)'\x91', (char)'\x56', (char)'\xd8', 
+(char)'\x49', (char)'\x82', (char)'\x60', (char)'\x0a', (char)'\xc8', 
+(char)'\x7d', (char)'\x88', (char)'\x0b', (char)'\x59', (char)'\x08', 
+(char)'\x4d', (char)'\xb0', (char)'\x0f', (char)'\x2e', (char)'\xc1', 
+(char)'\x13', (char)'\x48', (char)'\xbb', (char)'\x99', (char)'\xd1', 
+(char)'\x24', (char)'\x6d', (char)'\xe2', (char)'\xfb', (char)'\x25', 
+(char)'\xa1', (char)'\xa4', (char)'\x3e', (char)'\xe4', (char)'\xea', 
+(char)'\x44', (char)'\x44', (char)'\x3e', (char)'\xea', (char)'\x08', 
+(char)'\x91', (char)'\xb5', (char)'\x3e', (char)'\xd6', (char)'\x4b', 
+(char)'\x91', (char)'\xb5', (char)'\x3e', (char)'\xea', (char)'\x08', 
+(char)'\xb0', (char)'\x0f', (char)'\x46', (char)'\xca', (char)'\xe8', 
+(char)'\xb0', (char)'\x0b', (char)'\x92', (char)'\x76', (char)'\x1c', 
+(char)'\x4c', (char)'\x82', (char)'\x70', (char)'\xc8', (char)'\x5d', 
+(char)'\xb4', (char)'\x97', (char)'\x99', (char)'\xf7', (char)'\x30', 
+(char)'\x44', (char)'\xc4', (char)'\x99', (char)'\xb7', (char)'\x50', 
+(char)'\x2e', (char)'\x84', (char)'\x3b', (char)'\xdc', (char)'\x86', 
+(char)'\xcc', (char)'\x91', (char)'\x30', (char)'\x68', (char)'\x52', 
+(char)'\x92', (char)'\x29', (char)'\x9c', (char)'\x40', (char)'\x22', 
+(char)'\x0c', (char)'\x13', (char)'\x02', (char)'\x96', (char)'\x86', 
+(char)'\x93', (char)'\xad', (char)'\xa3', (char)'\x02', (char)'\x48', 
+(char)'\xa0', (char)'\xa8', (char)'\x59', (char)'\x3a', (char)'\xd0', 
+(char)'\x30', (char)'\x82', (char)'\x78', (char)'\x8b', (char)'\x29', 
+(char)'\x80', (char)'\x4a', (char)'\x77', (char)'\x66', (char)'\x78', 
+(char)'\xba', (char)'\xdd', (char)'\x9e', (char)'\x1e', (char)'\x4e', 
+(char)'\x92', (char)'\x31', (char)'\x74', (char)'\x4c', (char)'\x20', 
+(char)'\x2d', (char)'\x64', (char)'\x23', (char)'\x3a', (char)'\x86', 
+(char)'\xd4', (char)'\x0b', (char)'\x40', (char)'\xfe', (char)'\x83', 
+(char)'\xa3', (char)'\x04', (char)'\xc8', (char)'\x5f', (char)'\xdb', 
+(char)'\xfa', (char)'\xef', (char)'\xae', (char)'\xfa', (char)'\xef', 
+(char)'\xdd', (char)'\x17', (char)'\xc5', (char)'\x7c', (char)'\x48', 
+(char)'\x7e', (char)'\x80', (char)'\x3f', (char)'\x58', (char)'\x2f', 
+(char)'\xad', (char)'\xfb', (char)'\x01', (char)'\x7d', (char)'\x5f', 
+(char)'\xd8', (char)'\x07', (char)'\xec', (char)'\x13', (char)'\xf5', 
+(char)'\xbd', (char)'\x43', (char)'\x4a', (char)'\x86', (char)'\xa2', 
+(char)'\x78', (char)'\x4f', (char)'\xd5', (char)'\xf5', (char)'\x0d', 
+(char)'\x2a', (char)'\x1a', (char)'\x89', (char)'\xe1', (char)'\x1d', 
+(char)'\x43', (char)'\x4a', (char)'\x86', (char)'\xa2', (char)'\x78', 
+(char)'\x33', (char)'\x82', (char)'\x92', (char)'\x0a', (char)'\x66', 
+(char)'\x94', (char)'\xe2', (char)'\x86', (char)'\x98', (char)'\xcd', 
+(char)'\xa3', (char)'\x02', (char)'\x48', (char)'\x9c', (char)'\x2e', 
+(char)'\x72', (char)'\xc8', (char)'\x06', (char)'\xa6', (char)'\x8d', 
+(char)'\x19', (char)'\x0a', (char)'\x86', (char)'\x90', (char)'\x69', 
+(char)'\x94', (char)'\xe2', (char)'\x86', (char)'\x99', (char)'\x05', 
+(char)'\xc0', (char)'\xe6', (char)'\x06', (char)'\x92', (char)'\x50', 
+(char)'\x8c', (char)'\xc7', (char)'\x24', (char)'\x34', (char)'\xb1', 
+(char)'\x75', (char)'\x1a', (char)'\x33', (char)'\x44', (char)'\x0d', 
+(char)'\x1b', (char)'\x98', (char)'\x37', (char)'\xba', (char)'\xc3', 
+(char)'\x62', (char)'\x1a', (char)'\x36', (char)'\x02', (char)'\xe3', 
+(char)'\x5b', (char)'\x8c', (char)'\x52', (char)'\xad', (char)'\xce', 
+(char)'\x88', (char)'\xc9', (char)'\x77', (char)'\x8c', (char)'\x4e', 
+(char)'\x91', (char)'\x04', (char)'\x44', (char)'\x2c', (char)'\xa0', 
+(char)'\x98', (char)'\x1b', (char)'\xf6', (char)'\x44', (char)'\x04', 
+(char)'\xc0', (char)'\xd2', (char)'\x02', (char)'\x48', (char)'\x69', 
+(char)'\x00', (char)'\x27', (char)'\x48', (char)'\x60', (char)'\x0c', 
+(char)'\x8b', (char)'\xe9', (char)'\x42', (char)'\x33', (char)'\xfb', 
+(char)'\x23', (char)'\xfa', (char)'\x50', (char)'\x8c', (char)'\xfe', 
+(char)'\xc7', (char)'\x5f', (char)'\x64', (char)'\x2f', (char)'\x3d', 
+(char)'\x06', (char)'\xf2', (char)'\xdc', (char)'\x6f', (char)'\xb1', 
+(char)'\xfb', (char)'\x02', (char)'\x17', (char)'\xcb', (char)'\x71', 
+(char)'\xbe', (char)'\xc8', (char)'\x83', (char)'\xf2', (char)'\xdb', 
+(char)'\xf6', (char)'\x44', (char)'\xf2', (char)'\xdb', (char)'\xf6', 
+(char)'\x3f', (char)'\x60', (char)'\x1e', (char)'\x90', (char)'\xec', 
+(char)'\x24', (char)'\xa4', (char)'\x03', (char)'\x10', (char)'\x8d', 
+(char)'\x03', (char)'\x08', (char)'\x54', (char)'\x35', (char)'\xf4', 
+(char)'\x99', (char)'\x50', (char)'\xd1', (char)'\x92', (char)'\xe4', 
+(char)'\xfa', (char)'\x8f', (char)'\xbf', (char)'\xfb', (char)'\xaf', 
+(char)'\xa9', (char)'\x4a', (char)'\xc1', (char)'\x29', (char)'\xf5', 
+(char)'\x0d', (char)'\x19', (char)'\x2e', (char)'\x96', (char)'\x51', 
+(char)'\x73', (char)'\x42', (char)'\xd0', (char)'\xd2', (char)'\x29', 
+(char)'\x06', (char)'\x6b', (char)'\xa2', (char)'\x4e', (char)'\x88', 
+(char)'\x12', (char)'\x21', (char)'\xa4', (char)'\xea', (char)'\x44', 
+(char)'\x44', (char)'\x24', (char)'\xc9', (char)'\x29', (char)'\x90', 
+(char)'\x97', (char)'\x20', (char)'\x97', (char)'\x37', (char)'\x78', 
+(char)'\xcc', (char)'\x9c', (char)'\xbd', (char)'\x38', (char)'\xa1', 
+(char)'\xa6', (char)'\x3c', (char)'\x89', (char)'\x3e', (char)'\xe0', 
+(char)'\x80', (char)'\x89', (char)'\xcc', (char)'\x49', (char)'\xf7', 
+(char)'\x04', (char)'\x04', (char)'\x4d', (char)'\x37', (char)'\x79', 
+(char)'\x32', (char)'\x73', (char)'\x57', (char)'\x37', (char)'\x79', 
+(char)'\x12', (char)'\x74', (char)'\xbd', (char)'\x38', (char)'\xa1', 
+(char)'\xa6', (char)'\x5c', (char)'\xdd', (char)'\xea', (char)'\x4c', 
+(char)'\x52', (char)'\xf4', (char)'\xe2', (char)'\x86', (char)'\x99', 
+(char)'\xd2', (char)'\x24', (char)'\xfd', (char)'\x49', (char)'\x88', 
+(char)'\xbe', (char)'\xa2', (char)'\xd7', (char)'\xdc', (char)'\x10', 
+(char)'\x11', (char)'\x5c', (char)'\x89', (char)'\x3e', (char)'\x96', 
+(char)'\x8b', (char)'\x5f', (char)'\x70', (char)'\x40', (char)'\x45', 
+(char)'\x72', (char)'\x24', (char)'\xfd', (char)'\x49', (char)'\x89', 
+(char)'\x9e', (char)'\x73', (char)'\x66', (char)'\x74', (char)'\x48', 
+(char)'\x93', (char)'\xeb', (char)'\x1c', (char)'\xd9', (char)'\x9d', 
+(char)'\x52', (char)'\x24', (char)'\xfd', (char)'\x49', (char)'\x88', 
+(char)'\x7e', (char)'\x04', (char)'\xc8', (char)'\x79', (char)'\x12', 
+(char)'\x7d', (char)'\x18', (char)'\x26', (char)'\x45', (char)'\xc8', 
+(char)'\x93', (char)'\xf5', (char)'\x26', (char)'\x23', (char)'\xf9', 
+(char)'\xd4', (char)'\x8c', (char)'\x91', (char)'\x22', (char)'\x4f', 
+(char)'\xa7', (char)'\x75', (char)'\x23', (char)'\x26', (char)'\xc8', 
+(char)'\x93', (char)'\xf5', (char)'\x26', (char)'\x26', (char)'\x79', 
+(char)'\x0d', (char)'\xa4', (char)'\xc9', (char)'\x25', (char)'\x48', 
+(char)'\x93', (char)'\xeb', (char)'\x10', (char)'\xda', (char)'\x4c', 
+(char)'\x92', (char)'\x6c', (char)'\x89', (char)'\x3f', (char)'\x52', 
+(char)'\x62', (char)'\x97', (char)'\x88', (char)'\x27', (char)'\x34', 
+(char)'\x72', (char)'\x54', (char)'\x89', (char)'\x3e', (char)'\xc8', 
+(char)'\x82', (char)'\x73', (char)'\x47', (char)'\x29', (char)'\x48', 
+(char)'\x93', (char)'\xf5', (char)'\x26', (char)'\x26', (char)'\x79', 
+(char)'\x0b', (char)'\x5a', (char)'\x24', (char)'\x41', (char)'\x39', 
+(char)'\xa3', (char)'\x93', (char)'\xe4', (char)'\x49', (char)'\xf5', 
+(char)'\x88', (char)'\x5a', (char)'\xd1', (char)'\x22', (char)'\x09', 
+(char)'\xcd', (char)'\x1c', (char)'\x8f', (char)'\x22', (char)'\x4f', 
+(char)'\xb3', (char)'\x43', (char)'\x09', (char)'\x13', (char)'\x12', 
+(char)'\x7d', (char)'\x9a', (char)'\x18', (char)'\x4c', (char)'\xb9', 
+(char)'\xa4', (char)'\xeb', (char)'\x8a', (char)'\x59', (char)'\x12', 
+(char)'\x72', (char)'\x31', (char)'\x27', (char)'\xea', (char)'\x4c', 
+(char)'\x4c', (char)'\xf2', (char)'\x16', (char)'\xb4', (char)'\x48', 
+(char)'\x82', (char)'\x73', (char)'\x47', (char)'\x27', (char)'\x98', 
+(char)'\x93', (char)'\xeb', (char)'\x10', (char)'\xb5', (char)'\xa2', 
+(char)'\x44', (char)'\x13', (char)'\x9a', (char)'\x39', (char)'\x34', 
+(char)'\xc4', (char)'\x9f', (char)'\xa9', (char)'\x31', (char)'\x4b', 
+(char)'\xc4', (char)'\x13', (char)'\x9a', (char)'\x39', (char)'\x28', 
+(char)'\xc4', (char)'\x9f', (char)'\x64', (char)'\x41', (char)'\x39', 
+(char)'\xa3', (char)'\x93', (char)'\x4c', (char)'\x49', (char)'\xfa', 
+(char)'\x93', (char)'\x13', (char)'\x3c', (char)'\x86', (char)'\xd2', 
+(char)'\x64', (char)'\x92', (char)'\x8c', (char)'\x49', (char)'\xf5', 
+(char)'\x88', (char)'\x6d', (char)'\x26', (char)'\x49', (char)'\x2c', 
+(char)'\xc4', (char)'\x9f', (char)'\xa9', (char)'\x31', (char)'\x1f', 
+(char)'\xce', (char)'\xa4', (char)'\x64', (char)'\x83', (char)'\x12', 
+(char)'\x7d', (char)'\x3b', (char)'\xa9', (char)'\x19', (char)'\x24', 
+(char)'\xc4', (char)'\x9f', (char)'\xa9', (char)'\x31', (char)'\x0f', 
+(char)'\xc0', (char)'\xc1', (char)'\x8c', (char)'\x49', (char)'\xf4', 
+(char)'\x60', (char)'\xc2', (char)'\x8c', (char)'\x49', (char)'\xfa', 
+(char)'\x93', (char)'\x10', (char)'\xfc', (char)'\x09', (char)'\x90', 
+(char)'\xe6', (char)'\x24', (char)'\xfa', (char)'\x30', (char)'\x4c', 
+(char)'\x8b', (char)'\x31', (char)'\x27', (char)'\xea', (char)'\x4c', 
+(char)'\x4c', (char)'\xf3', (char)'\x9b', (char)'\x33', (char)'\xa0', 
+(char)'\xc4', (char)'\x9f', (char)'\x58', (char)'\xe6', (char)'\xcc', 
+(char)'\xee', (char)'\x31', (char)'\x27', (char)'\xea', (char)'\x4c', 
+(char)'\x45', (char)'\xf5', (char)'\x16', (char)'\xbe', (char)'\xe0', 
+(char)'\x80', (char)'\x8a', (char)'\xcc', (char)'\x49', (char)'\xf4', 
+(char)'\xb4', (char)'\x5a', (char)'\xfb', (char)'\x82', (char)'\x02', 
+(char)'\x27', (char)'\x31', (char)'\x27', (char)'\xd9', (char)'\xa1', 
+(char)'\x84', (char)'\x94', (char)'\xdd', (char)'\xd5', (char)'\xb8', 
+(char)'\x40', (char)'\x59', (char)'\x3b', (char)'\x34', (char)'\x30', 
+(char)'\x9d', (char)'\x94', (char)'\xe2', (char)'\x86', (char)'\x9a', 
+(char)'\x53', (char)'\x77', (char)'\x56', (char)'\xe1', (char)'\x01', 
+(char)'\x64', (char)'\xe8', (char)'\xc1', (char)'\x32', (char)'\x76', 
+(char)'\x53', (char)'\x8a', (char)'\x1a', (char)'\x66', (char)'\x4d', 
+(char)'\xdd', (char)'\x9a', (char)'\x18', (char)'\x4e', (char)'\xca', 
+(char)'\x71', (char)'\x43', (char)'\x4c', (char)'\xc9', (char)'\xbb', 
+(char)'\xa3', (char)'\x04', (char)'\xc9', (char)'\xd9', (char)'\x4e', 
+(char)'\x28', (char)'\x69', (char)'\x86', (char)'\xd7', (char)'\x58', 
+(char)'\x7e', (char)'\xa4', (char)'\xc4', (char)'\x57', (char)'\x82', 
+(char)'\x32', (char)'\x22', (char)'\xe6', (char)'\xee', (char)'\xbe', 
+(char)'\x24', (char)'\x12', (char)'\x24', (char)'\x87', (char)'\x35', 
+(char)'\xb3', (char)'\x77', (char)'\x49', (char)'\x77', (char)'\xb9', 
+(char)'\xa4', (char)'\x6c', (char)'\xd0', (char)'\x05', (char)'\x9e', 
+(char)'\x6e', (char)'\xe9', (char)'\x51', (char)'\x72', (char)'\x0e', 
+(char)'\x3e', (char)'\x7b', (char)'\xa4', (char)'\x89', (char)'\xa2', 
+(char)'\xa4', (char)'\xd2', (char)'\x1a', (char)'\x54', (char)'\x35', 
+(char)'\x13', (char)'\xc4', (char)'\x7c', (char)'\xd2', (char)'\x18', 
+(char)'\x13', (char)'\x45', (char)'\x49', (char)'\xa4', (char)'\x34', 
+(char)'\xa8', (char)'\x6a', (char)'\x27', (char)'\x81', (char)'\xf5', 
+(char)'\xa0', (char)'\xeb', (char)'\x53', (char)'\xe6', (char)'\x21', 
+(char)'\xba', (char)'\xa8', (char)'\x17', (char)'\x42', (char)'\x27', 
+(char)'\xcc', (char)'\x05', (char)'\xf5', (char)'\x50', (char)'\x2e', 
+(char)'\x84', (char)'\x34', (char)'\xa8', (char)'\x19', (char)'\x4e', 
+(char)'\x24', (char)'\x9c', (char)'\x50', (char)'\xc8', (char)'\xcd', 
+(char)'\xdd', (char)'\x5b', (char)'\x84', (char)'\x05', (char)'\x93', 
+(char)'\xb4', (char)'\x7b', (char)'\xc9', (char)'\x1e', (char)'\x88', 
+(char)'\x12', (char)'\x22', (char)'\xe6', (char)'\xee', (char)'\xd1', 
+(char)'\xef', (char)'\x24', (char)'\x7a', (char)'\x20', (char)'\x48', 
+(char)'\x91', (char)'\x9b', (char)'\xba', (char)'\xb7', (char)'\x08', 
+(char)'\x0b', (char)'\x27', (char)'\x56', (char)'\xeb', (char)'\x12', 
+(char)'\x3d', (char)'\x10', (char)'\x24', (char)'\x45', (char)'\xcd', 
+(char)'\xdd', (char)'\x5b', (char)'\xac', (char)'\x48', (char)'\xf4', 
+(char)'\x40', (char)'\x91', (char)'\x13', (char)'\x2a', (char)'\x06', 
+(char)'\x53', (char)'\x8a', (char)'\x1a', (char)'\x62', (char)'\xc9', 
+(char)'\xeb', (char)'\x44', (char)'\xcd', (char)'\x22', (char)'\x02', 
+(char)'\x22', (char)'\x39', (char)'\xe2', (char)'\x47', (char)'\xac', 
+(char)'\x02', (char)'\x21', (char)'\x58', (char)'\x09', (char)'\x88', 
+(char)'\xed', (char)'\x5b', (char)'\x84', (char)'\x05', (char)'\x93', 
+(char)'\xa2', (char)'\x73', (char)'\x1e', (char)'\x08', (char)'\x91', 
+(char)'\x42', (char)'\x38', (char)'\x23', (char)'\xd1', (char)'\x38', 
+(char)'\x64', (char)'\xe8', (char)'\x26', (char)'\x61', (char)'\x1c', 
+(char)'\x11', (char)'\xe8', (char)'\x26', (char)'\xc2', (char)'\xc5', 
+(char)'\xcc', (char)'\xe8', (char)'\x8e', (char)'\x08', (char)'\xf4', 
+(char)'\x4e', (char)'\x19', (char)'\x17', (char)'\x12', (char)'\x0e', 
+(char)'\x82', (char)'\x27', (char)'\x62', (char)'\x83', (char)'\x1e', 
+(char)'\x66', (char)'\x89', (char)'\x07', (char)'\x41', (char)'\x10', 
+(char)'\xc5', (char)'\x42', (char)'\xe6', (char)'\x48', (char)'\x8d', 
+(char)'\x80', (char)'\x79', (char)'\xca', (char)'\xe8', (char)'\xf4', 
+(char)'\x80', (char)'\x11', (char)'\xc9', (char)'\x27', (char)'\x30', 
+(char)'\x85', (char)'\x25', (char)'\x49', (char)'\x1c', (char)'\x2d', 
+(char)'\x60', (char)'\x94', (char)'\xfa', (char)'\x86', (char)'\x8c', 
+(char)'\x97', (char)'\xeb', (char)'\x8a', (char)'\x74', (char)'\x34', 
+(char)'\x64', (char)'\xbf', (char)'\x5c', (char)'\x53', (char)'\xd1', 
+(char)'\xb2', (char)'\x3a', (char)'\x0b', (char)'\x33', (char)'\x49', 
+(char)'\xeb', (char)'\x40', (char)'\x88', (char)'\x49', (char)'\x3a', 
+(char)'\x33', (char)'\x2c', (char)'\x96', (char)'\x81', (char)'\x10', 
+(char)'\xb2', (char)'\x3a', (char)'\x0b', (char)'\x33', (char)'\xc4', 
+(char)'\x95', (char)'\x24', (char)'\x64', (char)'\x42', (char)'\x3e', 
+(char)'\x92', (char)'\x38', (char)'\xde', (char)'\xe7', (char)'\x91', 
+(char)'\x2e', (char)'\x43', (char)'\x4c', (char)'\x27', (char)'\x34', 
+(char)'\x40', (char)'\x99', (char)'\xd1', (char)'\x2e', (char)'\x82', 
+(char)'\x31', (char)'\x06', (char)'\x12', (char)'\x08', (char)'\x9a', 
+(char)'\x8c', (char)'\x23', (char)'\x67', (char)'\x23', (char)'\x08', 
+(char)'\x0b', (char)'\x59', (char)'\x22', (char)'\x40', (char)'\xa1', 
+(char)'\xa3', (char)'\x20', (char)'\x80', (char)'\xb5', (char)'\x94', 
+(char)'\x0f', (char)'\x7a', (char)'\xf1', (char)'\x47', (char)'\xc5', 
+(char)'\xcf', (char)'\x24', (char)'\x67', (char)'\x8e', (char)'\xa2', 
+(char)'\x5d', (char)'\x23', (char)'\x68', (char)'\xc2', (char)'\x44', 
+(char)'\x01', (char)'\x59', (char)'\x1a', (char)'\x89', (char)'\x75', 
+(char)'\xf1', (char)'\x74', (char)'\xdd', (char)'\x3c', (char)'\x3c', 
+(char)'\x9d', (char)'\x71', (char)'\x5c', (char)'\x70', (char)'\x4b', 
+(char)'\xae', (char)'\xb3', (char)'\x7a', (char)'\xf8', (char)'\xb9', 
+(char)'\xe4', (char)'\x8c', (char)'\xf0', (char)'\x7a', (char)'\x81', 
+(char)'\x74', (char)'\x27', (char)'\x5c', (char)'\x57', (char)'\x4d', 
+(char)'\xdd', (char)'\x5b', (char)'\x84', (char)'\x05', (char)'\x93', 
+(char)'\xb2', (char)'\x9c', (char)'\x50', (char)'\xd3', (char)'\x22', 
+(char)'\x6e', (char)'\xec', (char)'\xa7', (char)'\x14', (char)'\x34', 
+(char)'\xcb', (char)'\x13', (char)'\x9b', (char)'\x29', (char)'\xc6', 
+(char)'\x82', (char)'\x9b', (char)'\xa2', (char)'\xa2', (char)'\x36', 
+(char)'\x8c', (char)'\x24', (char)'\x40', (char)'\x15', (char)'\x91', 
+(char)'\x82', (char)'\x73', (char)'\x4a', (char)'\x83', (char)'\x52', 
+(char)'\x20', (char)'\x0a', (char)'\xc8', (char)'\x8b', (char)'\x45', 
+(char)'\x13', (char)'\x00', (char)'\x56', (char)'\x42', (char)'\xd4', 
+(char)'\x0b', (char)'\xa1', (char)'\x08', (char)'\xa2', (char)'\x62', 
+(char)'\x4c', (char)'\x44', (char)'\xba', (char)'\x4b', (char)'\xcc', 
+(char)'\x8d', (char)'\x92', (char)'\x02', (char)'\xb2', (char)'\x21', 
+(char)'\x12', (char)'\xe9', (char)'\x62', (char)'\xec', (char)'\x91', 
+(char)'\xa8', (char)'\x44', (char)'\xbb', (char)'\x22', (char)'\x01', 
+(char)'\x64', (char)'\x1c', (char)'\x5f', (char)'\x12', (char)'\x54', 
+(char)'\x8d', (char)'\x9f', (char)'\x49', (char)'\x79', (char)'\x91', 
+(char)'\xb2', (char)'\x43', (char)'\x9b', (char)'\x23', (char)'\x16', 
+(char)'\x24', (char)'\x26', (char)'\x48', (char)'\x49', (char)'\x10', 
+(char)'\x0b', (char)'\x80', (char)'\xc8', (char)'\x54', (char)'\x34', 
+(char)'\x9d', (char)'\x7c', (char)'\x5c', (char)'\xf2', (char)'\x46', 
+(char)'\x68', (char)'\x24', (char)'\x9c', (char)'\x32', (char)'\x15', 
+(char)'\x0d', (char)'\x27', (char)'\x5f', (char)'\x17', (char)'\x3c', 
+(char)'\x91', (char)'\x9e', (char)'\x0c', (char)'\x28', (char)'\x90', 
+(char)'\x13', (char)'\x24', (char)'\xcc', (char)'\x49', (char)'\xf5', 
+(char)'\xd6', (char)'\x6f', (char)'\x5f', (char)'\x17', (char)'\x3c', 
+(char)'\x91', (char)'\x9e', (char)'\x3a', (char)'\xd0', (char)'\x30', 
+(char)'\x92', (char)'\xc1', (char)'\x89', (char)'\x3e', (char)'\xba', 
+(char)'\xcd', (char)'\xeb', (char)'\xe2', (char)'\xe7', (char)'\x92', 
+(char)'\x33', (char)'\xc7', (char)'\x46', (char)'\x49', (char)'\x0a', 
+(char)'\x28', (char)'\x7c', (char)'\xdd', (char)'\x17', (char)'\x18', 
+(char)'\x93', (char)'\xeb', (char)'\xe2', (char)'\xe9', (char)'\xba', 
+(char)'\x78', (char)'\x79', (char)'\x3a', (char)'\xe2', (char)'\xa5', 
+(char)'\xf1', (char)'\x74', (char)'\xdd', (char)'\x3c', (char)'\x3c', 
+(char)'\x86', (char)'\x59', (char)'\x1a', (char)'\x69', (char)'\x9c', 
+(char)'\xa0', (char)'\x59', (char)'\x23', (char)'\x32', (char)'\xbe', 
+(char)'\x28', (char)'\x6c', (char)'\xd1', (char)'\x46', (char)'\x92', 
+(char)'\x42', (char)'\x03', (char)'\xc8', (char)'\x62', (char)'\x48', 
+(char)'\x40', (char)'\x79', (char)'\x24', (char)'\x46', (char)'\x89', 
+(char)'\xc3', (char)'\x27', (char)'\xa9', (char)'\x14', (char)'\x0b', 
+(char)'\xce', (char)'\x63', (char)'\xdc', (char)'\xd2', (char)'\x36', 
+(char)'\x69', (char)'\x23', (char)'\x44', (char)'\xe1', (char)'\x93', 
+(char)'\xd4', (char)'\x8a', (char)'\x24', (char)'\x32', (char)'\x09', 
+(char)'\xc3', (char)'\x27', (char)'\xa9', (char)'\x14', (char)'\x0b', 
+(char)'\xce', (char)'\x63', (char)'\xdc', (char)'\xd2', (char)'\x36', 
+(char)'\x69', (char)'\x19', (char)'\x04', (char)'\xe1', (char)'\x93', 
+(char)'\xd4', (char)'\x8a', (char)'\x10', (char)'\x89', (char)'\x74', 
+(char)'\xa8', (char)'\x6a', (char)'\x26', (char)'\x42', (char)'\xa2', 
+(char)'\x5d', (char)'\x68', (char)'\x3a', (char)'\xd5', (char)'\x3c', 
+(char)'\x11', (char)'\x91', (char)'\x3a', (char)'\x55', (char)'\xb8', 
+(char)'\x13', (char)'\x43', (char)'\xc1', (char)'\x19', (char)'\x13', 
+(char)'\xa8', (char)'\x6c', (char)'\xc8', (char)'\x4a', (char)'\x81', 
+(char)'\x68', (char)'\xf5', (char)'\x22', (char)'\x82', (char)'\x7a', 
+(char)'\x31', (char)'\x74', (char)'\x53', (char)'\xd9', (char)'\xe1', 
+(char)'\xe4', (char)'\xe9', (char)'\x23', (char)'\x17', (char)'\x45', 
+(char)'\x7d', (char)'\x96', (char)'\x1b', (char)'\x30', (char)'\x5f', 
+(char)'\xa4', (char)'\x8c', (char)'\x5d', (char)'\x17', (char)'\x76', 
+(char)'\x24', (char)'\x29', (char)'\x22', (char)'\x46', (char)'\x88', 
+(char)'\x9d', (char)'\x24', (char)'\x62', (char)'\xe8', (char)'\xab', 
+(char)'\xb1', (char)'\x03', (char)'\x4c', (char)'\x4e', (char)'\x92', 
+(char)'\x31', (char)'\x74', (char)'\x53', (char)'\xd2', (char)'\x54', 
+(char)'\x0b', (char)'\xe9', (char)'\x23', (char)'\x17', (char)'\x44', 
+(char)'\xa1', (char)'\x89', (char)'\x00', (char)'\xa2', (char)'\x08', 
+(char)'\x12', (char)'\x21', (char)'\x44', (char)'\x09', (char)'\x88', 
+(char)'\xe8', (char)'\x13', (char)'\x9b', (char)'\x34', (char)'\x36', 
+(char)'\x84', (char)'\x40', (char)'\xc8', (char)'\x1a', (char)'\x18', 
+(char)'\xc4', (char)'\x89', (char)'\xc6', (char)'\x42', (char)'\x82', 
+(char)'\x8b', (char)'\x99', (char)'\x86', (char)'\x45', (char)'\x92', 
+(char)'\x64', (char)'\x10', (char)'\xdc', (char)'\x42', (char)'\x2e', 
+(char)'\x44', (char)'\x39', (char)'\x50', (char)'\xd0', (char)'\x2d', 
+(char)'\x78', (char)'\x19', (char)'\x5d', (char)'\x14', (char)'\x16', 
+(char)'\x8d', (char)'\x14', (char)'\xd0', (char)'\xe6', (char)'\x89', 
+(char)'\x05', (char)'\x12', (char)'\x1a', (char)'\xa4', (char)'\x36', 
+(char)'\x53', (char)'\x03', (char)'\x44', (char)'\x47', (char)'\x14', 
+(char)'\x6d', (char)'\x25', (char)'\x8d', (char)'\x12', (char)'\x4e', 
+(char)'\x91', (char)'\x69', (char)'\xa5', (char)'\x64', (char)'\x4c', 
+(char)'\x47', (char)'\x24', (char)'\xce', (char)'\x89', (char)'\x16', 
+(char)'\x67', (char)'\x8b', (char)'\xac', (char)'\x39', (char)'\xc7', 
+(char)'\x06', (char)'\x9e', (char)'\x1e', (char)'\x47', (char)'\x14', 
+(char)'\x75', (char)'\x04', (char)'\x49', (char)'\x57', (char)'\x20', 
+(char)'\x65', (char)'\xb1', (char)'\xd0', (char)'\xb2', (char)'\x12', 
+(char)'\xc8', (char)'\x99', (char)'\xca', (char)'\x25', (char)'\x82', 
+(char)'\x52', (char)'\x28', (char)'\x9c', (char)'\xd9', (char)'\x4c', 
+(char)'\x84', (char)'\x6d', (char)'\x18', (char)'\x62', (char)'\x5d', 
+(char)'\xee', (char)'\x8c', (char)'\xce', (char)'\x4b', (char)'\xcc', 
+(char)'\x8d', (char)'\x1c', (char)'\x8c', (char)'\x86', (char)'\x3d', 
+(char)'\xd1', (char)'\x99', (char)'\x65', (char)'\x47', (char)'\x92', 
+(char)'\x24', (char)'\x6d', (char)'\x16', (char)'\xb2', (char)'\x4e', 
+(char)'\x34', (char)'\x21', (char)'\x4a', (char)'\x05', (char)'\xc8', 
+(char)'\x83', (char)'\x31', (char)'\x26', (char)'\x39', (char)'\x12', 
+(char)'\x6a', (char)'\x43', (char)'\x1e', (char)'\xb2', (char)'\x30', 
+(char)'\x8d', (char)'\x9c', (char)'\x92', (char)'\x86', (char)'\xcc', 
+(char)'\x91', (char)'\x28', (char)'\x04', (char)'\x41', (char)'\xac', 
+(char)'\x93', (char)'\x3b', (char)'\xc0', (char)'\x25', (char)'\x00', 
+(char)'\xc4', (char)'\x3b', (char)'\xe2', (char)'\x8a', (char)'\x82', 
+(char)'\x64', (char)'\x4b', (char)'\xe2', (char)'\xe9', (char)'\x90', 
+(char)'\x53', (char)'\x20', (char)'\xcc', (char)'\xfa', (char)'\x05', 
+(char)'\x68', (char)'\x11', (char)'\xa5', (char)'\x30', (char)'\x4d', 
+(char)'\x02', (char)'\x2e', (char)'\x10', (char)'\x45', (char)'\x8c', 
+};
+
+/* to convert a heap stridx to a token number, subtract
+ * DUK_STRIDX_START_RESERVED and add DUK_TOK_START_RESERVED.
+ */
+
+/* native functions: 588 */
+duk_c_function duk_builtin_native_functions[] = {
+	(duk_c_function) duk_builtin_array_constructor,
+	(duk_c_function) duk_builtin_array_constructor_is_array,
+	(duk_c_function) duk_builtin_array_prototype_concat,
+	(duk_c_function) duk_builtin_array_prototype_every,
+	(duk_c_function) duk_builtin_array_prototype_filter,
+	(duk_c_function) duk_builtin_array_prototype_for_each,
+	(duk_c_function) duk_builtin_array_prototype_index_of,
+	(duk_c_function) duk_builtin_array_prototype_join,
+	(duk_c_function) duk_builtin_array_prototype_last_index_of,
+	(duk_c_function) duk_builtin_array_prototype_map,
+	(duk_c_function) duk_builtin_array_prototype_pop,
+	(duk_c_function) duk_builtin_array_prototype_push,
+	(duk_c_function) duk_builtin_array_prototype_reduce,
+	(duk_c_function) duk_builtin_array_prototype_reduce_right,
+	(duk_c_function) duk_builtin_array_prototype_reverse,
+	(duk_c_function) duk_builtin_array_prototype_shift,
+	(duk_c_function) duk_builtin_array_prototype_slice,
+	(duk_c_function) duk_builtin_array_prototype_some,
+	(duk_c_function) duk_builtin_array_prototype_sort,
+	(duk_c_function) duk_builtin_array_prototype_splice,
+	(duk_c_function) duk_builtin_array_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_array_prototype_to_string,
+	(duk_c_function) duk_builtin_array_prototype_unshift,
+	(duk_c_function) duk_builtin_boolean_constructor,
+	(duk_c_function) duk_builtin_boolean_prototype_to_string,
+	(duk_c_function) duk_builtin_boolean_prototype_value_of,
+	(duk_c_function) duk_builtin_buffer_constructor,
+	(duk_c_function) duk_builtin_buffer_prototype_to_string,
+	(duk_c_function) duk_builtin_buffer_prototype_value_of,
+	(duk_c_function) duk_builtin_date_constructor,
+	(duk_c_function) duk_builtin_date_constructor_now,
+	(duk_c_function) duk_builtin_date_constructor_parse,
+	(duk_c_function) duk_builtin_date_constructor_utc,
+	(duk_c_function) duk_builtin_date_prototype_get_date,
+	(duk_c_function) duk_builtin_date_prototype_get_day,
+	(duk_c_function) duk_builtin_date_prototype_get_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_month,
+	(duk_c_function) duk_builtin_date_prototype_get_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_timezone_offset,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_day,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_year,
+	(duk_c_function) duk_builtin_date_prototype_set_date,
+	(duk_c_function) duk_builtin_date_prototype_set_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_month,
+	(duk_c_function) duk_builtin_date_prototype_set_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_time,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_year,
+	(duk_c_function) duk_builtin_date_prototype_to_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_iso_string,
+	(duk_c_function) duk_builtin_date_prototype_to_json,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_string,
+	(duk_c_function) duk_builtin_date_prototype_to_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_utc_string,
+	(duk_c_function) duk_builtin_date_prototype_value_of,
+	(duk_c_function) duk_builtin_duk_object_addr,
+	(duk_c_function) duk_builtin_duk_object_dec,
+	(duk_c_function) duk_builtin_duk_object_enc,
+	(duk_c_function) duk_builtin_duk_object_gc,
+	(duk_c_function) duk_builtin_duk_object_get_finalizer,
+	(duk_c_function) duk_builtin_duk_object_refc,
+	(duk_c_function) duk_builtin_duk_object_set_finalizer,
+	(duk_c_function) duk_builtin_error_constructor,
+	(duk_c_function) duk_builtin_error_prototype_filename_getter,
+	(duk_c_function) duk_builtin_error_prototype_linenumber_getter,
+	(duk_c_function) duk_builtin_error_prototype_nop_setter,
+	(duk_c_function) duk_builtin_error_prototype_stack_getter,
+	(duk_c_function) duk_builtin_error_prototype_to_string,
+	(duk_c_function) duk_builtin_eval_error_constructor,
+	(duk_c_function) duk_builtin_function_constructor,
+	(duk_c_function) duk_builtin_function_prototype,
+	(duk_c_function) duk_builtin_function_prototype_apply,
+	(duk_c_function) duk_builtin_function_prototype_bind,
+	(duk_c_function) duk_builtin_function_prototype_call,
+	(duk_c_function) duk_builtin_function_prototype_to_string,
+	(duk_c_function) duk_builtin_global_object_alert,
+	(duk_c_function) duk_builtin_global_object_decode_uri,
+	(duk_c_function) duk_builtin_global_object_decode_uri_component,
+	(duk_c_function) duk_builtin_global_object_encode_uri,
+	(duk_c_function) duk_builtin_global_object_encode_uri_component,
+	(duk_c_function) duk_builtin_global_object_escape,
+	(duk_c_function) duk_builtin_global_object_eval,
+	(duk_c_function) duk_builtin_global_object_is_finite,
+	(duk_c_function) duk_builtin_global_object_is_nan,
+	(duk_c_function) duk_builtin_global_object_parse_float,
+	(duk_c_function) duk_builtin_global_object_parse_int,
+	(duk_c_function) duk_builtin_global_object_print,
+	(duk_c_function) duk_builtin_global_object_unescape,
+	(duk_c_function) duk_builtin_json_object_parse,
+	(duk_c_function) duk_builtin_json_object_stringify,
+	(duk_c_function) duk_builtin_math_object_abs,
+	(duk_c_function) duk_builtin_math_object_acos,
+	(duk_c_function) duk_builtin_math_object_asin,
+	(duk_c_function) duk_builtin_math_object_atan,
+	(duk_c_function) duk_builtin_math_object_atan2,
+	(duk_c_function) duk_builtin_math_object_ceil,
+	(duk_c_function) duk_builtin_math_object_cos,
+	(duk_c_function) duk_builtin_math_object_exp,
+	(duk_c_function) duk_builtin_math_object_floor,
+	(duk_c_function) duk_builtin_math_object_log,
+	(duk_c_function) duk_builtin_math_object_max,
+	(duk_c_function) duk_builtin_math_object_min,
+	(duk_c_function) duk_builtin_math_object_pow,
+	(duk_c_function) duk_builtin_math_object_random,
+	(duk_c_function) duk_builtin_math_object_round,
+	(duk_c_function) duk_builtin_math_object_sin,
+	(duk_c_function) duk_builtin_math_object_sqrt,
+	(duk_c_function) duk_builtin_math_object_tan,
+	(duk_c_function) duk_builtin_number_constructor,
+	(duk_c_function) duk_builtin_number_prototype_to_exponential,
+	(duk_c_function) duk_builtin_number_prototype_to_fixed,
+	(duk_c_function) duk_builtin_number_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_number_prototype_to_precision,
+	(duk_c_function) duk_builtin_number_prototype_to_string,
+	(duk_c_function) duk_builtin_number_prototype_value_of,
+	(duk_c_function) duk_builtin_object_constructor,
+	(duk_c_function) duk_builtin_object_constructor_create,
+	(duk_c_function) duk_builtin_object_constructor_define_properties,
+	(duk_c_function) duk_builtin_object_constructor_define_property,
+	(duk_c_function) duk_builtin_object_constructor_freeze,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_descriptor,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_names,
+	(duk_c_function) duk_builtin_object_constructor_get_prototype_of,
+	(duk_c_function) duk_builtin_object_constructor_is_extensible,
+	(duk_c_function) duk_builtin_object_constructor_is_frozen,
+	(duk_c_function) duk_builtin_object_constructor_is_sealed,
+	(duk_c_function) duk_builtin_object_constructor_keys,
+	(duk_c_function) duk_builtin_object_constructor_prevent_extensions,
+	(duk_c_function) duk_builtin_object_constructor_seal,
+	(duk_c_function) duk_builtin_object_prototype_has_own_property,
+	(duk_c_function) duk_builtin_object_prototype_is_prototype_of,
+	(duk_c_function) duk_builtin_object_prototype_property_is_enumerable,
+	(duk_c_function) duk_builtin_object_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_object_prototype_to_string,
+	(duk_c_function) duk_builtin_object_prototype_value_of,
+	(duk_c_function) duk_builtin_pointer_constructor,
+	(duk_c_function) duk_builtin_pointer_prototype_to_string,
+	(duk_c_function) duk_builtin_pointer_prototype_value_of,
+	(duk_c_function) duk_builtin_range_error_constructor,
+	(duk_c_function) duk_builtin_reference_error_constructor,
+	(duk_c_function) duk_builtin_regexp_constructor,
+	(duk_c_function) duk_builtin_regexp_prototype_exec,
+	(duk_c_function) duk_builtin_regexp_prototype_test,
+	(duk_c_function) duk_builtin_regexp_prototype_to_string,
+	(duk_c_function) duk_builtin_string_constructor,
+	(duk_c_function) duk_builtin_string_constructor_from_char_code,
+	(duk_c_function) duk_builtin_string_prototype_char_at,
+	(duk_c_function) duk_builtin_string_prototype_char_code_at,
+	(duk_c_function) duk_builtin_string_prototype_concat,
+	(duk_c_function) duk_builtin_string_prototype_index_of,
+	(duk_c_function) duk_builtin_string_prototype_last_index_of,
+	(duk_c_function) duk_builtin_string_prototype_locale_compare,
+	(duk_c_function) duk_builtin_string_prototype_match,
+	(duk_c_function) duk_builtin_string_prototype_replace,
+	(duk_c_function) duk_builtin_string_prototype_search,
+	(duk_c_function) duk_builtin_string_prototype_slice,
+	(duk_c_function) duk_builtin_string_prototype_split,
+	(duk_c_function) duk_builtin_string_prototype_substr,
+	(duk_c_function) duk_builtin_string_prototype_substring,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_to_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_string,
+	(duk_c_function) duk_builtin_string_prototype_to_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_trim,
+	(duk_c_function) duk_builtin_string_prototype_value_of,
+	(duk_c_function) duk_builtin_syntax_error_constructor,
+	(duk_c_function) duk_builtin_thread_constructor,
+	(duk_c_function) duk_builtin_thread_current,
+	(duk_c_function) duk_builtin_thread_resume,
+	(duk_c_function) duk_builtin_thread_yield,
+	(duk_c_function) duk_builtin_type_error_constructor,
+	(duk_c_function) duk_builtin_type_error_thrower,
+	(duk_c_function) duk_builtin_uri_error_constructor,
+	(duk_c_function) duk_builtin_array_constructor,
+	(duk_c_function) duk_builtin_array_constructor_is_array,
+	(duk_c_function) duk_builtin_array_prototype_concat,
+	(duk_c_function) duk_builtin_array_prototype_every,
+	(duk_c_function) duk_builtin_array_prototype_filter,
+	(duk_c_function) duk_builtin_array_prototype_for_each,
+	(duk_c_function) duk_builtin_array_prototype_index_of,
+	(duk_c_function) duk_builtin_array_prototype_join,
+	(duk_c_function) duk_builtin_array_prototype_last_index_of,
+	(duk_c_function) duk_builtin_array_prototype_map,
+	(duk_c_function) duk_builtin_array_prototype_pop,
+	(duk_c_function) duk_builtin_array_prototype_push,
+	(duk_c_function) duk_builtin_array_prototype_reduce,
+	(duk_c_function) duk_builtin_array_prototype_reduce_right,
+	(duk_c_function) duk_builtin_array_prototype_reverse,
+	(duk_c_function) duk_builtin_array_prototype_shift,
+	(duk_c_function) duk_builtin_array_prototype_slice,
+	(duk_c_function) duk_builtin_array_prototype_some,
+	(duk_c_function) duk_builtin_array_prototype_sort,
+	(duk_c_function) duk_builtin_array_prototype_splice,
+	(duk_c_function) duk_builtin_array_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_array_prototype_to_string,
+	(duk_c_function) duk_builtin_array_prototype_unshift,
+	(duk_c_function) duk_builtin_boolean_constructor,
+	(duk_c_function) duk_builtin_boolean_prototype_to_string,
+	(duk_c_function) duk_builtin_boolean_prototype_value_of,
+	(duk_c_function) duk_builtin_buffer_constructor,
+	(duk_c_function) duk_builtin_buffer_prototype_to_string,
+	(duk_c_function) duk_builtin_buffer_prototype_value_of,
+	(duk_c_function) duk_builtin_date_constructor,
+	(duk_c_function) duk_builtin_date_constructor_now,
+	(duk_c_function) duk_builtin_date_constructor_parse,
+	(duk_c_function) duk_builtin_date_constructor_utc,
+	(duk_c_function) duk_builtin_date_prototype_get_date,
+	(duk_c_function) duk_builtin_date_prototype_get_day,
+	(duk_c_function) duk_builtin_date_prototype_get_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_month,
+	(duk_c_function) duk_builtin_date_prototype_get_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_timezone_offset,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_day,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_year,
+	(duk_c_function) duk_builtin_date_prototype_set_date,
+	(duk_c_function) duk_builtin_date_prototype_set_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_month,
+	(duk_c_function) duk_builtin_date_prototype_set_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_time,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_year,
+	(duk_c_function) duk_builtin_date_prototype_to_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_iso_string,
+	(duk_c_function) duk_builtin_date_prototype_to_json,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_string,
+	(duk_c_function) duk_builtin_date_prototype_to_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_utc_string,
+	(duk_c_function) duk_builtin_date_prototype_value_of,
+	(duk_c_function) duk_builtin_duk_object_addr,
+	(duk_c_function) duk_builtin_duk_object_dec,
+	(duk_c_function) duk_builtin_duk_object_enc,
+	(duk_c_function) duk_builtin_duk_object_gc,
+	(duk_c_function) duk_builtin_duk_object_get_finalizer,
+	(duk_c_function) duk_builtin_duk_object_refc,
+	(duk_c_function) duk_builtin_duk_object_set_finalizer,
+	(duk_c_function) duk_builtin_error_constructor,
+	(duk_c_function) duk_builtin_error_prototype_filename_getter,
+	(duk_c_function) duk_builtin_error_prototype_linenumber_getter,
+	(duk_c_function) duk_builtin_error_prototype_nop_setter,
+	(duk_c_function) duk_builtin_error_prototype_stack_getter,
+	(duk_c_function) duk_builtin_error_prototype_to_string,
+	(duk_c_function) duk_builtin_eval_error_constructor,
+	(duk_c_function) duk_builtin_function_constructor,
+	(duk_c_function) duk_builtin_function_prototype,
+	(duk_c_function) duk_builtin_function_prototype_apply,
+	(duk_c_function) duk_builtin_function_prototype_bind,
+	(duk_c_function) duk_builtin_function_prototype_call,
+	(duk_c_function) duk_builtin_function_prototype_to_string,
+	(duk_c_function) duk_builtin_global_object_alert,
+	(duk_c_function) duk_builtin_global_object_decode_uri,
+	(duk_c_function) duk_builtin_global_object_decode_uri_component,
+	(duk_c_function) duk_builtin_global_object_encode_uri,
+	(duk_c_function) duk_builtin_global_object_encode_uri_component,
+	(duk_c_function) duk_builtin_global_object_escape,
+	(duk_c_function) duk_builtin_global_object_eval,
+	(duk_c_function) duk_builtin_global_object_is_finite,
+	(duk_c_function) duk_builtin_global_object_is_nan,
+	(duk_c_function) duk_builtin_global_object_parse_float,
+	(duk_c_function) duk_builtin_global_object_parse_int,
+	(duk_c_function) duk_builtin_global_object_print,
+	(duk_c_function) duk_builtin_global_object_unescape,
+	(duk_c_function) duk_builtin_json_object_parse,
+	(duk_c_function) duk_builtin_json_object_stringify,
+	(duk_c_function) duk_builtin_math_object_abs,
+	(duk_c_function) duk_builtin_math_object_acos,
+	(duk_c_function) duk_builtin_math_object_asin,
+	(duk_c_function) duk_builtin_math_object_atan,
+	(duk_c_function) duk_builtin_math_object_atan2,
+	(duk_c_function) duk_builtin_math_object_ceil,
+	(duk_c_function) duk_builtin_math_object_cos,
+	(duk_c_function) duk_builtin_math_object_exp,
+	(duk_c_function) duk_builtin_math_object_floor,
+	(duk_c_function) duk_builtin_math_object_log,
+	(duk_c_function) duk_builtin_math_object_max,
+	(duk_c_function) duk_builtin_math_object_min,
+	(duk_c_function) duk_builtin_math_object_pow,
+	(duk_c_function) duk_builtin_math_object_random,
+	(duk_c_function) duk_builtin_math_object_round,
+	(duk_c_function) duk_builtin_math_object_sin,
+	(duk_c_function) duk_builtin_math_object_sqrt,
+	(duk_c_function) duk_builtin_math_object_tan,
+	(duk_c_function) duk_builtin_number_constructor,
+	(duk_c_function) duk_builtin_number_prototype_to_exponential,
+	(duk_c_function) duk_builtin_number_prototype_to_fixed,
+	(duk_c_function) duk_builtin_number_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_number_prototype_to_precision,
+	(duk_c_function) duk_builtin_number_prototype_to_string,
+	(duk_c_function) duk_builtin_number_prototype_value_of,
+	(duk_c_function) duk_builtin_object_constructor,
+	(duk_c_function) duk_builtin_object_constructor_create,
+	(duk_c_function) duk_builtin_object_constructor_define_properties,
+	(duk_c_function) duk_builtin_object_constructor_define_property,
+	(duk_c_function) duk_builtin_object_constructor_freeze,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_descriptor,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_names,
+	(duk_c_function) duk_builtin_object_constructor_get_prototype_of,
+	(duk_c_function) duk_builtin_object_constructor_is_extensible,
+	(duk_c_function) duk_builtin_object_constructor_is_frozen,
+	(duk_c_function) duk_builtin_object_constructor_is_sealed,
+	(duk_c_function) duk_builtin_object_constructor_keys,
+	(duk_c_function) duk_builtin_object_constructor_prevent_extensions,
+	(duk_c_function) duk_builtin_object_constructor_seal,
+	(duk_c_function) duk_builtin_object_prototype_has_own_property,
+	(duk_c_function) duk_builtin_object_prototype_is_prototype_of,
+	(duk_c_function) duk_builtin_object_prototype_property_is_enumerable,
+	(duk_c_function) duk_builtin_object_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_object_prototype_to_string,
+	(duk_c_function) duk_builtin_object_prototype_value_of,
+	(duk_c_function) duk_builtin_pointer_constructor,
+	(duk_c_function) duk_builtin_pointer_prototype_to_string,
+	(duk_c_function) duk_builtin_pointer_prototype_value_of,
+	(duk_c_function) duk_builtin_range_error_constructor,
+	(duk_c_function) duk_builtin_reference_error_constructor,
+	(duk_c_function) duk_builtin_regexp_constructor,
+	(duk_c_function) duk_builtin_regexp_prototype_exec,
+	(duk_c_function) duk_builtin_regexp_prototype_test,
+	(duk_c_function) duk_builtin_regexp_prototype_to_string,
+	(duk_c_function) duk_builtin_string_constructor,
+	(duk_c_function) duk_builtin_string_constructor_from_char_code,
+	(duk_c_function) duk_builtin_string_prototype_char_at,
+	(duk_c_function) duk_builtin_string_prototype_char_code_at,
+	(duk_c_function) duk_builtin_string_prototype_concat,
+	(duk_c_function) duk_builtin_string_prototype_index_of,
+	(duk_c_function) duk_builtin_string_prototype_last_index_of,
+	(duk_c_function) duk_builtin_string_prototype_locale_compare,
+	(duk_c_function) duk_builtin_string_prototype_match,
+	(duk_c_function) duk_builtin_string_prototype_replace,
+	(duk_c_function) duk_builtin_string_prototype_search,
+	(duk_c_function) duk_builtin_string_prototype_slice,
+	(duk_c_function) duk_builtin_string_prototype_split,
+	(duk_c_function) duk_builtin_string_prototype_substr,
+	(duk_c_function) duk_builtin_string_prototype_substring,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_to_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_string,
+	(duk_c_function) duk_builtin_string_prototype_to_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_trim,
+	(duk_c_function) duk_builtin_string_prototype_value_of,
+	(duk_c_function) duk_builtin_syntax_error_constructor,
+	(duk_c_function) duk_builtin_thread_constructor,
+	(duk_c_function) duk_builtin_thread_current,
+	(duk_c_function) duk_builtin_thread_resume,
+	(duk_c_function) duk_builtin_thread_yield,
+	(duk_c_function) duk_builtin_type_error_constructor,
+	(duk_c_function) duk_builtin_type_error_thrower,
+	(duk_c_function) duk_builtin_uri_error_constructor,
+	(duk_c_function) duk_builtin_array_constructor,
+	(duk_c_function) duk_builtin_array_constructor_is_array,
+	(duk_c_function) duk_builtin_array_prototype_concat,
+	(duk_c_function) duk_builtin_array_prototype_every,
+	(duk_c_function) duk_builtin_array_prototype_filter,
+	(duk_c_function) duk_builtin_array_prototype_for_each,
+	(duk_c_function) duk_builtin_array_prototype_index_of,
+	(duk_c_function) duk_builtin_array_prototype_join,
+	(duk_c_function) duk_builtin_array_prototype_last_index_of,
+	(duk_c_function) duk_builtin_array_prototype_map,
+	(duk_c_function) duk_builtin_array_prototype_pop,
+	(duk_c_function) duk_builtin_array_prototype_push,
+	(duk_c_function) duk_builtin_array_prototype_reduce,
+	(duk_c_function) duk_builtin_array_prototype_reduce_right,
+	(duk_c_function) duk_builtin_array_prototype_reverse,
+	(duk_c_function) duk_builtin_array_prototype_shift,
+	(duk_c_function) duk_builtin_array_prototype_slice,
+	(duk_c_function) duk_builtin_array_prototype_some,
+	(duk_c_function) duk_builtin_array_prototype_sort,
+	(duk_c_function) duk_builtin_array_prototype_splice,
+	(duk_c_function) duk_builtin_array_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_array_prototype_to_string,
+	(duk_c_function) duk_builtin_array_prototype_unshift,
+	(duk_c_function) duk_builtin_boolean_constructor,
+	(duk_c_function) duk_builtin_boolean_prototype_to_string,
+	(duk_c_function) duk_builtin_boolean_prototype_value_of,
+	(duk_c_function) duk_builtin_buffer_constructor,
+	(duk_c_function) duk_builtin_buffer_prototype_to_string,
+	(duk_c_function) duk_builtin_buffer_prototype_value_of,
+	(duk_c_function) duk_builtin_date_constructor,
+	(duk_c_function) duk_builtin_date_constructor_now,
+	(duk_c_function) duk_builtin_date_constructor_parse,
+	(duk_c_function) duk_builtin_date_constructor_utc,
+	(duk_c_function) duk_builtin_date_prototype_get_date,
+	(duk_c_function) duk_builtin_date_prototype_get_day,
+	(duk_c_function) duk_builtin_date_prototype_get_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_month,
+	(duk_c_function) duk_builtin_date_prototype_get_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_timezone_offset,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_day,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_year,
+	(duk_c_function) duk_builtin_date_prototype_set_date,
+	(duk_c_function) duk_builtin_date_prototype_set_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_month,
+	(duk_c_function) duk_builtin_date_prototype_set_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_time,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_year,
+	(duk_c_function) duk_builtin_date_prototype_to_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_iso_string,
+	(duk_c_function) duk_builtin_date_prototype_to_json,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_string,
+	(duk_c_function) duk_builtin_date_prototype_to_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_utc_string,
+	(duk_c_function) duk_builtin_date_prototype_value_of,
+	(duk_c_function) duk_builtin_duk_object_addr,
+	(duk_c_function) duk_builtin_duk_object_dec,
+	(duk_c_function) duk_builtin_duk_object_enc,
+	(duk_c_function) duk_builtin_duk_object_gc,
+	(duk_c_function) duk_builtin_duk_object_get_finalizer,
+	(duk_c_function) duk_builtin_duk_object_refc,
+	(duk_c_function) duk_builtin_duk_object_set_finalizer,
+	(duk_c_function) duk_builtin_error_constructor,
+	(duk_c_function) duk_builtin_error_prototype_filename_getter,
+	(duk_c_function) duk_builtin_error_prototype_linenumber_getter,
+	(duk_c_function) duk_builtin_error_prototype_nop_setter,
+	(duk_c_function) duk_builtin_error_prototype_stack_getter,
+	(duk_c_function) duk_builtin_error_prototype_to_string,
+	(duk_c_function) duk_builtin_eval_error_constructor,
+	(duk_c_function) duk_builtin_function_constructor,
+	(duk_c_function) duk_builtin_function_prototype,
+	(duk_c_function) duk_builtin_function_prototype_apply,
+	(duk_c_function) duk_builtin_function_prototype_bind,
+	(duk_c_function) duk_builtin_function_prototype_call,
+	(duk_c_function) duk_builtin_function_prototype_to_string,
+	(duk_c_function) duk_builtin_global_object_alert,
+	(duk_c_function) duk_builtin_global_object_decode_uri,
+	(duk_c_function) duk_builtin_global_object_decode_uri_component,
+	(duk_c_function) duk_builtin_global_object_encode_uri,
+	(duk_c_function) duk_builtin_global_object_encode_uri_component,
+	(duk_c_function) duk_builtin_global_object_escape,
+	(duk_c_function) duk_builtin_global_object_eval,
+	(duk_c_function) duk_builtin_global_object_is_finite,
+	(duk_c_function) duk_builtin_global_object_is_nan,
+	(duk_c_function) duk_builtin_global_object_parse_float,
+	(duk_c_function) duk_builtin_global_object_parse_int,
+	(duk_c_function) duk_builtin_global_object_print,
+	(duk_c_function) duk_builtin_global_object_unescape,
+	(duk_c_function) duk_builtin_json_object_parse,
+	(duk_c_function) duk_builtin_json_object_stringify,
+	(duk_c_function) duk_builtin_math_object_abs,
+	(duk_c_function) duk_builtin_math_object_acos,
+	(duk_c_function) duk_builtin_math_object_asin,
+	(duk_c_function) duk_builtin_math_object_atan,
+	(duk_c_function) duk_builtin_math_object_atan2,
+	(duk_c_function) duk_builtin_math_object_ceil,
+	(duk_c_function) duk_builtin_math_object_cos,
+	(duk_c_function) duk_builtin_math_object_exp,
+	(duk_c_function) duk_builtin_math_object_floor,
+	(duk_c_function) duk_builtin_math_object_log,
+	(duk_c_function) duk_builtin_math_object_max,
+	(duk_c_function) duk_builtin_math_object_min,
+	(duk_c_function) duk_builtin_math_object_pow,
+	(duk_c_function) duk_builtin_math_object_random,
+	(duk_c_function) duk_builtin_math_object_round,
+	(duk_c_function) duk_builtin_math_object_sin,
+	(duk_c_function) duk_builtin_math_object_sqrt,
+	(duk_c_function) duk_builtin_math_object_tan,
+	(duk_c_function) duk_builtin_number_constructor,
+	(duk_c_function) duk_builtin_number_prototype_to_exponential,
+	(duk_c_function) duk_builtin_number_prototype_to_fixed,
+	(duk_c_function) duk_builtin_number_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_number_prototype_to_precision,
+	(duk_c_function) duk_builtin_number_prototype_to_string,
+	(duk_c_function) duk_builtin_number_prototype_value_of,
+	(duk_c_function) duk_builtin_object_constructor,
+	(duk_c_function) duk_builtin_object_constructor_create,
+	(duk_c_function) duk_builtin_object_constructor_define_properties,
+	(duk_c_function) duk_builtin_object_constructor_define_property,
+	(duk_c_function) duk_builtin_object_constructor_freeze,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_descriptor,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_names,
+	(duk_c_function) duk_builtin_object_constructor_get_prototype_of,
+	(duk_c_function) duk_builtin_object_constructor_is_extensible,
+	(duk_c_function) duk_builtin_object_constructor_is_frozen,
+	(duk_c_function) duk_builtin_object_constructor_is_sealed,
+	(duk_c_function) duk_builtin_object_constructor_keys,
+	(duk_c_function) duk_builtin_object_constructor_prevent_extensions,
+	(duk_c_function) duk_builtin_object_constructor_seal,
+	(duk_c_function) duk_builtin_object_prototype_has_own_property,
+	(duk_c_function) duk_builtin_object_prototype_is_prototype_of,
+	(duk_c_function) duk_builtin_object_prototype_property_is_enumerable,
+	(duk_c_function) duk_builtin_object_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_object_prototype_to_string,
+	(duk_c_function) duk_builtin_object_prototype_value_of,
+	(duk_c_function) duk_builtin_pointer_constructor,
+	(duk_c_function) duk_builtin_pointer_prototype_to_string,
+	(duk_c_function) duk_builtin_pointer_prototype_value_of,
+	(duk_c_function) duk_builtin_range_error_constructor,
+	(duk_c_function) duk_builtin_reference_error_constructor,
+	(duk_c_function) duk_builtin_regexp_constructor,
+	(duk_c_function) duk_builtin_regexp_prototype_exec,
+	(duk_c_function) duk_builtin_regexp_prototype_test,
+	(duk_c_function) duk_builtin_regexp_prototype_to_string,
+	(duk_c_function) duk_builtin_string_constructor,
+	(duk_c_function) duk_builtin_string_constructor_from_char_code,
+	(duk_c_function) duk_builtin_string_prototype_char_at,
+	(duk_c_function) duk_builtin_string_prototype_char_code_at,
+	(duk_c_function) duk_builtin_string_prototype_concat,
+	(duk_c_function) duk_builtin_string_prototype_index_of,
+	(duk_c_function) duk_builtin_string_prototype_last_index_of,
+	(duk_c_function) duk_builtin_string_prototype_locale_compare,
+	(duk_c_function) duk_builtin_string_prototype_match,
+	(duk_c_function) duk_builtin_string_prototype_replace,
+	(duk_c_function) duk_builtin_string_prototype_search,
+	(duk_c_function) duk_builtin_string_prototype_slice,
+	(duk_c_function) duk_builtin_string_prototype_split,
+	(duk_c_function) duk_builtin_string_prototype_substr,
+	(duk_c_function) duk_builtin_string_prototype_substring,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_to_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_string,
+	(duk_c_function) duk_builtin_string_prototype_to_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_trim,
+	(duk_c_function) duk_builtin_string_prototype_value_of,
+	(duk_c_function) duk_builtin_syntax_error_constructor,
+	(duk_c_function) duk_builtin_thread_constructor,
+	(duk_c_function) duk_builtin_thread_current,
+	(duk_c_function) duk_builtin_thread_resume,
+	(duk_c_function) duk_builtin_thread_yield,
+	(duk_c_function) duk_builtin_type_error_constructor,
+	(duk_c_function) duk_builtin_type_error_thrower,
+	(duk_c_function) duk_builtin_uri_error_constructor,
+};
+
+char duk_builtins_data[] = {
+(char)'\x69', (char)'\xc3', (char)'\x4c', (char)'\x48', (char)'\x49', 
+(char)'\x50', (char)'\xd2', (char)'\xb6', (char)'\x11', (char)'\xf9', 
+(char)'\xa1', (char)'\x70', (char)'\x0a', (char)'\x1a', (char)'\x40', 
+(char)'\x02', (char)'\x1f', (char)'\x14', (char)'\x1a', (char)'\x69', 
+(char)'\x81', (char)'\xff', (char)'\x60', (char)'\xd2', (char)'\x2e', 
+(char)'\x0e', (char)'\x46', (char)'\x34', (char)'\xc1', (char)'\x03', 
+(char)'\x7e', (char)'\x91', (char)'\xbc', (char)'\x74', (char)'\x19', 
+(char)'\xf2', (char)'\x0d', (char)'\x54', (char)'\x40', (char)'\xb5', 
+(char)'\x63', (char)'\x4a', (char)'\xa0', (char)'\x29', (char)'\x28', 
+(char)'\xd2', (char)'\xb5', (char)'\x01', (char)'\x4a', (char)'\x34', 
+(char)'\xd0', (char)'\x40', (char)'\x12', (char)'\x8d', (char)'\x34', 
+(char)'\x2f', (char)'\xf4', (char)'\xa3', (char)'\x4d', (char)'\xe3', 
+(char)'\xf9', (char)'\x28', (char)'\xd3', (char)'\x82', (char)'\xfd', 
+(char)'\x4a', (char)'\x34', (char)'\xe1', (char)'\xbf', (char)'\x12', 
+(char)'\x90', (char)'\x38', (char)'\xd1', (char)'\x84', (char)'\x3f', 
+(char)'\x14', (char)'\x34', (char)'\xde', (char)'\x80', (char)'\x3f', 
+(char)'\x21', (char)'\xa4', (char)'\x68', (char)'\x05', (char)'\xf8', 
+(char)'\x0d', (char)'\x33', (char)'\xa0', (char)'\x1f', (char)'\xc4', 
+(char)'\x50', (char)'\x7f', (char)'\xfe', (char)'\xaa', (char)'\xaa', 
+(char)'\x03', (char)'\xff', (char)'\xc0', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x01', (char)'\x2e', 
+(char)'\x03', (char)'\xff', (char)'\x80', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x01', (char)'\x42', 
+(char)'\x20', (char)'\x48', (char)'\xc2', (char)'\x08', (char)'\x98', 
+(char)'\x81', (char)'\x03', (char)'\x18', (char)'\x1e', (char)'\x64', 
+(char)'\x03', (char)'\x8c', (char)'\xa0', (char)'\x69', (char)'\x98', 
+(char)'\x0c', (char)'\x33', (char)'\x81', (char)'\x66', (char)'\x80', 
+(char)'\x28', (char)'\xd2', (char)'\x80', (char)'\x9a', (char)'\x90', 
+(char)'\x03', (char)'\x59', (char)'\xfe', (char)'\x6c', (char)'\x3f', 
+(char)'\x8d', (char)'\xa7', (char)'\xe9', (char)'\xb8', (char)'\xfc', 
+(char)'\x37', (char)'\x81', (char)'\x27', (char)'\x00', (char)'\x20', 
+(char)'\xe1', (char)'\x12', (char)'\x1c', (char)'\x66', (char)'\xbe', 
+(char)'\xd9', (char)'\xc9', (char)'\xf4', (char)'\xd6', (char)'\x8f', 
+(char)'\x96', (char)'\xa2', (char)'\x7c', (char)'\x34', (char)'\x93', 
+(char)'\xdd', (char)'\xa0', (char)'\x9e', (char)'\xcc', (char)'\x44', 
+(char)'\xf5', (char)'\x63', (char)'\x27', (char)'\xa3', (char)'\x21', 
+(char)'\x3c', (char)'\xd9', (char)'\x49', (char)'\xe4', (char)'\xcc', 
+(char)'\x4f', (char)'\x16', (char)'\xd2', (char)'\x78', (char)'\x36', 
+(char)'\x0f', (char)'\x77', (char)'\xb0', (char)'\x8f', (char)'\xff', 
+(char)'\xff', (char)'\xc1', (char)'\x1b', (char)'\x43', (char)'\x00', 
+(char)'\x01', (char)'\x43', (char)'\xfc', (char)'\x03', (char)'\x5d', 
+(char)'\x92', (char)'\x04', (char)'\xeb', (char)'\x8e', (char)'\x47', 
+(char)'\x54', (char)'\x79', (char)'\x3a', (char)'\x62', (char)'\x91', 
+(char)'\xd1', (char)'\x18', (char)'\xce', (char)'\x78', (char)'\xb4', 
+(char)'\x73', (char)'\x4b', (char)'\x13', (char)'\x96', (char)'\x34', 
+(char)'\x9c', (char)'\x92', (char)'\xa4', (char)'\xe3', (char)'\x93', 
+(char)'\x27', (char)'\x14', (char)'\x91', (char)'\x38', (char)'\x64', 
+(char)'\x49', (char)'\xc1', (char)'\x28', (char)'\x5f', (char)'\xfe', 
+(char)'\x10', (char)'\x03', (char)'\x36', (char)'\xa6', (char)'\xc1', 
+(char)'\xb3', (char)'\x34', (char)'\x0d', (char)'\x89', (char)'\xc0', 
+(char)'\x6b', (char)'\xcb', (char)'\x93', (char)'\x5a', (char)'\x60', 
+(char)'\x9a', (char)'\xb3', (char)'\x24', (char)'\x28', (char)'\xbf', 
+(char)'\x80', (char)'\x00', (char)'\x7f', (char)'\x88', (char)'\x00', 
+(char)'\x8d', (char)'\xa6', (char)'\x02', (char)'\x6a', (char)'\x2e', 
+(char)'\xa3', (char)'\x4d', (char)'\x7c', (char)'\xfb', (char)'\x49', 
+(char)'\x78', (char)'\xf8', (char)'\xa3', (char)'\xfe', (char)'\x00', 
+(char)'\x2c', (char)'\xf0', (char)'\x12', (char)'\x0f', (char)'\xf1', 
+(char)'\x80', (char)'\x55', (char)'\xb4', (char)'\x2a', (char)'\x0d', 
+(char)'\x91', (char)'\x40', (char)'\x67', (char)'\x01', (char)'\x1f', 
+(char)'\x66', (char)'\x83', (char)'\x93', (char)'\x30', (char)'\x28', 
+(char)'\x19', (char)'\x61', (char)'\x67', (char)'\xd9', (char)'\x41', 
+(char)'\xc0', (char)'\xc9', (char)'\x0f', (char)'\x06', (char)'\x40', 
+(char)'\x82', (char)'\x31', (char)'\xc4', (char)'\x89', (char)'\x8c', 
+(char)'\x26', (char)'\xbd', (char)'\x8a', (char)'\x2c', (char)'\x7d', 
+(char)'\x88', (char)'\x0c', (char)'\x7d', (char)'\x86', (char)'\x10', 
+(char)'\x7d', (char)'\x84', (char)'\x06', (char)'\x69', (char)'\x82', 
+(char)'\x22', (char)'\x69', (char)'\x80', (char)'\x0a', (char)'\x69', 
+(char)'\x7e', (char)'\x12', (char)'\x69', (char)'\x7c', (char)'\x08', 
+(char)'\x69', (char)'\x7a', (char)'\x18', (char)'\x7d', (char)'\x78', 
+(char)'\x1a', (char)'\x7c', (char)'\x52', (char)'\x7f', (char)'\x00', 
+(char)'\x15', (char)'\xdd', (char)'\x39', (char)'\xf0', (char)'\xff', 
+(char)'\x20', (char)'\x11', (char)'\xbc', (char)'\x20', (char)'\x2a', 
+(char)'\x8d', (char)'\xab', (char)'\x80', (char)'\x6c', (char)'\x5d', 
+(char)'\x82', (char)'\xea', (char)'\xa0', (char)'\x97', (char)'\x35', 
+(char)'\x24', (char)'\xce', (char)'\xaa', (char)'\x3e', (char)'\xc4', 
+(char)'\xab', (char)'\x34', (char)'\xc3', (char)'\xac', (char)'\x34', 
+(char)'\xb8', (char)'\xad', (char)'\x25', (char)'\xbd', (char)'\x71', 
+(char)'\x2d', (char)'\xab', (char)'\xd1', (char)'\x6b', (char)'\x60', 
+(char)'\x4c', (char)'\x8b', (char)'\x14', (char)'\x5a', (char)'\x59', 
+(char)'\x22', (char)'\xce', (char)'\xd1', (char)'\x16', (char)'\x56', 
+(char)'\xe0', (char)'\xb1', (char)'\xb5', (char)'\x05', (char)'\x85', 
+(char)'\xc8', (char)'\x2b', (char)'\xed', (char)'\x81', (char)'\x5d', 
+(char)'\x74', (char)'\x0a', (char)'\xdb', (char)'\x34', (char)'\x14', 
+(char)'\xbf', (char)'\xc0', (char)'\x00', (char)'\x3f', (char)'\xca', 
+(char)'\x04', (char)'\x6f', (char)'\x18', (char)'\x26', (char)'\xd0', 
+(char)'\xc0', (char)'\x36', (char)'\x06', (char)'\x40', (char)'\x53', 
+(char)'\x7f', (char)'\x15', (char)'\x59', (char)'\x01', (char)'\xff', 
+(char)'\xbf', (char)'\xff', (char)'\xff', (char)'\xff', (char)'\xff', 
+(char)'\xff', (char)'\xfd', (char)'\x57', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x05', (char)'\x55', (char)'\x01', (char)'\xff', 
+(char)'\xe0', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x01', (char)'\x51', (char)'\x01', (char)'\xff', 
+(char)'\xc0', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x01', (char)'\x53', (char)'\x03', (char)'\xff', 
+(char)'\xc0', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\xff', (char)'\x30', 
+(char)'\x11', (char)'\xbc', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x01', (char)'\x9b', (char)'\x50', (char)'\xe4', (char)'\xd9', 
+(char)'\x85', (char)'\x26', (char)'\xc4', (char)'\x40', (char)'\x29', 
+(char)'\xe1', (char)'\x09', (char)'\x4d', (char)'\x06', (char)'\x4a', 
+(char)'\x58', (char)'\x62', (char)'\x14', (char)'\xff', (char)'\xc0', 
+(char)'\x0d', (char)'\x48', (char)'\x3e', (char)'\x4a', (char)'\x32', 
+(char)'\x0f', (char)'\xea', (char)'\x21', (char)'\xe0', (char)'\x0f', 
+(char)'\xf3', (char)'\x81', (char)'\x1b', (char)'\xc8', (char)'\x7f', 
+(char)'\xf8', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\xb5', (char)'\xb4', (char)'\x92', 
+(char)'\x0a', (char)'\x14', (char)'\x30', (char)'\x50', (char)'\x25', 
+(char)'\x03', (char)'\x65', (char)'\x1c', (char)'\x13', (char)'\xe8', 
+(char)'\xc0', (char)'\x9e', (char)'\x48', (char)'\x06', (char)'\xc2', 
+(char)'\x60', (char)'\x27', (char)'\x53', (char)'\x01', (char)'\x38', 
+(char)'\x46', (char)'\x09', (char)'\xb2', (char)'\xc0', (char)'\x4d', 
+(char)'\x13', (char)'\x82', (char)'\x64', (char)'\xc0', (char)'\x13', 
+(char)'\x04', (char)'\x20', (char)'\x97', (char)'\x2a', (char)'\x04', 
+(char)'\xb1', (char)'\x10', (char)'\x25', (char)'\x4a', (char)'\xc1', 
+(char)'\x28', (char)'\x48', (char)'\x09', (char)'\x32', (char)'\xd0', 
+(char)'\x49', (char)'\x13', (char)'\x02', (char)'\x44', (char)'\xbc', 
+(char)'\x12', (char)'\x05', (char)'\x00', (char)'\x8f', (char)'\x31', 
+(char)'\x04', (char)'\x71', (char)'\x28', (char)'\x23', (char)'\x4b', 
+(char)'\x81', (char)'\x18', (char)'\x52', (char)'\x08', (char)'\xb3', 
+(char)'\xa2', (char)'\x45', (char)'\x1b', (char)'\x12', (char)'\x24', 
+(char)'\xf8', (char)'\x91', (char)'\x07', (char)'\x2b', (char)'\xd0', 
+(char)'\xe8', (char)'\x2b', (char)'\xd0', (char)'\xc6', (char)'\xef', 
+(char)'\xd0', (char)'\xa7', (char)'\xef', (char)'\xd0', (char)'\x86', 
+(char)'\xb3', (char)'\xd0', (char)'\x67', (char)'\xb3', (char)'\xd0', 
+(char)'\x46', (char)'\x64', (char)'\x81', (char)'\x3b', (char)'\x24', 
+(char)'\x01', (char)'\xc2', (char)'\xf3', (char)'\xfa', (char)'\x02', 
+(char)'\xf3', (char)'\xf1', (char)'\xa3', (char)'\xf3', (char)'\xe9', 
+(char)'\xe3', (char)'\xf3', (char)'\xe2', (char)'\x58', (char)'\x1e', 
+(char)'\xd1', (char)'\x00', (char)'\xf4', (char)'\x8a', (char)'\x47', 
+(char)'\x93', (char)'\x20', (char)'\x3c', (char)'\x21', (char)'\x10', 
+(char)'\xa8', (char)'\xfe', (char)'\x00', (char)'\x01', (char)'\xfe', 
+(char)'\x80', (char)'\xc3', (char)'\x48', (char)'\x20', (char)'\x60', 
+(char)'\x01', (char)'\x01', (char)'\x3a', (char)'\x42', (char)'\x38', 
+(char)'\x01', (char)'\xa3', (char)'\x1c', (char)'\xe3', (char)'\x1c', 
+(char)'\xa3', (char)'\x1c', (char)'\x64', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x06', (char)'\x76', (char)'\xa3', (char)'\x23', 
+(char)'\xad', (char)'\x21', (char)'\x36', (char)'\xa9', (char)'\x40', 
+(char)'\x54', (char)'\xff', (char)'\x00', (char)'\x00', (char)'\xff', 
+(char)'\x48', (char)'\x53', (char)'\x69', (char)'\x02', (char)'\x8d', 
+(char)'\x84', (char)'\x05', (char)'\x1f', (char)'\x3a', (char)'\xc2', 
+(char)'\xb8', (char)'\xf1', (char)'\xd5', (char)'\x55', (char)'\xc7', 
+(char)'\x6e', (char)'\xac', (char)'\xae', (char)'\x0b', (char)'\x69', 
+(char)'\x64', (char)'\x05', (char)'\x57', (char)'\xf0', (char)'\x00', 
+(char)'\x4f', (char)'\xf5', (char)'\x02', (char)'\x36', (char)'\x94', 
+(char)'\x04', (char)'\xd8', (char)'\x40', (char)'\x50', (char)'\x05', 
+(char)'\x5f', (char)'\xf0', (char)'\x00', (char)'\x4f', (char)'\xf5', 
+(char)'\x82', (char)'\x36', (char)'\x94', (char)'\x00', (char)'\xd8', 
+(char)'\x40', (char)'\x50', (char)'\x05', (char)'\x67', (char)'\xf0', 
+(char)'\x00', (char)'\x4f', (char)'\xf6', (char)'\x02', (char)'\x36', 
+(char)'\x93', (char)'\xfc', (char)'\xd8', (char)'\x40', (char)'\x50', 
+(char)'\x05', (char)'\x6f', (char)'\xf0', (char)'\x00', (char)'\x4f', 
+(char)'\xf6', (char)'\x82', (char)'\x36', (char)'\x93', (char)'\xf8', 
+(char)'\xd8', (char)'\x40', (char)'\x50', (char)'\x05', (char)'\x77', 
+(char)'\xf0', (char)'\x00', (char)'\x4f', (char)'\xf7', (char)'\x02', 
+(char)'\x36', (char)'\x93', (char)'\xf4', (char)'\xd8', (char)'\x40', 
+(char)'\x50', (char)'\x05', (char)'\x7f', (char)'\xf0', (char)'\x00', 
+(char)'\x4f', (char)'\xf7', (char)'\x82', (char)'\x36', (char)'\x93', 
+(char)'\xf0', (char)'\xd8', (char)'\x40', (char)'\x50', (char)'\x03', 
+(char)'\xff', (char)'\xf2', (char)'\x0d', (char)'\x70', (char)'\x10', 
+(char)'\x01', (char)'\x6f', (char)'\xc2', (char)'\xa2', (char)'\xc5', 
+(char)'\x15', (char)'\xda', (char)'\x4d', (char)'\x50', (char)'\x10', 
+(char)'\x00', (char)'\x9a', (char)'\xec', (char)'\x6e', (char)'\xed', 
+(char)'\x55', (char)'\x45', (char)'\x8d', (char)'\x30', (char)'\x0f', 
+(char)'\xf9', (char)'\x8b', (char)'\x90', (char)'\xbf', (char)'\xbe', 
+(char)'\x8e', (char)'\x7b', (char)'\xcd', (char)'\x10', (char)'\x0f', 
+(char)'\xfd', (char)'\xc5', (char)'\x51', (char)'\xd9', (char)'\x4a', 
+(char)'\xe0', (char)'\xbf', (char)'\x8c', (char)'\xf0', (char)'\x0f', 
+(char)'\xf6', (char)'\xf2', (char)'\xde', (char)'\xc5', (char)'\x49', 
+(char)'\xb9', (char)'\x43', (char)'\x8c', (char)'\xd0', (char)'\x10', 
+(char)'\x02', (char)'\x48', (char)'\x7e', (char)'\xd5', (char)'\x11', 
+(char)'\x0b', (char)'\x46', (char)'\x0c', (char)'\xb0', (char)'\x0f', 
+(char)'\xf9', (char)'\xa8', (char)'\x27', (char)'\x99', (char)'\x9f', 
+(char)'\xce', (char)'\xf3', (char)'\x4c', (char)'\x90', (char)'\x0f', 
+(char)'\xfd', (char)'\xa8', (char)'\x27', (char)'\x99', (char)'\x9f', 
+(char)'\xce', (char)'\xf3', (char)'\x52', (char)'\x31', (char)'\xb8', 
+(char)'\x11', (char)'\x89', (char)'\xc4', (char)'\x8c', (char)'\x2e', 
+(char)'\x44', (char)'\x60', (char)'\x73', (char)'\x22', (char)'\xfb', 
+(char)'\xa2', (char)'\x17', (char)'\x9d', (char)'\x48', (char)'\xba', 
+(char)'\xec', (char)'\x45', (char)'\xc7', (char)'\x72', (char)'\x2d', 
+(char)'\xbc', (char)'\x11', (char)'\x69', (char)'\xe4', (char)'\x8b', 
+(char)'\x2f', (char)'\x4b', (char)'\xcb', (char)'\x0f', (char)'\x6b', 
+(char)'\xca', (char)'\xef', (char)'\x88', (char)'\x56', (char)'\x7d', 
+(char)'\x02', (char)'\xab', (char)'\xf1', (char)'\x15', (char)'\x1f', 
+(char)'\xc8', (char)'\xa7', (char)'\x00', (char)'\x45', (char)'\x28', 
+(char)'\x12', (char)'\x0f', (char)'\xff', (char)'\xc0', (char)'\x09', 
+(char)'\x48', (char)'\xdc', (char)'\x85', (char)'\x16', (char)'\xf6', 
+(char)'\x17', (char)'\xff', (char)'\xc0', (char)'\x00', (char)'\x3f', 
+(char)'\xff', (char)'\x14', (char)'\x47', (char)'\x01', (char)'\x02', 
+(char)'\x17', (char)'\x80', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x45', (char)'\x06', (char)'\xbd', 
+(char)'\x93', (char)'\x06', (char)'\x2c', (char)'\xd6', (char)'\xb1', 
+(char)'\x60', (char)'\xb5', (char)'\x9b', (char)'\x07', (char)'\x68', 
+(char)'\x26', (char)'\x69', (char)'\xdd', (char)'\xd7', (char)'\xc2', 
+(char)'\x0e', (char)'\x18', (char)'\x78', (char)'\x70', (char)'\xc3', 
+(char)'\xd3', (char)'\xae', (char)'\xee', (char)'\x9c', (char)'\xf0', 
+(char)'\xa0', (char)'\x66', (char)'\xb9', (char)'\xa2', (char)'\xe6', 
+(char)'\x0b', (char)'\x58', (char)'\x33', (char)'\x60', (char)'\xd1', 
+(char)'\x83', (char)'\x05', (char)'\xb9', (char)'\xf2', (char)'\xee', 
+(char)'\xcb', (char)'\xcb', (char)'\x4e', (char)'\x34', (char)'\x08', 
+(char)'\xd9', (char)'\x30', (char)'\x62', (char)'\xc9', (char)'\x83', 
+(char)'\x56', (char)'\x4c', (char)'\x58', (char)'\x35', (char)'\x64', 
+(char)'\xc5', (char)'\x05', (char)'\x39', (char)'\xb4', (char)'\x10', 
+(char)'\x4d', (char)'\xdf', (char)'\xb9', (char)'\x04', (char)'\xdc', 
+(char)'\x3e', (char)'\x50', (char)'\x32', (char)'\x62', (char)'\x81', 
+(char)'\x83', (char)'\x97', (char)'\x4c', (char)'\x99', (char)'\x3a', 
+(char)'\x60', (char)'\xc9', (char)'\x05', (char)'\x5a', (char)'\x90', 
+(char)'\xd0', (char)'\x32', (char)'\x60', (char)'\xc5', (char)'\x92', 
+(char)'\x0f', (char)'\x0e', (char)'\x1b', (char)'\x5f', (char)'\x6c', 
+(char)'\xd1', (char)'\x07', (char)'\x87', (char)'\x0d', (char)'\xaf', 
+(char)'\xb6', (char)'\x68', (char)'\x83', (char)'\xc3', (char)'\x86', 
+(char)'\xd7', (char)'\xdb', (char)'\x34', (char)'\x41', (char)'\x1e', 
+(char)'\x75', (char)'\x55', (char)'\xf3', (char)'\x34', (char)'\xee', 
+(char)'\xeb', (char)'\xe1', (char)'\xda', (char)'\x06', (char)'\x6c', 
+(char)'\xb2', (char)'\x61', (char)'\x6a', (char)'\xdb', (char)'\x2e', 
+(char)'\x46', (char)'\xf8', (char)'\xda', (char)'\x36', (char)'\x63', 
+(char)'\x87', (char)'\x0e', (char)'\x46', (char)'\x4e', (char)'\x19', 
+(char)'\xb9', (char)'\x6e', (char)'\xe5', (char)'\x8e', (char)'\x66', 
+(char)'\xec', (char)'\x19', (char)'\x61', (char)'\xcb', (char)'\x99', 
+(char)'\xc3', (char)'\x86', (char)'\x6c', (char)'\x5b', (char)'\x62', 
+(char)'\x6f', (char)'\x8f', (char)'\x0e', (char)'\x67', (char)'\x68', 
+(char)'\x31', (char)'\x69', (char)'\xce', (char)'\x02', (char)'\x39', 
+(char)'\x80', (char)'\x27', (char)'\x40', (char)'\x00', (char)'\xe4', 
+(char)'\x1c', (char)'\x42', (char)'\x9a', (char)'\x42', (char)'\x05', 
+(char)'\x22', (char)'\x0f', (char)'\xa8', (char)'\x10', (char)'\x75', 
+(char)'\x44', (char)'\x83', (char)'\xca', (char)'\x68', (char)'\x1c', 
+(char)'\x4f', (char)'\x40', (char)'\xda', (char)'\x72', (char)'\x0b', 
+(char)'\x2f', (char)'\xe0', (char)'\x07', (char)'\x30', (char)'\xc0', 
+(char)'\x40', (char)'\xc5', (char)'\xfb', (char)'\x05', (char)'\xef', 
+(char)'\x80', (char)'\x3f', (char)'\xe4', (char)'\x00', (char)'\x01', 
+(char)'\x67', (char)'\xfc', (char)'\x00', (char)'\x03', (char)'\xfe', 
+(char)'\x60', (char)'\x02', (char)'\x6d', (char)'\x0d', (char)'\x83', 
+(char)'\x60', (char)'\x70', (char)'\x05', (char)'\xa7', (char)'\xf0', 
+(char)'\x00', (char)'\x0f', (char)'\xfa', (char)'\x00', (char)'\x09', 
+(char)'\xb5', (char)'\x3c', (char)'\x0d', (char)'\x89', (char)'\xf0', 
+(char)'\x4f', (char)'\xff', (char)'\xc2', (char)'\x36', (char)'\xc1', 
+(char)'\x0b', (char)'\x89', (char)'\xbf', (char)'\xae', (char)'\x2d', 
+(char)'\x99', (char)'\x62', (char)'\xf2', (char)'\xe5', (char)'\xbf', 
+(char)'\x91', (char)'\xb2', (char)'\x08', (char)'\xbe', (char)'\x5e', 
+(char)'\x5c', (char)'\xb7', (char)'\xf2', (char)'\x41', (char)'\xa7', 
+(char)'\x72', (char)'\x0c', (char)'\xbc', (char)'\xb9', (char)'\x6f', 
+(char)'\xe4', (char)'\x83', (char)'\x46', (char)'\x1d', (char)'\xd9', 
+(char)'\x36', (char)'\x69', (char)'\xdd', (char)'\x9c', (char)'\x00', 
+};
+#elif defined(DUK_USE_DOUBLE_ME)
+char duk_strings_data[] = {
+(char)'\x37', (char)'\x66', (char)'\x78', (char)'\x90', (char)'\x03', 
+(char)'\x3f', (char)'\x5e', (char)'\xe4', (char)'\x36', (char)'\x64', 
+(char)'\x89', (char)'\xba', (char)'\x1a', (char)'\x14', (char)'\xa4', 
+(char)'\x89', (char)'\xba', (char)'\x32', (char)'\x0b', (char)'\xa4', 
+(char)'\x6d', (char)'\x4d', (char)'\xd7', (char)'\x05', (char)'\x3d', 
+(char)'\x23', (char)'\x6a', (char)'\x03', (char)'\x19', (char)'\x6e', 
+(char)'\x08', (char)'\x16', (char)'\x9e', (char)'\x82', (char)'\x26', 
+(char)'\xa3', (char)'\x08', (char)'\xd9', (char)'\xc8', (char)'\x9e', 
+(char)'\x4c', (char)'\x9c', (char)'\xd2', (char)'\x75', (char)'\x80', 
+(char)'\x99', (char)'\xcb', (char)'\xd2', (char)'\x46', (char)'\x2e', 
+(char)'\x89', (char)'\xbb', (char)'\x12', (char)'\x1b', (char)'\xa4', 
+(char)'\xbb', (char)'\xc9', (char)'\xd1', (char)'\x82', (char)'\x64', 
+(char)'\x37', (char)'\x5b', (char)'\x46', (char)'\x04', (char)'\x91', 
+(char)'\x3f', (char)'\x42', (char)'\xe7', (char)'\x2c', (char)'\x80', 
+(char)'\x69', (char)'\xbb', (char)'\x29', (char)'\xc5', (char)'\x0d', 
+(char)'\x31', (char)'\x7a', (char)'\x08', (char)'\xc4', (char)'\x18', 
+(char)'\x47', (char)'\x4b', (char)'\x46', (char)'\x8a', (char)'\x68', 
+(char)'\x73', (char)'\x4d', (char)'\xd7', (char)'\x05', (char)'\x24', 
+(char)'\x14', (char)'\xdd', (char)'\xff', (char)'\x7f', (char)'\x45', 
+(char)'\xa6', (char)'\xa1', (char)'\xa5', (char)'\xfa', (char)'\x2f', 
+(char)'\xba', (char)'\x9c', (char)'\x68', (char)'\x4f', (char)'\xfd', 
+(char)'\x6f', (char)'\xfd', (char)'\xfd', (char)'\x16', (char)'\x90', 
+(char)'\xd2', (char)'\xfd', (char)'\x17', (char)'\xdd', (char)'\x4e', 
+(char)'\x34', (char)'\x27', (char)'\xfe', (char)'\xb7', (char)'\xfe', 
+(char)'\xfe', (char)'\x8b', (char)'\x4d', (char)'\x03', (char)'\x7e', 
+(char)'\x8b', (char)'\xee', (char)'\xa7', (char)'\x1a', (char)'\x13', 
+(char)'\xff', (char)'\x67', (char)'\xff', (char)'\x7f', (char)'\x45', 
+(char)'\xaa', (char)'\x34', (char)'\x64', (char)'\x2a', (char)'\x1a', 
+(char)'\x41', (char)'\xfd', (char)'\x17', (char)'\xdd', (char)'\x4e', 
+(char)'\x34', (char)'\x27', (char)'\xfe', (char)'\x9c', (char)'\x54', 
+(char)'\x8c', (char)'\x48', (char)'\xd9', (char)'\x9a', (char)'\x24', 
+(char)'\x95', (char)'\x18', (char)'\x43', (char)'\x04', (char)'\x12', 
+(char)'\x27', (char)'\xdb', (char)'\x7d', (char)'\xa0', (char)'\xce', 
+(char)'\x4b', (char)'\x8c', (char)'\x64', (char)'\x10', (char)'\xc8', 
+(char)'\xd1', (char)'\x30', (char)'\xc4', (char)'\x9f', (char)'\x4a', 
+(char)'\x86', (char)'\x81', (char)'\x68', (char)'\xc9', (char)'\x22', 
+(char)'\xc9', (char)'\x12', (char)'\x7d', (char)'\x2a', (char)'\x1a', 
+(char)'\x05', (char)'\xa3', (char)'\x24', (char)'\x88', (char)'\x8c', 
+(char)'\x22', (char)'\x44', (char)'\x85', (char)'\x11', (char)'\x00', 
+(char)'\x31', (char)'\xc4', (char)'\xa1', (char)'\xa2', (char)'\x16', 
+(char)'\x33', (char)'\xd4', (char)'\x91', (char)'\x92', (char)'\x1c', 
+(char)'\xd3', (char)'\xeb', (char)'\x43', (char)'\xa2', (char)'\xb5', 
+(char)'\xa3', (char)'\x89', (char)'\xcc', (char)'\x7a', (char)'\x16', 
+(char)'\x44', (char)'\x6e', (char)'\x24', (char)'\x30', (char)'\x41', 
+(char)'\x22', (char)'\x1f', (char)'\x73', (char)'\x3c', (char)'\x48', 
+(char)'\x01', (char)'\xab', (char)'\x65', (char)'\x43', (char)'\x40', 
+(char)'\xb4', (char)'\x64', (char)'\x91', (char)'\x56', (char)'\xd8', 
+(char)'\x49', (char)'\x82', (char)'\x60', (char)'\x0a', (char)'\xc8', 
+(char)'\x7d', (char)'\x88', (char)'\x0b', (char)'\x59', (char)'\x08', 
+(char)'\x4d', (char)'\xb0', (char)'\x0f', (char)'\x2e', (char)'\xc1', 
+(char)'\x13', (char)'\x48', (char)'\xbb', (char)'\x99', (char)'\xd1', 
+(char)'\x24', (char)'\x6d', (char)'\xe2', (char)'\xfb', (char)'\x25', 
+(char)'\xa1', (char)'\xa4', (char)'\x3e', (char)'\xe4', (char)'\xea', 
+(char)'\x44', (char)'\x44', (char)'\x3e', (char)'\xea', (char)'\x08', 
+(char)'\x91', (char)'\xb5', (char)'\x3e', (char)'\xd6', (char)'\x4b', 
+(char)'\x91', (char)'\xb5', (char)'\x3e', (char)'\xea', (char)'\x08', 
+(char)'\xb0', (char)'\x0f', (char)'\x46', (char)'\xca', (char)'\xe8', 
+(char)'\xb0', (char)'\x0b', (char)'\x92', (char)'\x76', (char)'\x1c', 
+(char)'\x4c', (char)'\x82', (char)'\x70', (char)'\xc8', (char)'\x5d', 
+(char)'\xb4', (char)'\x97', (char)'\x99', (char)'\xf7', (char)'\x30', 
+(char)'\x44', (char)'\xc4', (char)'\x99', (char)'\xb7', (char)'\x50', 
+(char)'\x2e', (char)'\x84', (char)'\x3b', (char)'\xdc', (char)'\x86', 
+(char)'\xcc', (char)'\x91', (char)'\x30', (char)'\x68', (char)'\x52', 
+(char)'\x92', (char)'\x29', (char)'\x9c', (char)'\x40', (char)'\x22', 
+(char)'\x0c', (char)'\x13', (char)'\x02', (char)'\x96', (char)'\x86', 
+(char)'\x93', (char)'\xad', (char)'\xa3', (char)'\x02', (char)'\x48', 
+(char)'\xa0', (char)'\xa8', (char)'\x59', (char)'\x3a', (char)'\xd0', 
+(char)'\x30', (char)'\x82', (char)'\x78', (char)'\x8b', (char)'\x29', 
+(char)'\x80', (char)'\x4a', (char)'\x77', (char)'\x66', (char)'\x78', 
+(char)'\xba', (char)'\xdd', (char)'\x9e', (char)'\x1e', (char)'\x4e', 
+(char)'\x92', (char)'\x31', (char)'\x74', (char)'\x4c', (char)'\x20', 
+(char)'\x2d', (char)'\x64', (char)'\x23', (char)'\x3a', (char)'\x86', 
+(char)'\xd4', (char)'\x0b', (char)'\x40', (char)'\xfe', (char)'\x83', 
+(char)'\xa3', (char)'\x04', (char)'\xc8', (char)'\x5f', (char)'\xdb', 
+(char)'\xfa', (char)'\xef', (char)'\xae', (char)'\xfa', (char)'\xef', 
+(char)'\xdd', (char)'\x17', (char)'\xc5', (char)'\x7c', (char)'\x48', 
+(char)'\x7e', (char)'\x80', (char)'\x3f', (char)'\x58', (char)'\x2f', 
+(char)'\xad', (char)'\xfb', (char)'\x01', (char)'\x7d', (char)'\x5f', 
+(char)'\xd8', (char)'\x07', (char)'\xec', (char)'\x13', (char)'\xf5', 
+(char)'\xbd', (char)'\x43', (char)'\x4a', (char)'\x86', (char)'\xa2', 
+(char)'\x78', (char)'\x4f', (char)'\xd5', (char)'\xf5', (char)'\x0d', 
+(char)'\x2a', (char)'\x1a', (char)'\x89', (char)'\xe1', (char)'\x1d', 
+(char)'\x43', (char)'\x4a', (char)'\x86', (char)'\xa2', (char)'\x78', 
+(char)'\x33', (char)'\x82', (char)'\x92', (char)'\x0a', (char)'\x66', 
+(char)'\x94', (char)'\xe2', (char)'\x86', (char)'\x98', (char)'\xcd', 
+(char)'\xa3', (char)'\x02', (char)'\x48', (char)'\x9c', (char)'\x2e', 
+(char)'\x72', (char)'\xc8', (char)'\x06', (char)'\xa6', (char)'\x8d', 
+(char)'\x19', (char)'\x0a', (char)'\x86', (char)'\x90', (char)'\x69', 
+(char)'\x94', (char)'\xe2', (char)'\x86', (char)'\x99', (char)'\x05', 
+(char)'\xc0', (char)'\xe6', (char)'\x06', (char)'\x92', (char)'\x50', 
+(char)'\x8c', (char)'\xc7', (char)'\x24', (char)'\x34', (char)'\xb1', 
+(char)'\x75', (char)'\x1a', (char)'\x33', (char)'\x44', (char)'\x0d', 
+(char)'\x1b', (char)'\x98', (char)'\x37', (char)'\xba', (char)'\xc3', 
+(char)'\x62', (char)'\x1a', (char)'\x36', (char)'\x02', (char)'\xe3', 
+(char)'\x5b', (char)'\x8c', (char)'\x52', (char)'\xad', (char)'\xce', 
+(char)'\x88', (char)'\xc9', (char)'\x77', (char)'\x8c', (char)'\x4e', 
+(char)'\x91', (char)'\x04', (char)'\x44', (char)'\x2c', (char)'\xa0', 
+(char)'\x98', (char)'\x1b', (char)'\xf6', (char)'\x44', (char)'\x04', 
+(char)'\xc0', (char)'\xd2', (char)'\x02', (char)'\x48', (char)'\x69', 
+(char)'\x00', (char)'\x27', (char)'\x48', (char)'\x60', (char)'\x0c', 
+(char)'\x8b', (char)'\xe9', (char)'\x42', (char)'\x33', (char)'\xfb', 
+(char)'\x23', (char)'\xfa', (char)'\x50', (char)'\x8c', (char)'\xfe', 
+(char)'\xc7', (char)'\x5f', (char)'\x64', (char)'\x2f', (char)'\x3d', 
+(char)'\x06', (char)'\xf2', (char)'\xdc', (char)'\x6f', (char)'\xb1', 
+(char)'\xfb', (char)'\x02', (char)'\x17', (char)'\xcb', (char)'\x71', 
+(char)'\xbe', (char)'\xc8', (char)'\x83', (char)'\xf2', (char)'\xdb', 
+(char)'\xf6', (char)'\x44', (char)'\xf2', (char)'\xdb', (char)'\xf6', 
+(char)'\x3f', (char)'\x60', (char)'\x1e', (char)'\x90', (char)'\xec', 
+(char)'\x24', (char)'\xa4', (char)'\x03', (char)'\x10', (char)'\x8d', 
+(char)'\x03', (char)'\x08', (char)'\x54', (char)'\x35', (char)'\xf4', 
+(char)'\x99', (char)'\x50', (char)'\xd1', (char)'\x92', (char)'\xe4', 
+(char)'\xfa', (char)'\x8f', (char)'\xbf', (char)'\xfb', (char)'\xaf', 
+(char)'\xa9', (char)'\x4a', (char)'\xc1', (char)'\x29', (char)'\xf5', 
+(char)'\x0d', (char)'\x19', (char)'\x2e', (char)'\x96', (char)'\x51', 
+(char)'\x73', (char)'\x42', (char)'\xd0', (char)'\xd2', (char)'\x29', 
+(char)'\x06', (char)'\x6b', (char)'\xa2', (char)'\x4e', (char)'\x88', 
+(char)'\x12', (char)'\x21', (char)'\xa4', (char)'\xea', (char)'\x44', 
+(char)'\x44', (char)'\x24', (char)'\xc9', (char)'\x29', (char)'\x90', 
+(char)'\x97', (char)'\x20', (char)'\x97', (char)'\x37', (char)'\x78', 
+(char)'\xcc', (char)'\x9c', (char)'\xbd', (char)'\x38', (char)'\xa1', 
+(char)'\xa6', (char)'\x3c', (char)'\x89', (char)'\x3e', (char)'\xe0', 
+(char)'\x80', (char)'\x89', (char)'\xcc', (char)'\x49', (char)'\xf7', 
+(char)'\x04', (char)'\x04', (char)'\x4d', (char)'\x37', (char)'\x79', 
+(char)'\x32', (char)'\x73', (char)'\x57', (char)'\x37', (char)'\x79', 
+(char)'\x12', (char)'\x74', (char)'\xbd', (char)'\x38', (char)'\xa1', 
+(char)'\xa6', (char)'\x5c', (char)'\xdd', (char)'\xea', (char)'\x4c', 
+(char)'\x52', (char)'\xf4', (char)'\xe2', (char)'\x86', (char)'\x99', 
+(char)'\xd2', (char)'\x24', (char)'\xfd', (char)'\x49', (char)'\x88', 
+(char)'\xbe', (char)'\xa2', (char)'\xd7', (char)'\xdc', (char)'\x10', 
+(char)'\x11', (char)'\x5c', (char)'\x89', (char)'\x3e', (char)'\x96', 
+(char)'\x8b', (char)'\x5f', (char)'\x70', (char)'\x40', (char)'\x45', 
+(char)'\x72', (char)'\x24', (char)'\xfd', (char)'\x49', (char)'\x89', 
+(char)'\x9e', (char)'\x73', (char)'\x66', (char)'\x74', (char)'\x48', 
+(char)'\x93', (char)'\xeb', (char)'\x1c', (char)'\xd9', (char)'\x9d', 
+(char)'\x52', (char)'\x24', (char)'\xfd', (char)'\x49', (char)'\x88', 
+(char)'\x7e', (char)'\x04', (char)'\xc8', (char)'\x79', (char)'\x12', 
+(char)'\x7d', (char)'\x18', (char)'\x26', (char)'\x45', (char)'\xc8', 
+(char)'\x93', (char)'\xf5', (char)'\x26', (char)'\x23', (char)'\xf9', 
+(char)'\xd4', (char)'\x8c', (char)'\x91', (char)'\x22', (char)'\x4f', 
+(char)'\xa7', (char)'\x75', (char)'\x23', (char)'\x26', (char)'\xc8', 
+(char)'\x93', (char)'\xf5', (char)'\x26', (char)'\x26', (char)'\x79', 
+(char)'\x0d', (char)'\xa4', (char)'\xc9', (char)'\x25', (char)'\x48', 
+(char)'\x93', (char)'\xeb', (char)'\x10', (char)'\xda', (char)'\x4c', 
+(char)'\x92', (char)'\x6c', (char)'\x89', (char)'\x3f', (char)'\x52', 
+(char)'\x62', (char)'\x97', (char)'\x88', (char)'\x27', (char)'\x34', 
+(char)'\x72', (char)'\x54', (char)'\x89', (char)'\x3e', (char)'\xc8', 
+(char)'\x82', (char)'\x73', (char)'\x47', (char)'\x29', (char)'\x48', 
+(char)'\x93', (char)'\xf5', (char)'\x26', (char)'\x26', (char)'\x79', 
+(char)'\x0b', (char)'\x5a', (char)'\x24', (char)'\x41', (char)'\x39', 
+(char)'\xa3', (char)'\x93', (char)'\xe4', (char)'\x49', (char)'\xf5', 
+(char)'\x88', (char)'\x5a', (char)'\xd1', (char)'\x22', (char)'\x09', 
+(char)'\xcd', (char)'\x1c', (char)'\x8f', (char)'\x22', (char)'\x4f', 
+(char)'\xb3', (char)'\x43', (char)'\x09', (char)'\x13', (char)'\x12', 
+(char)'\x7d', (char)'\x9a', (char)'\x18', (char)'\x4c', (char)'\xb9', 
+(char)'\xa4', (char)'\xeb', (char)'\x8a', (char)'\x59', (char)'\x12', 
+(char)'\x72', (char)'\x31', (char)'\x27', (char)'\xea', (char)'\x4c', 
+(char)'\x4c', (char)'\xf2', (char)'\x16', (char)'\xb4', (char)'\x48', 
+(char)'\x82', (char)'\x73', (char)'\x47', (char)'\x27', (char)'\x98', 
+(char)'\x93', (char)'\xeb', (char)'\x10', (char)'\xb5', (char)'\xa2', 
+(char)'\x44', (char)'\x13', (char)'\x9a', (char)'\x39', (char)'\x34', 
+(char)'\xc4', (char)'\x9f', (char)'\xa9', (char)'\x31', (char)'\x4b', 
+(char)'\xc4', (char)'\x13', (char)'\x9a', (char)'\x39', (char)'\x28', 
+(char)'\xc4', (char)'\x9f', (char)'\x64', (char)'\x41', (char)'\x39', 
+(char)'\xa3', (char)'\x93', (char)'\x4c', (char)'\x49', (char)'\xfa', 
+(char)'\x93', (char)'\x13', (char)'\x3c', (char)'\x86', (char)'\xd2', 
+(char)'\x64', (char)'\x92', (char)'\x8c', (char)'\x49', (char)'\xf5', 
+(char)'\x88', (char)'\x6d', (char)'\x26', (char)'\x49', (char)'\x2c', 
+(char)'\xc4', (char)'\x9f', (char)'\xa9', (char)'\x31', (char)'\x1f', 
+(char)'\xce', (char)'\xa4', (char)'\x64', (char)'\x83', (char)'\x12', 
+(char)'\x7d', (char)'\x3b', (char)'\xa9', (char)'\x19', (char)'\x24', 
+(char)'\xc4', (char)'\x9f', (char)'\xa9', (char)'\x31', (char)'\x0f', 
+(char)'\xc0', (char)'\xc1', (char)'\x8c', (char)'\x49', (char)'\xf4', 
+(char)'\x60', (char)'\xc2', (char)'\x8c', (char)'\x49', (char)'\xfa', 
+(char)'\x93', (char)'\x10', (char)'\xfc', (char)'\x09', (char)'\x90', 
+(char)'\xe6', (char)'\x24', (char)'\xfa', (char)'\x30', (char)'\x4c', 
+(char)'\x8b', (char)'\x31', (char)'\x27', (char)'\xea', (char)'\x4c', 
+(char)'\x4c', (char)'\xf3', (char)'\x9b', (char)'\x33', (char)'\xa0', 
+(char)'\xc4', (char)'\x9f', (char)'\x58', (char)'\xe6', (char)'\xcc', 
+(char)'\xee', (char)'\x31', (char)'\x27', (char)'\xea', (char)'\x4c', 
+(char)'\x45', (char)'\xf5', (char)'\x16', (char)'\xbe', (char)'\xe0', 
+(char)'\x80', (char)'\x8a', (char)'\xcc', (char)'\x49', (char)'\xf4', 
+(char)'\xb4', (char)'\x5a', (char)'\xfb', (char)'\x82', (char)'\x02', 
+(char)'\x27', (char)'\x31', (char)'\x27', (char)'\xd9', (char)'\xa1', 
+(char)'\x84', (char)'\x94', (char)'\xdd', (char)'\xd5', (char)'\xb8', 
+(char)'\x40', (char)'\x59', (char)'\x3b', (char)'\x34', (char)'\x30', 
+(char)'\x9d', (char)'\x94', (char)'\xe2', (char)'\x86', (char)'\x9a', 
+(char)'\x53', (char)'\x77', (char)'\x56', (char)'\xe1', (char)'\x01', 
+(char)'\x64', (char)'\xe8', (char)'\xc1', (char)'\x32', (char)'\x76', 
+(char)'\x53', (char)'\x8a', (char)'\x1a', (char)'\x66', (char)'\x4d', 
+(char)'\xdd', (char)'\x9a', (char)'\x18', (char)'\x4e', (char)'\xca', 
+(char)'\x71', (char)'\x43', (char)'\x4c', (char)'\xc9', (char)'\xbb', 
+(char)'\xa3', (char)'\x04', (char)'\xc9', (char)'\xd9', (char)'\x4e', 
+(char)'\x28', (char)'\x69', (char)'\x86', (char)'\xd7', (char)'\x58', 
+(char)'\x7e', (char)'\xa4', (char)'\xc4', (char)'\x57', (char)'\x82', 
+(char)'\x32', (char)'\x22', (char)'\xe6', (char)'\xee', (char)'\xbe', 
+(char)'\x24', (char)'\x12', (char)'\x24', (char)'\x87', (char)'\x35', 
+(char)'\xb3', (char)'\x77', (char)'\x49', (char)'\x77', (char)'\xb9', 
+(char)'\xa4', (char)'\x6c', (char)'\xd0', (char)'\x05', (char)'\x9e', 
+(char)'\x6e', (char)'\xe9', (char)'\x51', (char)'\x72', (char)'\x0e', 
+(char)'\x3e', (char)'\x7b', (char)'\xa4', (char)'\x89', (char)'\xa2', 
+(char)'\xa4', (char)'\xd2', (char)'\x1a', (char)'\x54', (char)'\x35', 
+(char)'\x13', (char)'\xc4', (char)'\x7c', (char)'\xd2', (char)'\x18', 
+(char)'\x13', (char)'\x45', (char)'\x49', (char)'\xa4', (char)'\x34', 
+(char)'\xa8', (char)'\x6a', (char)'\x27', (char)'\x81', (char)'\xf5', 
+(char)'\xa0', (char)'\xeb', (char)'\x53', (char)'\xe6', (char)'\x21', 
+(char)'\xba', (char)'\xa8', (char)'\x17', (char)'\x42', (char)'\x27', 
+(char)'\xcc', (char)'\x05', (char)'\xf5', (char)'\x50', (char)'\x2e', 
+(char)'\x84', (char)'\x34', (char)'\xa8', (char)'\x19', (char)'\x4e', 
+(char)'\x24', (char)'\x9c', (char)'\x50', (char)'\xc8', (char)'\xcd', 
+(char)'\xdd', (char)'\x5b', (char)'\x84', (char)'\x05', (char)'\x93', 
+(char)'\xb4', (char)'\x7b', (char)'\xc9', (char)'\x1e', (char)'\x88', 
+(char)'\x12', (char)'\x22', (char)'\xe6', (char)'\xee', (char)'\xd1', 
+(char)'\xef', (char)'\x24', (char)'\x7a', (char)'\x20', (char)'\x48', 
+(char)'\x91', (char)'\x9b', (char)'\xba', (char)'\xb7', (char)'\x08', 
+(char)'\x0b', (char)'\x27', (char)'\x56', (char)'\xeb', (char)'\x12', 
+(char)'\x3d', (char)'\x10', (char)'\x24', (char)'\x45', (char)'\xcd', 
+(char)'\xdd', (char)'\x5b', (char)'\xac', (char)'\x48', (char)'\xf4', 
+(char)'\x40', (char)'\x91', (char)'\x13', (char)'\x2a', (char)'\x06', 
+(char)'\x53', (char)'\x8a', (char)'\x1a', (char)'\x62', (char)'\xc9', 
+(char)'\xeb', (char)'\x44', (char)'\xcd', (char)'\x22', (char)'\x02', 
+(char)'\x22', (char)'\x39', (char)'\xe2', (char)'\x47', (char)'\xac', 
+(char)'\x02', (char)'\x21', (char)'\x58', (char)'\x09', (char)'\x88', 
+(char)'\xed', (char)'\x5b', (char)'\x84', (char)'\x05', (char)'\x93', 
+(char)'\xa2', (char)'\x73', (char)'\x1e', (char)'\x08', (char)'\x91', 
+(char)'\x42', (char)'\x38', (char)'\x23', (char)'\xd1', (char)'\x38', 
+(char)'\x64', (char)'\xe8', (char)'\x26', (char)'\x61', (char)'\x1c', 
+(char)'\x11', (char)'\xe8', (char)'\x26', (char)'\xc2', (char)'\xc5', 
+(char)'\xcc', (char)'\xe8', (char)'\x8e', (char)'\x08', (char)'\xf4', 
+(char)'\x4e', (char)'\x19', (char)'\x17', (char)'\x12', (char)'\x0e', 
+(char)'\x82', (char)'\x27', (char)'\x62', (char)'\x83', (char)'\x1e', 
+(char)'\x66', (char)'\x89', (char)'\x07', (char)'\x41', (char)'\x10', 
+(char)'\xc5', (char)'\x42', (char)'\xe6', (char)'\x48', (char)'\x8d', 
+(char)'\x80', (char)'\x79', (char)'\xca', (char)'\xe8', (char)'\xf4', 
+(char)'\x80', (char)'\x11', (char)'\xc9', (char)'\x27', (char)'\x30', 
+(char)'\x85', (char)'\x25', (char)'\x49', (char)'\x1c', (char)'\x2d', 
+(char)'\x60', (char)'\x94', (char)'\xfa', (char)'\x86', (char)'\x8c', 
+(char)'\x97', (char)'\xeb', (char)'\x8a', (char)'\x74', (char)'\x34', 
+(char)'\x64', (char)'\xbf', (char)'\x5c', (char)'\x53', (char)'\xd1', 
+(char)'\xb2', (char)'\x3a', (char)'\x0b', (char)'\x33', (char)'\x49', 
+(char)'\xeb', (char)'\x40', (char)'\x88', (char)'\x49', (char)'\x3a', 
+(char)'\x33', (char)'\x2c', (char)'\x96', (char)'\x81', (char)'\x10', 
+(char)'\xb2', (char)'\x3a', (char)'\x0b', (char)'\x33', (char)'\xc4', 
+(char)'\x95', (char)'\x24', (char)'\x64', (char)'\x42', (char)'\x3e', 
+(char)'\x92', (char)'\x38', (char)'\xde', (char)'\xe7', (char)'\x91', 
+(char)'\x2e', (char)'\x43', (char)'\x4c', (char)'\x27', (char)'\x34', 
+(char)'\x40', (char)'\x99', (char)'\xd1', (char)'\x2e', (char)'\x82', 
+(char)'\x31', (char)'\x06', (char)'\x12', (char)'\x08', (char)'\x9a', 
+(char)'\x8c', (char)'\x23', (char)'\x67', (char)'\x23', (char)'\x08', 
+(char)'\x0b', (char)'\x59', (char)'\x22', (char)'\x40', (char)'\xa1', 
+(char)'\xa3', (char)'\x20', (char)'\x80', (char)'\xb5', (char)'\x94', 
+(char)'\x0f', (char)'\x7a', (char)'\xf1', (char)'\x47', (char)'\xc5', 
+(char)'\xcf', (char)'\x24', (char)'\x67', (char)'\x8e', (char)'\xa2', 
+(char)'\x5d', (char)'\x23', (char)'\x68', (char)'\xc2', (char)'\x44', 
+(char)'\x01', (char)'\x59', (char)'\x1a', (char)'\x89', (char)'\x75', 
+(char)'\xf1', (char)'\x74', (char)'\xdd', (char)'\x3c', (char)'\x3c', 
+(char)'\x9d', (char)'\x71', (char)'\x5c', (char)'\x70', (char)'\x4b', 
+(char)'\xae', (char)'\xb3', (char)'\x7a', (char)'\xf8', (char)'\xb9', 
+(char)'\xe4', (char)'\x8c', (char)'\xf0', (char)'\x7a', (char)'\x81', 
+(char)'\x74', (char)'\x27', (char)'\x5c', (char)'\x57', (char)'\x4d', 
+(char)'\xdd', (char)'\x5b', (char)'\x84', (char)'\x05', (char)'\x93', 
+(char)'\xb2', (char)'\x9c', (char)'\x50', (char)'\xd3', (char)'\x22', 
+(char)'\x6e', (char)'\xec', (char)'\xa7', (char)'\x14', (char)'\x34', 
+(char)'\xcb', (char)'\x13', (char)'\x9b', (char)'\x29', (char)'\xc6', 
+(char)'\x82', (char)'\x9b', (char)'\xa2', (char)'\xa2', (char)'\x36', 
+(char)'\x8c', (char)'\x24', (char)'\x40', (char)'\x15', (char)'\x91', 
+(char)'\x82', (char)'\x73', (char)'\x4a', (char)'\x83', (char)'\x52', 
+(char)'\x20', (char)'\x0a', (char)'\xc8', (char)'\x8b', (char)'\x45', 
+(char)'\x13', (char)'\x00', (char)'\x56', (char)'\x42', (char)'\xd4', 
+(char)'\x0b', (char)'\xa1', (char)'\x08', (char)'\xa2', (char)'\x62', 
+(char)'\x4c', (char)'\x44', (char)'\xba', (char)'\x4b', (char)'\xcc', 
+(char)'\x8d', (char)'\x92', (char)'\x02', (char)'\xb2', (char)'\x21', 
+(char)'\x12', (char)'\xe9', (char)'\x62', (char)'\xec', (char)'\x91', 
+(char)'\xa8', (char)'\x44', (char)'\xbb', (char)'\x22', (char)'\x01', 
+(char)'\x64', (char)'\x1c', (char)'\x5f', (char)'\x12', (char)'\x54', 
+(char)'\x8d', (char)'\x9f', (char)'\x49', (char)'\x79', (char)'\x91', 
+(char)'\xb2', (char)'\x43', (char)'\x9b', (char)'\x23', (char)'\x16', 
+(char)'\x24', (char)'\x26', (char)'\x48', (char)'\x49', (char)'\x10', 
+(char)'\x0b', (char)'\x80', (char)'\xc8', (char)'\x54', (char)'\x34', 
+(char)'\x9d', (char)'\x7c', (char)'\x5c', (char)'\xf2', (char)'\x46', 
+(char)'\x68', (char)'\x24', (char)'\x9c', (char)'\x32', (char)'\x15', 
+(char)'\x0d', (char)'\x27', (char)'\x5f', (char)'\x17', (char)'\x3c', 
+(char)'\x91', (char)'\x9e', (char)'\x0c', (char)'\x28', (char)'\x90', 
+(char)'\x13', (char)'\x24', (char)'\xcc', (char)'\x49', (char)'\xf5', 
+(char)'\xd6', (char)'\x6f', (char)'\x5f', (char)'\x17', (char)'\x3c', 
+(char)'\x91', (char)'\x9e', (char)'\x3a', (char)'\xd0', (char)'\x30', 
+(char)'\x92', (char)'\xc1', (char)'\x89', (char)'\x3e', (char)'\xba', 
+(char)'\xcd', (char)'\xeb', (char)'\xe2', (char)'\xe7', (char)'\x92', 
+(char)'\x33', (char)'\xc7', (char)'\x46', (char)'\x49', (char)'\x0a', 
+(char)'\x28', (char)'\x7c', (char)'\xdd', (char)'\x17', (char)'\x18', 
+(char)'\x93', (char)'\xeb', (char)'\xe2', (char)'\xe9', (char)'\xba', 
+(char)'\x78', (char)'\x79', (char)'\x3a', (char)'\xe2', (char)'\xa5', 
+(char)'\xf1', (char)'\x74', (char)'\xdd', (char)'\x3c', (char)'\x3c', 
+(char)'\x86', (char)'\x59', (char)'\x1a', (char)'\x69', (char)'\x9c', 
+(char)'\xa0', (char)'\x59', (char)'\x23', (char)'\x32', (char)'\xbe', 
+(char)'\x28', (char)'\x6c', (char)'\xd1', (char)'\x46', (char)'\x92', 
+(char)'\x42', (char)'\x03', (char)'\xc8', (char)'\x62', (char)'\x48', 
+(char)'\x40', (char)'\x79', (char)'\x24', (char)'\x46', (char)'\x89', 
+(char)'\xc3', (char)'\x27', (char)'\xa9', (char)'\x14', (char)'\x0b', 
+(char)'\xce', (char)'\x63', (char)'\xdc', (char)'\xd2', (char)'\x36', 
+(char)'\x69', (char)'\x23', (char)'\x44', (char)'\xe1', (char)'\x93', 
+(char)'\xd4', (char)'\x8a', (char)'\x24', (char)'\x32', (char)'\x09', 
+(char)'\xc3', (char)'\x27', (char)'\xa9', (char)'\x14', (char)'\x0b', 
+(char)'\xce', (char)'\x63', (char)'\xdc', (char)'\xd2', (char)'\x36', 
+(char)'\x69', (char)'\x19', (char)'\x04', (char)'\xe1', (char)'\x93', 
+(char)'\xd4', (char)'\x8a', (char)'\x10', (char)'\x89', (char)'\x74', 
+(char)'\xa8', (char)'\x6a', (char)'\x26', (char)'\x42', (char)'\xa2', 
+(char)'\x5d', (char)'\x68', (char)'\x3a', (char)'\xd5', (char)'\x3c', 
+(char)'\x11', (char)'\x91', (char)'\x3a', (char)'\x55', (char)'\xb8', 
+(char)'\x13', (char)'\x43', (char)'\xc1', (char)'\x19', (char)'\x13', 
+(char)'\xa8', (char)'\x6c', (char)'\xc8', (char)'\x4a', (char)'\x81', 
+(char)'\x68', (char)'\xf5', (char)'\x22', (char)'\x82', (char)'\x7a', 
+(char)'\x31', (char)'\x74', (char)'\x53', (char)'\xd9', (char)'\xe1', 
+(char)'\xe4', (char)'\xe9', (char)'\x23', (char)'\x17', (char)'\x45', 
+(char)'\x7d', (char)'\x96', (char)'\x1b', (char)'\x30', (char)'\x5f', 
+(char)'\xa4', (char)'\x8c', (char)'\x5d', (char)'\x17', (char)'\x76', 
+(char)'\x24', (char)'\x29', (char)'\x22', (char)'\x46', (char)'\x88', 
+(char)'\x9d', (char)'\x24', (char)'\x62', (char)'\xe8', (char)'\xab', 
+(char)'\xb1', (char)'\x03', (char)'\x4c', (char)'\x4e', (char)'\x92', 
+(char)'\x31', (char)'\x74', (char)'\x53', (char)'\xd2', (char)'\x54', 
+(char)'\x0b', (char)'\xe9', (char)'\x23', (char)'\x17', (char)'\x44', 
+(char)'\xa1', (char)'\x89', (char)'\x00', (char)'\xa2', (char)'\x08', 
+(char)'\x12', (char)'\x21', (char)'\x44', (char)'\x09', (char)'\x88', 
+(char)'\xe8', (char)'\x13', (char)'\x9b', (char)'\x34', (char)'\x36', 
+(char)'\x84', (char)'\x40', (char)'\xc8', (char)'\x1a', (char)'\x18', 
+(char)'\xc4', (char)'\x89', (char)'\xc6', (char)'\x42', (char)'\x82', 
+(char)'\x8b', (char)'\x99', (char)'\x86', (char)'\x45', (char)'\x92', 
+(char)'\x64', (char)'\x10', (char)'\xdc', (char)'\x42', (char)'\x2e', 
+(char)'\x44', (char)'\x39', (char)'\x50', (char)'\xd0', (char)'\x2d', 
+(char)'\x78', (char)'\x19', (char)'\x5d', (char)'\x14', (char)'\x16', 
+(char)'\x8d', (char)'\x14', (char)'\xd0', (char)'\xe6', (char)'\x89', 
+(char)'\x05', (char)'\x12', (char)'\x1a', (char)'\xa4', (char)'\x36', 
+(char)'\x53', (char)'\x03', (char)'\x44', (char)'\x47', (char)'\x14', 
+(char)'\x6d', (char)'\x25', (char)'\x8d', (char)'\x12', (char)'\x4e', 
+(char)'\x91', (char)'\x69', (char)'\xa5', (char)'\x64', (char)'\x4c', 
+(char)'\x47', (char)'\x24', (char)'\xce', (char)'\x89', (char)'\x16', 
+(char)'\x67', (char)'\x8b', (char)'\xac', (char)'\x39', (char)'\xc7', 
+(char)'\x06', (char)'\x9e', (char)'\x1e', (char)'\x47', (char)'\x14', 
+(char)'\x75', (char)'\x04', (char)'\x49', (char)'\x57', (char)'\x20', 
+(char)'\x65', (char)'\xb1', (char)'\xd0', (char)'\xb2', (char)'\x12', 
+(char)'\xc8', (char)'\x99', (char)'\xca', (char)'\x25', (char)'\x82', 
+(char)'\x52', (char)'\x28', (char)'\x9c', (char)'\xd9', (char)'\x4c', 
+(char)'\x84', (char)'\x6d', (char)'\x18', (char)'\x62', (char)'\x5d', 
+(char)'\xee', (char)'\x8c', (char)'\xce', (char)'\x4b', (char)'\xcc', 
+(char)'\x8d', (char)'\x1c', (char)'\x8c', (char)'\x86', (char)'\x3d', 
+(char)'\xd1', (char)'\x99', (char)'\x65', (char)'\x47', (char)'\x92', 
+(char)'\x24', (char)'\x6d', (char)'\x16', (char)'\xb2', (char)'\x4e', 
+(char)'\x34', (char)'\x21', (char)'\x4a', (char)'\x05', (char)'\xc8', 
+(char)'\x83', (char)'\x31', (char)'\x26', (char)'\x39', (char)'\x12', 
+(char)'\x6a', (char)'\x43', (char)'\x1e', (char)'\xb2', (char)'\x30', 
+(char)'\x8d', (char)'\x9c', (char)'\x92', (char)'\x86', (char)'\xcc', 
+(char)'\x91', (char)'\x28', (char)'\x04', (char)'\x41', (char)'\xac', 
+(char)'\x93', (char)'\x3b', (char)'\xc0', (char)'\x25', (char)'\x00', 
+(char)'\xc4', (char)'\x3b', (char)'\xe2', (char)'\x8a', (char)'\x82', 
+(char)'\x64', (char)'\x4b', (char)'\xe2', (char)'\xe9', (char)'\x90', 
+(char)'\x53', (char)'\x20', (char)'\xcc', (char)'\xfa', (char)'\x05', 
+(char)'\x68', (char)'\x11', (char)'\xa5', (char)'\x30', (char)'\x4d', 
+(char)'\x02', (char)'\x2e', (char)'\x10', (char)'\x45', (char)'\x8c', 
+};
+
+/* to convert a heap stridx to a token number, subtract
+ * DUK_STRIDX_START_RESERVED and add DUK_TOK_START_RESERVED.
+ */
+
+/* native functions: 588 */
+duk_c_function duk_builtin_native_functions[] = {
+	(duk_c_function) duk_builtin_array_constructor,
+	(duk_c_function) duk_builtin_array_constructor_is_array,
+	(duk_c_function) duk_builtin_array_prototype_concat,
+	(duk_c_function) duk_builtin_array_prototype_every,
+	(duk_c_function) duk_builtin_array_prototype_filter,
+	(duk_c_function) duk_builtin_array_prototype_for_each,
+	(duk_c_function) duk_builtin_array_prototype_index_of,
+	(duk_c_function) duk_builtin_array_prototype_join,
+	(duk_c_function) duk_builtin_array_prototype_last_index_of,
+	(duk_c_function) duk_builtin_array_prototype_map,
+	(duk_c_function) duk_builtin_array_prototype_pop,
+	(duk_c_function) duk_builtin_array_prototype_push,
+	(duk_c_function) duk_builtin_array_prototype_reduce,
+	(duk_c_function) duk_builtin_array_prototype_reduce_right,
+	(duk_c_function) duk_builtin_array_prototype_reverse,
+	(duk_c_function) duk_builtin_array_prototype_shift,
+	(duk_c_function) duk_builtin_array_prototype_slice,
+	(duk_c_function) duk_builtin_array_prototype_some,
+	(duk_c_function) duk_builtin_array_prototype_sort,
+	(duk_c_function) duk_builtin_array_prototype_splice,
+	(duk_c_function) duk_builtin_array_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_array_prototype_to_string,
+	(duk_c_function) duk_builtin_array_prototype_unshift,
+	(duk_c_function) duk_builtin_boolean_constructor,
+	(duk_c_function) duk_builtin_boolean_prototype_to_string,
+	(duk_c_function) duk_builtin_boolean_prototype_value_of,
+	(duk_c_function) duk_builtin_buffer_constructor,
+	(duk_c_function) duk_builtin_buffer_prototype_to_string,
+	(duk_c_function) duk_builtin_buffer_prototype_value_of,
+	(duk_c_function) duk_builtin_date_constructor,
+	(duk_c_function) duk_builtin_date_constructor_now,
+	(duk_c_function) duk_builtin_date_constructor_parse,
+	(duk_c_function) duk_builtin_date_constructor_utc,
+	(duk_c_function) duk_builtin_date_prototype_get_date,
+	(duk_c_function) duk_builtin_date_prototype_get_day,
+	(duk_c_function) duk_builtin_date_prototype_get_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_month,
+	(duk_c_function) duk_builtin_date_prototype_get_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_timezone_offset,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_day,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_year,
+	(duk_c_function) duk_builtin_date_prototype_set_date,
+	(duk_c_function) duk_builtin_date_prototype_set_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_month,
+	(duk_c_function) duk_builtin_date_prototype_set_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_time,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_year,
+	(duk_c_function) duk_builtin_date_prototype_to_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_iso_string,
+	(duk_c_function) duk_builtin_date_prototype_to_json,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_string,
+	(duk_c_function) duk_builtin_date_prototype_to_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_utc_string,
+	(duk_c_function) duk_builtin_date_prototype_value_of,
+	(duk_c_function) duk_builtin_duk_object_addr,
+	(duk_c_function) duk_builtin_duk_object_dec,
+	(duk_c_function) duk_builtin_duk_object_enc,
+	(duk_c_function) duk_builtin_duk_object_gc,
+	(duk_c_function) duk_builtin_duk_object_get_finalizer,
+	(duk_c_function) duk_builtin_duk_object_refc,
+	(duk_c_function) duk_builtin_duk_object_set_finalizer,
+	(duk_c_function) duk_builtin_error_constructor,
+	(duk_c_function) duk_builtin_error_prototype_filename_getter,
+	(duk_c_function) duk_builtin_error_prototype_linenumber_getter,
+	(duk_c_function) duk_builtin_error_prototype_nop_setter,
+	(duk_c_function) duk_builtin_error_prototype_stack_getter,
+	(duk_c_function) duk_builtin_error_prototype_to_string,
+	(duk_c_function) duk_builtin_eval_error_constructor,
+	(duk_c_function) duk_builtin_function_constructor,
+	(duk_c_function) duk_builtin_function_prototype,
+	(duk_c_function) duk_builtin_function_prototype_apply,
+	(duk_c_function) duk_builtin_function_prototype_bind,
+	(duk_c_function) duk_builtin_function_prototype_call,
+	(duk_c_function) duk_builtin_function_prototype_to_string,
+	(duk_c_function) duk_builtin_global_object_alert,
+	(duk_c_function) duk_builtin_global_object_decode_uri,
+	(duk_c_function) duk_builtin_global_object_decode_uri_component,
+	(duk_c_function) duk_builtin_global_object_encode_uri,
+	(duk_c_function) duk_builtin_global_object_encode_uri_component,
+	(duk_c_function) duk_builtin_global_object_escape,
+	(duk_c_function) duk_builtin_global_object_eval,
+	(duk_c_function) duk_builtin_global_object_is_finite,
+	(duk_c_function) duk_builtin_global_object_is_nan,
+	(duk_c_function) duk_builtin_global_object_parse_float,
+	(duk_c_function) duk_builtin_global_object_parse_int,
+	(duk_c_function) duk_builtin_global_object_print,
+	(duk_c_function) duk_builtin_global_object_unescape,
+	(duk_c_function) duk_builtin_json_object_parse,
+	(duk_c_function) duk_builtin_json_object_stringify,
+	(duk_c_function) duk_builtin_math_object_abs,
+	(duk_c_function) duk_builtin_math_object_acos,
+	(duk_c_function) duk_builtin_math_object_asin,
+	(duk_c_function) duk_builtin_math_object_atan,
+	(duk_c_function) duk_builtin_math_object_atan2,
+	(duk_c_function) duk_builtin_math_object_ceil,
+	(duk_c_function) duk_builtin_math_object_cos,
+	(duk_c_function) duk_builtin_math_object_exp,
+	(duk_c_function) duk_builtin_math_object_floor,
+	(duk_c_function) duk_builtin_math_object_log,
+	(duk_c_function) duk_builtin_math_object_max,
+	(duk_c_function) duk_builtin_math_object_min,
+	(duk_c_function) duk_builtin_math_object_pow,
+	(duk_c_function) duk_builtin_math_object_random,
+	(duk_c_function) duk_builtin_math_object_round,
+	(duk_c_function) duk_builtin_math_object_sin,
+	(duk_c_function) duk_builtin_math_object_sqrt,
+	(duk_c_function) duk_builtin_math_object_tan,
+	(duk_c_function) duk_builtin_number_constructor,
+	(duk_c_function) duk_builtin_number_prototype_to_exponential,
+	(duk_c_function) duk_builtin_number_prototype_to_fixed,
+	(duk_c_function) duk_builtin_number_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_number_prototype_to_precision,
+	(duk_c_function) duk_builtin_number_prototype_to_string,
+	(duk_c_function) duk_builtin_number_prototype_value_of,
+	(duk_c_function) duk_builtin_object_constructor,
+	(duk_c_function) duk_builtin_object_constructor_create,
+	(duk_c_function) duk_builtin_object_constructor_define_properties,
+	(duk_c_function) duk_builtin_object_constructor_define_property,
+	(duk_c_function) duk_builtin_object_constructor_freeze,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_descriptor,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_names,
+	(duk_c_function) duk_builtin_object_constructor_get_prototype_of,
+	(duk_c_function) duk_builtin_object_constructor_is_extensible,
+	(duk_c_function) duk_builtin_object_constructor_is_frozen,
+	(duk_c_function) duk_builtin_object_constructor_is_sealed,
+	(duk_c_function) duk_builtin_object_constructor_keys,
+	(duk_c_function) duk_builtin_object_constructor_prevent_extensions,
+	(duk_c_function) duk_builtin_object_constructor_seal,
+	(duk_c_function) duk_builtin_object_prototype_has_own_property,
+	(duk_c_function) duk_builtin_object_prototype_is_prototype_of,
+	(duk_c_function) duk_builtin_object_prototype_property_is_enumerable,
+	(duk_c_function) duk_builtin_object_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_object_prototype_to_string,
+	(duk_c_function) duk_builtin_object_prototype_value_of,
+	(duk_c_function) duk_builtin_pointer_constructor,
+	(duk_c_function) duk_builtin_pointer_prototype_to_string,
+	(duk_c_function) duk_builtin_pointer_prototype_value_of,
+	(duk_c_function) duk_builtin_range_error_constructor,
+	(duk_c_function) duk_builtin_reference_error_constructor,
+	(duk_c_function) duk_builtin_regexp_constructor,
+	(duk_c_function) duk_builtin_regexp_prototype_exec,
+	(duk_c_function) duk_builtin_regexp_prototype_test,
+	(duk_c_function) duk_builtin_regexp_prototype_to_string,
+	(duk_c_function) duk_builtin_string_constructor,
+	(duk_c_function) duk_builtin_string_constructor_from_char_code,
+	(duk_c_function) duk_builtin_string_prototype_char_at,
+	(duk_c_function) duk_builtin_string_prototype_char_code_at,
+	(duk_c_function) duk_builtin_string_prototype_concat,
+	(duk_c_function) duk_builtin_string_prototype_index_of,
+	(duk_c_function) duk_builtin_string_prototype_last_index_of,
+	(duk_c_function) duk_builtin_string_prototype_locale_compare,
+	(duk_c_function) duk_builtin_string_prototype_match,
+	(duk_c_function) duk_builtin_string_prototype_replace,
+	(duk_c_function) duk_builtin_string_prototype_search,
+	(duk_c_function) duk_builtin_string_prototype_slice,
+	(duk_c_function) duk_builtin_string_prototype_split,
+	(duk_c_function) duk_builtin_string_prototype_substr,
+	(duk_c_function) duk_builtin_string_prototype_substring,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_to_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_string,
+	(duk_c_function) duk_builtin_string_prototype_to_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_trim,
+	(duk_c_function) duk_builtin_string_prototype_value_of,
+	(duk_c_function) duk_builtin_syntax_error_constructor,
+	(duk_c_function) duk_builtin_thread_constructor,
+	(duk_c_function) duk_builtin_thread_current,
+	(duk_c_function) duk_builtin_thread_resume,
+	(duk_c_function) duk_builtin_thread_yield,
+	(duk_c_function) duk_builtin_type_error_constructor,
+	(duk_c_function) duk_builtin_type_error_thrower,
+	(duk_c_function) duk_builtin_uri_error_constructor,
+	(duk_c_function) duk_builtin_array_constructor,
+	(duk_c_function) duk_builtin_array_constructor_is_array,
+	(duk_c_function) duk_builtin_array_prototype_concat,
+	(duk_c_function) duk_builtin_array_prototype_every,
+	(duk_c_function) duk_builtin_array_prototype_filter,
+	(duk_c_function) duk_builtin_array_prototype_for_each,
+	(duk_c_function) duk_builtin_array_prototype_index_of,
+	(duk_c_function) duk_builtin_array_prototype_join,
+	(duk_c_function) duk_builtin_array_prototype_last_index_of,
+	(duk_c_function) duk_builtin_array_prototype_map,
+	(duk_c_function) duk_builtin_array_prototype_pop,
+	(duk_c_function) duk_builtin_array_prototype_push,
+	(duk_c_function) duk_builtin_array_prototype_reduce,
+	(duk_c_function) duk_builtin_array_prototype_reduce_right,
+	(duk_c_function) duk_builtin_array_prototype_reverse,
+	(duk_c_function) duk_builtin_array_prototype_shift,
+	(duk_c_function) duk_builtin_array_prototype_slice,
+	(duk_c_function) duk_builtin_array_prototype_some,
+	(duk_c_function) duk_builtin_array_prototype_sort,
+	(duk_c_function) duk_builtin_array_prototype_splice,
+	(duk_c_function) duk_builtin_array_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_array_prototype_to_string,
+	(duk_c_function) duk_builtin_array_prototype_unshift,
+	(duk_c_function) duk_builtin_boolean_constructor,
+	(duk_c_function) duk_builtin_boolean_prototype_to_string,
+	(duk_c_function) duk_builtin_boolean_prototype_value_of,
+	(duk_c_function) duk_builtin_buffer_constructor,
+	(duk_c_function) duk_builtin_buffer_prototype_to_string,
+	(duk_c_function) duk_builtin_buffer_prototype_value_of,
+	(duk_c_function) duk_builtin_date_constructor,
+	(duk_c_function) duk_builtin_date_constructor_now,
+	(duk_c_function) duk_builtin_date_constructor_parse,
+	(duk_c_function) duk_builtin_date_constructor_utc,
+	(duk_c_function) duk_builtin_date_prototype_get_date,
+	(duk_c_function) duk_builtin_date_prototype_get_day,
+	(duk_c_function) duk_builtin_date_prototype_get_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_month,
+	(duk_c_function) duk_builtin_date_prototype_get_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_timezone_offset,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_day,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_year,
+	(duk_c_function) duk_builtin_date_prototype_set_date,
+	(duk_c_function) duk_builtin_date_prototype_set_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_month,
+	(duk_c_function) duk_builtin_date_prototype_set_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_time,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_year,
+	(duk_c_function) duk_builtin_date_prototype_to_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_iso_string,
+	(duk_c_function) duk_builtin_date_prototype_to_json,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_string,
+	(duk_c_function) duk_builtin_date_prototype_to_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_utc_string,
+	(duk_c_function) duk_builtin_date_prototype_value_of,
+	(duk_c_function) duk_builtin_duk_object_addr,
+	(duk_c_function) duk_builtin_duk_object_dec,
+	(duk_c_function) duk_builtin_duk_object_enc,
+	(duk_c_function) duk_builtin_duk_object_gc,
+	(duk_c_function) duk_builtin_duk_object_get_finalizer,
+	(duk_c_function) duk_builtin_duk_object_refc,
+	(duk_c_function) duk_builtin_duk_object_set_finalizer,
+	(duk_c_function) duk_builtin_error_constructor,
+	(duk_c_function) duk_builtin_error_prototype_filename_getter,
+	(duk_c_function) duk_builtin_error_prototype_linenumber_getter,
+	(duk_c_function) duk_builtin_error_prototype_nop_setter,
+	(duk_c_function) duk_builtin_error_prototype_stack_getter,
+	(duk_c_function) duk_builtin_error_prototype_to_string,
+	(duk_c_function) duk_builtin_eval_error_constructor,
+	(duk_c_function) duk_builtin_function_constructor,
+	(duk_c_function) duk_builtin_function_prototype,
+	(duk_c_function) duk_builtin_function_prototype_apply,
+	(duk_c_function) duk_builtin_function_prototype_bind,
+	(duk_c_function) duk_builtin_function_prototype_call,
+	(duk_c_function) duk_builtin_function_prototype_to_string,
+	(duk_c_function) duk_builtin_global_object_alert,
+	(duk_c_function) duk_builtin_global_object_decode_uri,
+	(duk_c_function) duk_builtin_global_object_decode_uri_component,
+	(duk_c_function) duk_builtin_global_object_encode_uri,
+	(duk_c_function) duk_builtin_global_object_encode_uri_component,
+	(duk_c_function) duk_builtin_global_object_escape,
+	(duk_c_function) duk_builtin_global_object_eval,
+	(duk_c_function) duk_builtin_global_object_is_finite,
+	(duk_c_function) duk_builtin_global_object_is_nan,
+	(duk_c_function) duk_builtin_global_object_parse_float,
+	(duk_c_function) duk_builtin_global_object_parse_int,
+	(duk_c_function) duk_builtin_global_object_print,
+	(duk_c_function) duk_builtin_global_object_unescape,
+	(duk_c_function) duk_builtin_json_object_parse,
+	(duk_c_function) duk_builtin_json_object_stringify,
+	(duk_c_function) duk_builtin_math_object_abs,
+	(duk_c_function) duk_builtin_math_object_acos,
+	(duk_c_function) duk_builtin_math_object_asin,
+	(duk_c_function) duk_builtin_math_object_atan,
+	(duk_c_function) duk_builtin_math_object_atan2,
+	(duk_c_function) duk_builtin_math_object_ceil,
+	(duk_c_function) duk_builtin_math_object_cos,
+	(duk_c_function) duk_builtin_math_object_exp,
+	(duk_c_function) duk_builtin_math_object_floor,
+	(duk_c_function) duk_builtin_math_object_log,
+	(duk_c_function) duk_builtin_math_object_max,
+	(duk_c_function) duk_builtin_math_object_min,
+	(duk_c_function) duk_builtin_math_object_pow,
+	(duk_c_function) duk_builtin_math_object_random,
+	(duk_c_function) duk_builtin_math_object_round,
+	(duk_c_function) duk_builtin_math_object_sin,
+	(duk_c_function) duk_builtin_math_object_sqrt,
+	(duk_c_function) duk_builtin_math_object_tan,
+	(duk_c_function) duk_builtin_number_constructor,
+	(duk_c_function) duk_builtin_number_prototype_to_exponential,
+	(duk_c_function) duk_builtin_number_prototype_to_fixed,
+	(duk_c_function) duk_builtin_number_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_number_prototype_to_precision,
+	(duk_c_function) duk_builtin_number_prototype_to_string,
+	(duk_c_function) duk_builtin_number_prototype_value_of,
+	(duk_c_function) duk_builtin_object_constructor,
+	(duk_c_function) duk_builtin_object_constructor_create,
+	(duk_c_function) duk_builtin_object_constructor_define_properties,
+	(duk_c_function) duk_builtin_object_constructor_define_property,
+	(duk_c_function) duk_builtin_object_constructor_freeze,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_descriptor,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_names,
+	(duk_c_function) duk_builtin_object_constructor_get_prototype_of,
+	(duk_c_function) duk_builtin_object_constructor_is_extensible,
+	(duk_c_function) duk_builtin_object_constructor_is_frozen,
+	(duk_c_function) duk_builtin_object_constructor_is_sealed,
+	(duk_c_function) duk_builtin_object_constructor_keys,
+	(duk_c_function) duk_builtin_object_constructor_prevent_extensions,
+	(duk_c_function) duk_builtin_object_constructor_seal,
+	(duk_c_function) duk_builtin_object_prototype_has_own_property,
+	(duk_c_function) duk_builtin_object_prototype_is_prototype_of,
+	(duk_c_function) duk_builtin_object_prototype_property_is_enumerable,
+	(duk_c_function) duk_builtin_object_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_object_prototype_to_string,
+	(duk_c_function) duk_builtin_object_prototype_value_of,
+	(duk_c_function) duk_builtin_pointer_constructor,
+	(duk_c_function) duk_builtin_pointer_prototype_to_string,
+	(duk_c_function) duk_builtin_pointer_prototype_value_of,
+	(duk_c_function) duk_builtin_range_error_constructor,
+	(duk_c_function) duk_builtin_reference_error_constructor,
+	(duk_c_function) duk_builtin_regexp_constructor,
+	(duk_c_function) duk_builtin_regexp_prototype_exec,
+	(duk_c_function) duk_builtin_regexp_prototype_test,
+	(duk_c_function) duk_builtin_regexp_prototype_to_string,
+	(duk_c_function) duk_builtin_string_constructor,
+	(duk_c_function) duk_builtin_string_constructor_from_char_code,
+	(duk_c_function) duk_builtin_string_prototype_char_at,
+	(duk_c_function) duk_builtin_string_prototype_char_code_at,
+	(duk_c_function) duk_builtin_string_prototype_concat,
+	(duk_c_function) duk_builtin_string_prototype_index_of,
+	(duk_c_function) duk_builtin_string_prototype_last_index_of,
+	(duk_c_function) duk_builtin_string_prototype_locale_compare,
+	(duk_c_function) duk_builtin_string_prototype_match,
+	(duk_c_function) duk_builtin_string_prototype_replace,
+	(duk_c_function) duk_builtin_string_prototype_search,
+	(duk_c_function) duk_builtin_string_prototype_slice,
+	(duk_c_function) duk_builtin_string_prototype_split,
+	(duk_c_function) duk_builtin_string_prototype_substr,
+	(duk_c_function) duk_builtin_string_prototype_substring,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_to_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_string,
+	(duk_c_function) duk_builtin_string_prototype_to_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_trim,
+	(duk_c_function) duk_builtin_string_prototype_value_of,
+	(duk_c_function) duk_builtin_syntax_error_constructor,
+	(duk_c_function) duk_builtin_thread_constructor,
+	(duk_c_function) duk_builtin_thread_current,
+	(duk_c_function) duk_builtin_thread_resume,
+	(duk_c_function) duk_builtin_thread_yield,
+	(duk_c_function) duk_builtin_type_error_constructor,
+	(duk_c_function) duk_builtin_type_error_thrower,
+	(duk_c_function) duk_builtin_uri_error_constructor,
+	(duk_c_function) duk_builtin_array_constructor,
+	(duk_c_function) duk_builtin_array_constructor_is_array,
+	(duk_c_function) duk_builtin_array_prototype_concat,
+	(duk_c_function) duk_builtin_array_prototype_every,
+	(duk_c_function) duk_builtin_array_prototype_filter,
+	(duk_c_function) duk_builtin_array_prototype_for_each,
+	(duk_c_function) duk_builtin_array_prototype_index_of,
+	(duk_c_function) duk_builtin_array_prototype_join,
+	(duk_c_function) duk_builtin_array_prototype_last_index_of,
+	(duk_c_function) duk_builtin_array_prototype_map,
+	(duk_c_function) duk_builtin_array_prototype_pop,
+	(duk_c_function) duk_builtin_array_prototype_push,
+	(duk_c_function) duk_builtin_array_prototype_reduce,
+	(duk_c_function) duk_builtin_array_prototype_reduce_right,
+	(duk_c_function) duk_builtin_array_prototype_reverse,
+	(duk_c_function) duk_builtin_array_prototype_shift,
+	(duk_c_function) duk_builtin_array_prototype_slice,
+	(duk_c_function) duk_builtin_array_prototype_some,
+	(duk_c_function) duk_builtin_array_prototype_sort,
+	(duk_c_function) duk_builtin_array_prototype_splice,
+	(duk_c_function) duk_builtin_array_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_array_prototype_to_string,
+	(duk_c_function) duk_builtin_array_prototype_unshift,
+	(duk_c_function) duk_builtin_boolean_constructor,
+	(duk_c_function) duk_builtin_boolean_prototype_to_string,
+	(duk_c_function) duk_builtin_boolean_prototype_value_of,
+	(duk_c_function) duk_builtin_buffer_constructor,
+	(duk_c_function) duk_builtin_buffer_prototype_to_string,
+	(duk_c_function) duk_builtin_buffer_prototype_value_of,
+	(duk_c_function) duk_builtin_date_constructor,
+	(duk_c_function) duk_builtin_date_constructor_now,
+	(duk_c_function) duk_builtin_date_constructor_parse,
+	(duk_c_function) duk_builtin_date_constructor_utc,
+	(duk_c_function) duk_builtin_date_prototype_get_date,
+	(duk_c_function) duk_builtin_date_prototype_get_day,
+	(duk_c_function) duk_builtin_date_prototype_get_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_month,
+	(duk_c_function) duk_builtin_date_prototype_get_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_timezone_offset,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_day,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_get_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_get_year,
+	(duk_c_function) duk_builtin_date_prototype_set_date,
+	(duk_c_function) duk_builtin_date_prototype_set_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_month,
+	(duk_c_function) duk_builtin_date_prototype_set_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_time,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_date,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_full_year,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_hours,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_milliseconds,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_minutes,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_month,
+	(duk_c_function) duk_builtin_date_prototype_set_utc_seconds,
+	(duk_c_function) duk_builtin_date_prototype_set_year,
+	(duk_c_function) duk_builtin_date_prototype_to_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_iso_string,
+	(duk_c_function) duk_builtin_date_prototype_to_json,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_date_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_date_prototype_to_locale_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_string,
+	(duk_c_function) duk_builtin_date_prototype_to_time_string,
+	(duk_c_function) duk_builtin_date_prototype_to_utc_string,
+	(duk_c_function) duk_builtin_date_prototype_value_of,
+	(duk_c_function) duk_builtin_duk_object_addr,
+	(duk_c_function) duk_builtin_duk_object_dec,
+	(duk_c_function) duk_builtin_duk_object_enc,
+	(duk_c_function) duk_builtin_duk_object_gc,
+	(duk_c_function) duk_builtin_duk_object_get_finalizer,
+	(duk_c_function) duk_builtin_duk_object_refc,
+	(duk_c_function) duk_builtin_duk_object_set_finalizer,
+	(duk_c_function) duk_builtin_error_constructor,
+	(duk_c_function) duk_builtin_error_prototype_filename_getter,
+	(duk_c_function) duk_builtin_error_prototype_linenumber_getter,
+	(duk_c_function) duk_builtin_error_prototype_nop_setter,
+	(duk_c_function) duk_builtin_error_prototype_stack_getter,
+	(duk_c_function) duk_builtin_error_prototype_to_string,
+	(duk_c_function) duk_builtin_eval_error_constructor,
+	(duk_c_function) duk_builtin_function_constructor,
+	(duk_c_function) duk_builtin_function_prototype,
+	(duk_c_function) duk_builtin_function_prototype_apply,
+	(duk_c_function) duk_builtin_function_prototype_bind,
+	(duk_c_function) duk_builtin_function_prototype_call,
+	(duk_c_function) duk_builtin_function_prototype_to_string,
+	(duk_c_function) duk_builtin_global_object_alert,
+	(duk_c_function) duk_builtin_global_object_decode_uri,
+	(duk_c_function) duk_builtin_global_object_decode_uri_component,
+	(duk_c_function) duk_builtin_global_object_encode_uri,
+	(duk_c_function) duk_builtin_global_object_encode_uri_component,
+	(duk_c_function) duk_builtin_global_object_escape,
+	(duk_c_function) duk_builtin_global_object_eval,
+	(duk_c_function) duk_builtin_global_object_is_finite,
+	(duk_c_function) duk_builtin_global_object_is_nan,
+	(duk_c_function) duk_builtin_global_object_parse_float,
+	(duk_c_function) duk_builtin_global_object_parse_int,
+	(duk_c_function) duk_builtin_global_object_print,
+	(duk_c_function) duk_builtin_global_object_unescape,
+	(duk_c_function) duk_builtin_json_object_parse,
+	(duk_c_function) duk_builtin_json_object_stringify,
+	(duk_c_function) duk_builtin_math_object_abs,
+	(duk_c_function) duk_builtin_math_object_acos,
+	(duk_c_function) duk_builtin_math_object_asin,
+	(duk_c_function) duk_builtin_math_object_atan,
+	(duk_c_function) duk_builtin_math_object_atan2,
+	(duk_c_function) duk_builtin_math_object_ceil,
+	(duk_c_function) duk_builtin_math_object_cos,
+	(duk_c_function) duk_builtin_math_object_exp,
+	(duk_c_function) duk_builtin_math_object_floor,
+	(duk_c_function) duk_builtin_math_object_log,
+	(duk_c_function) duk_builtin_math_object_max,
+	(duk_c_function) duk_builtin_math_object_min,
+	(duk_c_function) duk_builtin_math_object_pow,
+	(duk_c_function) duk_builtin_math_object_random,
+	(duk_c_function) duk_builtin_math_object_round,
+	(duk_c_function) duk_builtin_math_object_sin,
+	(duk_c_function) duk_builtin_math_object_sqrt,
+	(duk_c_function) duk_builtin_math_object_tan,
+	(duk_c_function) duk_builtin_number_constructor,
+	(duk_c_function) duk_builtin_number_prototype_to_exponential,
+	(duk_c_function) duk_builtin_number_prototype_to_fixed,
+	(duk_c_function) duk_builtin_number_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_number_prototype_to_precision,
+	(duk_c_function) duk_builtin_number_prototype_to_string,
+	(duk_c_function) duk_builtin_number_prototype_value_of,
+	(duk_c_function) duk_builtin_object_constructor,
+	(duk_c_function) duk_builtin_object_constructor_create,
+	(duk_c_function) duk_builtin_object_constructor_define_properties,
+	(duk_c_function) duk_builtin_object_constructor_define_property,
+	(duk_c_function) duk_builtin_object_constructor_freeze,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_descriptor,
+	(duk_c_function) duk_builtin_object_constructor_get_own_property_names,
+	(duk_c_function) duk_builtin_object_constructor_get_prototype_of,
+	(duk_c_function) duk_builtin_object_constructor_is_extensible,
+	(duk_c_function) duk_builtin_object_constructor_is_frozen,
+	(duk_c_function) duk_builtin_object_constructor_is_sealed,
+	(duk_c_function) duk_builtin_object_constructor_keys,
+	(duk_c_function) duk_builtin_object_constructor_prevent_extensions,
+	(duk_c_function) duk_builtin_object_constructor_seal,
+	(duk_c_function) duk_builtin_object_prototype_has_own_property,
+	(duk_c_function) duk_builtin_object_prototype_is_prototype_of,
+	(duk_c_function) duk_builtin_object_prototype_property_is_enumerable,
+	(duk_c_function) duk_builtin_object_prototype_to_locale_string,
+	(duk_c_function) duk_builtin_object_prototype_to_string,
+	(duk_c_function) duk_builtin_object_prototype_value_of,
+	(duk_c_function) duk_builtin_pointer_constructor,
+	(duk_c_function) duk_builtin_pointer_prototype_to_string,
+	(duk_c_function) duk_builtin_pointer_prototype_value_of,
+	(duk_c_function) duk_builtin_range_error_constructor,
+	(duk_c_function) duk_builtin_reference_error_constructor,
+	(duk_c_function) duk_builtin_regexp_constructor,
+	(duk_c_function) duk_builtin_regexp_prototype_exec,
+	(duk_c_function) duk_builtin_regexp_prototype_test,
+	(duk_c_function) duk_builtin_regexp_prototype_to_string,
+	(duk_c_function) duk_builtin_string_constructor,
+	(duk_c_function) duk_builtin_string_constructor_from_char_code,
+	(duk_c_function) duk_builtin_string_prototype_char_at,
+	(duk_c_function) duk_builtin_string_prototype_char_code_at,
+	(duk_c_function) duk_builtin_string_prototype_concat,
+	(duk_c_function) duk_builtin_string_prototype_index_of,
+	(duk_c_function) duk_builtin_string_prototype_last_index_of,
+	(duk_c_function) duk_builtin_string_prototype_locale_compare,
+	(duk_c_function) duk_builtin_string_prototype_match,
+	(duk_c_function) duk_builtin_string_prototype_replace,
+	(duk_c_function) duk_builtin_string_prototype_search,
+	(duk_c_function) duk_builtin_string_prototype_slice,
+	(duk_c_function) duk_builtin_string_prototype_split,
+	(duk_c_function) duk_builtin_string_prototype_substr,
+	(duk_c_function) duk_builtin_string_prototype_substring,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_locale_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_to_lower_case,
+	(duk_c_function) duk_builtin_string_prototype_to_string,
+	(duk_c_function) duk_builtin_string_prototype_to_upper_case,
+	(duk_c_function) duk_builtin_string_prototype_trim,
+	(duk_c_function) duk_builtin_string_prototype_value_of,
+	(duk_c_function) duk_builtin_syntax_error_constructor,
+	(duk_c_function) duk_builtin_thread_constructor,
+	(duk_c_function) duk_builtin_thread_current,
+	(duk_c_function) duk_builtin_thread_resume,
+	(duk_c_function) duk_builtin_thread_yield,
+	(duk_c_function) duk_builtin_type_error_constructor,
+	(duk_c_function) duk_builtin_type_error_thrower,
+	(duk_c_function) duk_builtin_uri_error_constructor,
+};
+
+char duk_builtins_data[] = {
+(char)'\x69', (char)'\xc3', (char)'\x4c', (char)'\x48', (char)'\x49', 
+(char)'\x50', (char)'\xd2', (char)'\xb6', (char)'\x11', (char)'\xf9', 
+(char)'\xa1', (char)'\x70', (char)'\x0a', (char)'\x1a', (char)'\x40', 
+(char)'\x02', (char)'\x1f', (char)'\x14', (char)'\x1a', (char)'\x69', 
+(char)'\x81', (char)'\xff', (char)'\x60', (char)'\xd2', (char)'\x2e', 
+(char)'\x0e', (char)'\x46', (char)'\x34', (char)'\xc1', (char)'\x03', 
+(char)'\x7e', (char)'\x91', (char)'\xbc', (char)'\x74', (char)'\x19', 
+(char)'\xf2', (char)'\x0d', (char)'\x54', (char)'\x40', (char)'\xb5', 
+(char)'\x63', (char)'\x4a', (char)'\xa0', (char)'\x29', (char)'\x28', 
+(char)'\xd2', (char)'\xb5', (char)'\x01', (char)'\x4a', (char)'\x34', 
+(char)'\xd0', (char)'\x40', (char)'\x12', (char)'\x8d', (char)'\x34', 
+(char)'\x2f', (char)'\xf4', (char)'\xa3', (char)'\x4d', (char)'\xe3', 
+(char)'\xf9', (char)'\x28', (char)'\xd3', (char)'\x82', (char)'\xfd', 
+(char)'\x4a', (char)'\x34', (char)'\xe1', (char)'\xbf', (char)'\x12', 
+(char)'\x90', (char)'\x38', (char)'\xd1', (char)'\x84', (char)'\x3f', 
+(char)'\x14', (char)'\x34', (char)'\xde', (char)'\x80', (char)'\x3f', 
+(char)'\x21', (char)'\xa4', (char)'\x68', (char)'\x05', (char)'\xf8', 
+(char)'\x0d', (char)'\x33', (char)'\xa0', (char)'\x1f', (char)'\xc4', 
+(char)'\x50', (char)'\x7f', (char)'\xfe', (char)'\xaa', (char)'\xaa', 
+(char)'\x00', (char)'\x00', (char)'\x07', (char)'\xc3', (char)'\xf8', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x01', (char)'\x2e', 
+(char)'\x00', (char)'\x00', (char)'\x07', (char)'\x83', (char)'\xf8', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x01', (char)'\x42', 
+(char)'\x20', (char)'\x48', (char)'\xc2', (char)'\x08', (char)'\x98', 
+(char)'\x81', (char)'\x03', (char)'\x18', (char)'\x1e', (char)'\x64', 
+(char)'\x03', (char)'\x8c', (char)'\xa0', (char)'\x69', (char)'\x98', 
+(char)'\x0c', (char)'\x33', (char)'\x81', (char)'\x66', (char)'\x80', 
+(char)'\x28', (char)'\xd2', (char)'\x80', (char)'\x9a', (char)'\x90', 
+(char)'\x03', (char)'\x59', (char)'\xfe', (char)'\x6c', (char)'\x3f', 
+(char)'\x8d', (char)'\xa7', (char)'\xe9', (char)'\xb8', (char)'\xfc', 
+(char)'\x37', (char)'\x81', (char)'\x27', (char)'\x00', (char)'\x20', 
+(char)'\xe1', (char)'\x12', (char)'\x1c', (char)'\x66', (char)'\xbe', 
+(char)'\xd9', (char)'\xc9', (char)'\xf4', (char)'\xd6', (char)'\x8f', 
+(char)'\x96', (char)'\xa2', (char)'\x7c', (char)'\x34', (char)'\x93', 
+(char)'\xdd', (char)'\xa0', (char)'\x9e', (char)'\xcc', (char)'\x44', 
+(char)'\xf5', (char)'\x63', (char)'\x27', (char)'\xa3', (char)'\x21', 
+(char)'\x3c', (char)'\xd9', (char)'\x49', (char)'\xe4', (char)'\xcc', 
+(char)'\x4f', (char)'\x16', (char)'\xd2', (char)'\x78', (char)'\x36', 
+(char)'\x0f', (char)'\x77', (char)'\xb0', (char)'\x8f', (char)'\xff', 
+(char)'\xff', (char)'\xc1', (char)'\x1b', (char)'\x43', (char)'\x00', 
+(char)'\x01', (char)'\x43', (char)'\xfc', (char)'\x03', (char)'\x5d', 
+(char)'\x92', (char)'\x04', (char)'\xeb', (char)'\x8e', (char)'\x47', 
+(char)'\x54', (char)'\x79', (char)'\x3a', (char)'\x62', (char)'\x91', 
+(char)'\xd1', (char)'\x18', (char)'\xce', (char)'\x78', (char)'\xb4', 
+(char)'\x73', (char)'\x4b', (char)'\x13', (char)'\x96', (char)'\x34', 
+(char)'\x9c', (char)'\x92', (char)'\xa4', (char)'\xe3', (char)'\x93', 
+(char)'\x27', (char)'\x14', (char)'\x91', (char)'\x38', (char)'\x64', 
+(char)'\x49', (char)'\xc1', (char)'\x28', (char)'\x5f', (char)'\xfe', 
+(char)'\x10', (char)'\x03', (char)'\x36', (char)'\xa6', (char)'\xc1', 
+(char)'\xb3', (char)'\x34', (char)'\x0d', (char)'\x89', (char)'\xc0', 
+(char)'\x6b', (char)'\xcb', (char)'\x93', (char)'\x5a', (char)'\x60', 
+(char)'\x9a', (char)'\xb3', (char)'\x24', (char)'\x28', (char)'\xbf', 
+(char)'\x80', (char)'\x00', (char)'\x7f', (char)'\x88', (char)'\x00', 
+(char)'\x8d', (char)'\xa6', (char)'\x02', (char)'\x6a', (char)'\x2e', 
+(char)'\xa3', (char)'\x4d', (char)'\x7c', (char)'\xfb', (char)'\x49', 
+(char)'\x78', (char)'\xf8', (char)'\xa3', (char)'\xfe', (char)'\x00', 
+(char)'\x2c', (char)'\xf0', (char)'\x12', (char)'\x0f', (char)'\xf1', 
+(char)'\x80', (char)'\x55', (char)'\xb4', (char)'\x2a', (char)'\x0d', 
+(char)'\x91', (char)'\x40', (char)'\x67', (char)'\x01', (char)'\x1f', 
+(char)'\x66', (char)'\x83', (char)'\x93', (char)'\x30', (char)'\x28', 
+(char)'\x19', (char)'\x61', (char)'\x67', (char)'\xd9', (char)'\x41', 
+(char)'\xc0', (char)'\xc9', (char)'\x0f', (char)'\x06', (char)'\x40', 
+(char)'\x82', (char)'\x31', (char)'\xc4', (char)'\x89', (char)'\x8c', 
+(char)'\x26', (char)'\xbd', (char)'\x8a', (char)'\x2c', (char)'\x7d', 
+(char)'\x88', (char)'\x0c', (char)'\x7d', (char)'\x86', (char)'\x10', 
+(char)'\x7d', (char)'\x84', (char)'\x06', (char)'\x69', (char)'\x82', 
+(char)'\x22', (char)'\x69', (char)'\x80', (char)'\x0a', (char)'\x69', 
+(char)'\x7e', (char)'\x12', (char)'\x69', (char)'\x7c', (char)'\x08', 
+(char)'\x69', (char)'\x7a', (char)'\x18', (char)'\x7d', (char)'\x78', 
+(char)'\x1a', (char)'\x7c', (char)'\x52', (char)'\x7f', (char)'\x00', 
+(char)'\x15', (char)'\xdd', (char)'\x39', (char)'\xf0', (char)'\xff', 
+(char)'\x20', (char)'\x11', (char)'\xbc', (char)'\x20', (char)'\x2a', 
+(char)'\x8d', (char)'\xab', (char)'\x80', (char)'\x6c', (char)'\x5d', 
+(char)'\x82', (char)'\xea', (char)'\xa0', (char)'\x97', (char)'\x35', 
+(char)'\x24', (char)'\xce', (char)'\xaa', (char)'\x3e', (char)'\xc4', 
+(char)'\xab', (char)'\x34', (char)'\xc3', (char)'\xac', (char)'\x34', 
+(char)'\xb8', (char)'\xad', (char)'\x25', (char)'\xbd', (char)'\x71', 
+(char)'\x2d', (char)'\xab', (char)'\xd1', (char)'\x6b', (char)'\x60', 
+(char)'\x4c', (char)'\x8b', (char)'\x14', (char)'\x5a', (char)'\x59', 
+(char)'\x22', (char)'\xce', (char)'\xd1', (char)'\x16', (char)'\x56', 
+(char)'\xe0', (char)'\xb1', (char)'\xb5', (char)'\x05', (char)'\x85', 
+(char)'\xc8', (char)'\x2b', (char)'\xed', (char)'\x81', (char)'\x5d', 
+(char)'\x74', (char)'\x0a', (char)'\xdb', (char)'\x34', (char)'\x14', 
+(char)'\xbf', (char)'\xc0', (char)'\x00', (char)'\x3f', (char)'\xca', 
+(char)'\x04', (char)'\x6f', (char)'\x18', (char)'\x26', (char)'\xd0', 
+(char)'\xc0', (char)'\x36', (char)'\x06', (char)'\x40', (char)'\x53', 
+(char)'\x7f', (char)'\x15', (char)'\x59', (char)'\x03', (char)'\xff', 
+(char)'\xff', (char)'\xbd', (char)'\xff', (char)'\xff', (char)'\xff', 
+(char)'\xff', (char)'\xfd', (char)'\x57', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x04', (char)'\x00', 
+(char)'\x00', (char)'\x01', (char)'\x55', (char)'\x00', (char)'\x00', 
+(char)'\x03', (char)'\xe1', (char)'\xfc', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x01', (char)'\x51', (char)'\x00', (char)'\x00', 
+(char)'\x03', (char)'\xc1', (char)'\xfc', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x01', (char)'\x53', (char)'\x00', (char)'\x00', 
+(char)'\x03', (char)'\xc3', (char)'\xfc', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\xff', (char)'\x30', 
+(char)'\x11', (char)'\xbc', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x01', (char)'\x9b', (char)'\x50', (char)'\xe4', (char)'\xd9', 
+(char)'\x85', (char)'\x26', (char)'\xc4', (char)'\x40', (char)'\x29', 
+(char)'\xe1', (char)'\x09', (char)'\x4d', (char)'\x06', (char)'\x4a', 
+(char)'\x58', (char)'\x62', (char)'\x14', (char)'\xff', (char)'\xc0', 
+(char)'\x0d', (char)'\x48', (char)'\x3e', (char)'\x4a', (char)'\x32', 
+(char)'\x0f', (char)'\xea', (char)'\x21', (char)'\xe0', (char)'\x0f', 
+(char)'\xf3', (char)'\x81', (char)'\x1b', (char)'\xc8', (char)'\x00', 
+(char)'\x00', (char)'\xf8', (char)'\x7f', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\xb5', (char)'\xb4', (char)'\x92', 
+(char)'\x0a', (char)'\x14', (char)'\x30', (char)'\x50', (char)'\x25', 
+(char)'\x03', (char)'\x65', (char)'\x1c', (char)'\x13', (char)'\xe8', 
+(char)'\xc0', (char)'\x9e', (char)'\x48', (char)'\x06', (char)'\xc2', 
+(char)'\x60', (char)'\x27', (char)'\x53', (char)'\x01', (char)'\x38', 
+(char)'\x46', (char)'\x09', (char)'\xb2', (char)'\xc0', (char)'\x4d', 
+(char)'\x13', (char)'\x82', (char)'\x64', (char)'\xc0', (char)'\x13', 
+(char)'\x04', (char)'\x20', (char)'\x97', (char)'\x2a', (char)'\x04', 
+(char)'\xb1', (char)'\x10', (char)'\x25', (char)'\x4a', (char)'\xc1', 
+(char)'\x28', (char)'\x48', (char)'\x09', (char)'\x32', (char)'\xd0', 
+(char)'\x49', (char)'\x13', (char)'\x02', (char)'\x44', (char)'\xbc', 
+(char)'\x12', (char)'\x05', (char)'\x00', (char)'\x8f', (char)'\x31', 
+(char)'\x04', (char)'\x71', (char)'\x28', (char)'\x23', (char)'\x4b', 
+(char)'\x81', (char)'\x18', (char)'\x52', (char)'\x08', (char)'\xb3', 
+(char)'\xa2', (char)'\x45', (char)'\x1b', (char)'\x12', (char)'\x24', 
+(char)'\xf8', (char)'\x91', (char)'\x07', (char)'\x2b', (char)'\xd0', 
+(char)'\xe8', (char)'\x2b', (char)'\xd0', (char)'\xc6', (char)'\xef', 
+(char)'\xd0', (char)'\xa7', (char)'\xef', (char)'\xd0', (char)'\x86', 
+(char)'\xb3', (char)'\xd0', (char)'\x67', (char)'\xb3', (char)'\xd0', 
+(char)'\x46', (char)'\x64', (char)'\x81', (char)'\x3b', (char)'\x24', 
+(char)'\x01', (char)'\xc2', (char)'\xf3', (char)'\xfa', (char)'\x02', 
+(char)'\xf3', (char)'\xf1', (char)'\xa3', (char)'\xf3', (char)'\xe9', 
+(char)'\xe3', (char)'\xf3', (char)'\xe2', (char)'\x58', (char)'\x1e', 
+(char)'\xd1', (char)'\x00', (char)'\xf4', (char)'\x8a', (char)'\x47', 
+(char)'\x93', (char)'\x20', (char)'\x3c', (char)'\x21', (char)'\x10', 
+(char)'\xa8', (char)'\xfe', (char)'\x00', (char)'\x01', (char)'\xfe', 
+(char)'\x80', (char)'\xc3', (char)'\x48', (char)'\x20', (char)'\x60', 
+(char)'\x01', (char)'\x01', (char)'\x3a', (char)'\x42', (char)'\x38', 
+(char)'\x01', (char)'\xa3', (char)'\x1c', (char)'\xe3', (char)'\x1c', 
+(char)'\xa3', (char)'\x1c', (char)'\x64', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x06', (char)'\x76', (char)'\xa3', (char)'\x23', 
+(char)'\xad', (char)'\x21', (char)'\x36', (char)'\xa9', (char)'\x40', 
+(char)'\x54', (char)'\xff', (char)'\x00', (char)'\x00', (char)'\xff', 
+(char)'\x48', (char)'\x53', (char)'\x69', (char)'\x02', (char)'\x8d', 
+(char)'\x84', (char)'\x05', (char)'\x1f', (char)'\x3a', (char)'\xc2', 
+(char)'\xb8', (char)'\xf1', (char)'\xd5', (char)'\x55', (char)'\xc7', 
+(char)'\x6e', (char)'\xac', (char)'\xae', (char)'\x0b', (char)'\x69', 
+(char)'\x64', (char)'\x05', (char)'\x57', (char)'\xf0', (char)'\x00', 
+(char)'\x4f', (char)'\xf5', (char)'\x02', (char)'\x36', (char)'\x94', 
+(char)'\x04', (char)'\xd8', (char)'\x40', (char)'\x50', (char)'\x05', 
+(char)'\x5f', (char)'\xf0', (char)'\x00', (char)'\x4f', (char)'\xf5', 
+(char)'\x82', (char)'\x36', (char)'\x94', (char)'\x00', (char)'\xd8', 
+(char)'\x40', (char)'\x50', (char)'\x05', (char)'\x67', (char)'\xf0', 
+(char)'\x00', (char)'\x4f', (char)'\xf6', (char)'\x02', (char)'\x36', 
+(char)'\x93', (char)'\xfc', (char)'\xd8', (char)'\x40', (char)'\x50', 
+(char)'\x05', (char)'\x6f', (char)'\xf0', (char)'\x00', (char)'\x4f', 
+(char)'\xf6', (char)'\x82', (char)'\x36', (char)'\x93', (char)'\xf8', 
+(char)'\xd8', (char)'\x40', (char)'\x50', (char)'\x05', (char)'\x77', 
+(char)'\xf0', (char)'\x00', (char)'\x4f', (char)'\xf7', (char)'\x02', 
+(char)'\x36', (char)'\x93', (char)'\xf4', (char)'\xd8', (char)'\x40', 
+(char)'\x50', (char)'\x05', (char)'\x7f', (char)'\xf0', (char)'\x00', 
+(char)'\x4f', (char)'\xf7', (char)'\x82', (char)'\x36', (char)'\x93', 
+(char)'\xf0', (char)'\xd8', (char)'\x40', (char)'\x50', (char)'\x03', 
+(char)'\xff', (char)'\xf2', (char)'\x0d', (char)'\x70', (char)'\x02', 
+(char)'\xaf', (char)'\xc1', (char)'\x50', (char)'\x1a', (char)'\x55', 
+(char)'\xc5', (char)'\x22', (char)'\xcd', (char)'\x50', (char)'\x2c', 
+(char)'\x5a', (char)'\xc0', (char)'\x90', (char)'\x05', (char)'\x95', 
+(char)'\x6d', (char)'\x6e', (char)'\xcd', (char)'\x30', (char)'\x10', 
+(char)'\x8b', (char)'\xb9', (char)'\x8f', (char)'\xfb', (char)'\xce', 
+(char)'\x7e', (char)'\xbf', (char)'\x8d', (char)'\x10', (char)'\x11', 
+(char)'\xc5', (char)'\x7d', (char)'\xcf', (char)'\xff', (char)'\xa0', 
+(char)'\x8a', (char)'\xd9', (char)'\x4c', (char)'\xf0', (char)'\x1e', 
+(char)'\xf2', (char)'\xf6', (char)'\xcf', (char)'\xc3', (char)'\xb9', 
+(char)'\x49', (char)'\x85', (char)'\x4c', (char)'\xd0', (char)'\x3e', 
+(char)'\xc8', (char)'\x42', (char)'\x50', (char)'\x06', (char)'\x0b', 
+(char)'\x51', (char)'\x15', (char)'\x0c', (char)'\xb0', (char)'\x27', 
+(char)'\xa8', (char)'\x39', (char)'\x8f', (char)'\xf3', (char)'\x4e', 
+(char)'\xdf', (char)'\xd9', (char)'\x8c', (char)'\x90', (char)'\x27', 
+(char)'\xa8', (char)'\x3d', (char)'\x8f', (char)'\xf3', (char)'\x4e', 
+(char)'\xdf', (char)'\xd9', (char)'\x92', (char)'\x31', (char)'\xb8', 
+(char)'\x11', (char)'\x89', (char)'\xc4', (char)'\x8c', (char)'\x2e', 
+(char)'\x44', (char)'\x60', (char)'\x73', (char)'\x22', (char)'\xfb', 
+(char)'\xa2', (char)'\x17', (char)'\x9d', (char)'\x48', (char)'\xba', 
+(char)'\xec', (char)'\x45', (char)'\xc7', (char)'\x72', (char)'\x2d', 
+(char)'\xbc', (char)'\x11', (char)'\x69', (char)'\xe4', (char)'\x8b', 
+(char)'\x2f', (char)'\x4b', (char)'\xcb', (char)'\x0f', (char)'\x6b', 
+(char)'\xca', (char)'\xef', (char)'\x88', (char)'\x56', (char)'\x7d', 
+(char)'\x02', (char)'\xab', (char)'\xf1', (char)'\x15', (char)'\x1f', 
+(char)'\xc8', (char)'\xa7', (char)'\x00', (char)'\x45', (char)'\x28', 
+(char)'\x12', (char)'\x0f', (char)'\xff', (char)'\xc0', (char)'\x09', 
+(char)'\x48', (char)'\xdc', (char)'\x85', (char)'\x16', (char)'\xf6', 
+(char)'\x17', (char)'\xff', (char)'\xc0', (char)'\x00', (char)'\x3f', 
+(char)'\xff', (char)'\x14', (char)'\x47', (char)'\x00', (char)'\x03', 
+(char)'\x82', (char)'\x15', (char)'\x00', (char)'\x00', (char)'\x00', 
+(char)'\x00', (char)'\x00', (char)'\x45', (char)'\x06', (char)'\xc9', 
+(char)'\x93', (char)'\x06', (char)'\x2c', (char)'\xd6', (char)'\xb1', 
+(char)'\x60', (char)'\xb5', (char)'\x9b', (char)'\x07', (char)'\x68', 
+(char)'\x26', (char)'\x69', (char)'\xdd', (char)'\xd7', (char)'\xc2', 
+(char)'\x0e', (char)'\x18', (char)'\x78', (char)'\x70', (char)'\xc3', 
+(char)'\xd3', (char)'\xae', (char)'\xee', (char)'\x9c', (char)'\xf0', 
+(char)'\xa0', (char)'\x66', (char)'\xb9', (char)'\xa2', (char)'\xe6', 
+(char)'\x0b', (char)'\x58', (char)'\x33', (char)'\x60', (char)'\xd1', 
+(char)'\x83', (char)'\x05', (char)'\xb9', (char)'\xf2', (char)'\xee', 
+(char)'\xcb', (char)'\xcb', (char)'\x4e', (char)'\x34', (char)'\x08', 
+(char)'\xd9', (char)'\x30', (char)'\x62', (char)'\xc9', (char)'\x83', 
+(char)'\x56', (char)'\x4c', (char)'\x58', (char)'\x35', (char)'\x64', 
+(char)'\xc5', (char)'\x05', (char)'\x39', (char)'\xb4', (char)'\x10', 
+(char)'\x4d', (char)'\xdf', (char)'\xb9', (char)'\x04', (char)'\xdc', 
+(char)'\x3e', (char)'\x50', (char)'\x32', (char)'\x62', (char)'\x81', 
+(char)'\x83', (char)'\x97', (char)'\x4c', (char)'\x99', (char)'\x3a', 
+(char)'\x60', (char)'\xc9', (char)'\x05', (char)'\x5a', (char)'\x90', 
+(char)'\xd0', (char)'\x32', (char)'\x60', (char)'\xc5', (char)'\x92', 
+(char)'\x0f', (char)'\x0e', (char)'\x1b', (char)'\x5f', (char)'\x6c', 
+(char)'\xd1', (char)'\x07', (char)'\x87', (char)'\x0d', (char)'\xaf', 
+(char)'\xb6', (char)'\x68', (char)'\x83', (char)'\xc3', (char)'\x86', 
+(char)'\xd7', (char)'\xdb', (char)'\x34', (char)'\x41', (char)'\x1e', 
+(char)'\x75', (char)'\x55', (char)'\xf3', (char)'\x34', (char)'\xee', 
+(char)'\xeb', (char)'\xe1', (char)'\xda', (char)'\x06', (char)'\x6c', 
+(char)'\xb2', (char)'\x61', (char)'\x6a', (char)'\xdb', (char)'\x2e', 
+(char)'\x46', (char)'\xf8', (char)'\xda', (char)'\x36', (char)'\x63', 
+(char)'\x87', (char)'\x0e', (char)'\x46', (char)'\x4e', (char)'\x19', 
+(char)'\xb9', (char)'\x6e', (char)'\xe5', (char)'\x8e', (char)'\x66', 
+(char)'\xec', (char)'\x19', (char)'\x61', (char)'\xcb', (char)'\x99', 
+(char)'\xc3', (char)'\x86', (char)'\x6c', (char)'\x5b', (char)'\x62', 
+(char)'\x6f', (char)'\x8f', (char)'\x0e', (char)'\x67', (char)'\x68', 
+(char)'\x36', (char)'\xe9', (char)'\xc9', (char)'\x93', (char)'\x66', 
+(char)'\x50', (char)'\x11', (char)'\xcc', (char)'\x01', (char)'\x3a', 
+(char)'\x00', (char)'\x07', (char)'\x20', (char)'\xe2', (char)'\x14', 
+(char)'\xd2', (char)'\x10', (char)'\x29', (char)'\x10', (char)'\x7d', 
+(char)'\x40', (char)'\x83', (char)'\xaa', (char)'\x24', (char)'\x1e', 
+(char)'\x53', (char)'\x40', (char)'\xe2', (char)'\x7a', (char)'\x06', 
+(char)'\xd3', (char)'\x90', (char)'\x59', (char)'\x7f', (char)'\x00', 
+(char)'\x39', (char)'\x86', (char)'\x02', (char)'\x06', (char)'\x2f', 
+(char)'\xd8', (char)'\x2f', (char)'\x7c', (char)'\x01', (char)'\xff', 
+(char)'\x20', (char)'\x00', (char)'\x0b', (char)'\x3f', (char)'\xe0', 
+(char)'\x00', (char)'\x1f', (char)'\xf3', (char)'\x00', (char)'\x13', 
+(char)'\x68', (char)'\x6c', (char)'\x1b', (char)'\x03', (char)'\x80', 
+(char)'\x2d', (char)'\x3f', (char)'\x80', (char)'\x00', (char)'\x7f', 
+(char)'\xd0', (char)'\x00', (char)'\x4d', (char)'\xa9', (char)'\xe0', 
+(char)'\x6c', (char)'\x4f', (char)'\x82', (char)'\x7f', (char)'\xfe', 
+(char)'\x11', (char)'\xb6', (char)'\x08', (char)'\x5c', (char)'\x4d', 
+(char)'\xfd', (char)'\x71', (char)'\x6c', (char)'\xcb', (char)'\x17', 
+(char)'\x97', (char)'\x2d', (char)'\xfc', (char)'\x8d', (char)'\x90', 
+(char)'\x45', (char)'\xf2', (char)'\xf2', (char)'\xe5', (char)'\xbf', 
+(char)'\x92', (char)'\x0d', (char)'\x3b', (char)'\x90', (char)'\x65', 
+(char)'\xe5', (char)'\xcb', (char)'\x7f', (char)'\x24', (char)'\x1a', 
+(char)'\x30', (char)'\xee', (char)'\xc9', (char)'\xb3', (char)'\x4e', 
+(char)'\xec', (char)'\xe0', (char)'\x00', 
+};
+#else
+#error invalid endianness defines
+#endif
 #line 1 "duk_debug_fixedbuffer.c"
 /*
  *  Fixed buffer helper useful for debugging, requires no allocation
@@ -20107,11 +25958,11 @@ void duk_fb_put_bytes(duk_fixedbuffer *fb, duk_u8 *buffer, duk_u32 length) {
 
 	avail = (fb->offset >= fb->length ? (duk_u32) 0 : (duk_u32) (fb->length - fb->offset));
 	if (length > avail) {
-		memcpy(fb->buffer + fb->offset, buffer, avail);
+		DUK_MEMCPY(fb->buffer + fb->offset, buffer, avail);
 		fb->offset += avail;
 		fb->truncated = 1;
 	} else {
-		memcpy(fb->buffer + fb->offset, buffer, length);
+		DUK_MEMCPY(fb->buffer + fb->offset, buffer, length);
 		fb->offset += length;
 	}
 }
@@ -20120,7 +25971,7 @@ void duk_fb_put_byte(duk_fixedbuffer *fb, duk_u8 x) {
 	duk_fb_put_bytes(fb, &x, 1);
 }
 
-void duk_fb_put_cstring(duk_fixedbuffer *fb, char *x) {
+void duk_fb_put_cstring(duk_fixedbuffer *fb, const char *x) {
 	duk_fb_put_bytes(fb, (duk_u8 *) x, (duk_u32) strlen(x));
 }
 
@@ -20131,7 +25982,7 @@ void duk_fb_sprintf(duk_fixedbuffer *fb, const char *fmt, ...) {
 	va_start(ap, fmt);
 	avail = (fb->offset >= fb->length ? (duk_u32) 0 : (duk_u32) (fb->length - fb->offset));
 	if (avail > 0) {
-		int res = vsnprintf((char *) (fb->buffer + fb->offset), avail, fmt, ap);
+		int res = DUK_VSNPRINTF((char *) (fb->buffer + fb->offset), avail, fmt, ap);
 		if (res < 0) {
 			/* error */
 		} else if (res >= avail) {
@@ -20170,7 +26021,7 @@ static void sanitize_snippet(char *buf, int buf_size, duk_hstring *str) {
 	int maxchars;
 	duk_u8 *data;
 
-	memset(buf, 0, buf_size);
+	DUK_MEMSET(buf, 0, buf_size);
 
 	maxchars = buf_size - 1;
 	data = DUK_HSTRING_GET_DATA(str);
@@ -20189,14 +26040,14 @@ static void format_func_ptr(char *buf, int buf_size, unsigned char *fptr, int fp
 	char *p = buf;
 	char *p_end = buf + buf_size - 1;
 
-	memset(buf, 0, buf_size);
+	DUK_MEMSET(buf, 0, buf_size);
 
 	for (i = 0; i < fptr_size; i++) {
 		int left = p_end - p;
 		if (left <= 0) {
 			break;
 		}
-		p += snprintf(p, left, "%02x", (int) fptr[i]);
+		p += DUK_SNPRINTF(p, left, "%02x", (int) fptr[i]);
 	}	
 }
 
@@ -20404,7 +26255,7 @@ void duk_debug_dump_heap(duk_heap *heap) {
 #ifdef DUK_USE_DEBUG
 
 /* must match duk_hobject.h */
-static const char *class_names[16] = {
+static const char *class_names[32] = {
 	"unused",
 	"Arguments",
 	"Array",
@@ -20419,8 +26270,24 @@ static const char *class_names[16] = {
 	"RegExp",
 	"String",
 	"global",
-	"objenv",
-	"decenv",
+	"ObjEnv",
+	"DecEnv",
+	"Buffer",
+	"Pointer",
+	"unused",
+	"unused",
+	"unused",
+	"unused",
+	"unused",
+	"unused",
+	"unused",
+	"unused",
+	"unused",
+	"unused",
+	"unused",
+	"unused",
+	"unused",
+	"unused",
 };
 
 /* for thread dumping */
@@ -20931,7 +26798,7 @@ void duk_debug_log(int level, const char *file, int line, const char *func, char
 
 	va_start(ap, fmt);
 
-	memset((void *) buf, 0, (size_t) DUK_DEBUG_BUFSIZE);
+	DUK_MEMSET((void *) buf, 0, (size_t) DUK_DEBUG_BUFSIZE);
 	duk_debug_vsnprintf(buf, DUK_DEBUG_BUFSIZE - 1, fmt, ap);
 
 #ifdef DUK_USE_DPRINT_RDTSC
@@ -20970,10 +26837,11 @@ int duk_debug_level_stash;
 
 void duk_debug_log(char *fmt, ...) {
 	va_list ap;
+	int level = duk_debug_level_stash;
 
 	va_start(ap, fmt);
 
-	memset((void *) buf, 0, (size_t) DUK_DEBUG_BUFSIZE);
+	DUK_MEMSET((void *) buf, 0, (size_t) DUK_DEBUG_BUFSIZE);
 	duk_debug_vsnprintf(buf, DUK_DEBUG_BUFSIZE - 1, fmt, ap);
 
 #ifdef DUK_USE_DPRINT_RDTSC
@@ -21101,9 +26969,9 @@ static char *bc_optab[] = {
 };
 
 static char *bc_extraoptab[] = {
-	"NOP", "LDTHIS", "LDUNDEF", "LDNULL", "LDBOOL", "NEWOBJ", "NEWARR", "SETALEN", "TYPEOF", "TYPEOFID",
-	"TONUM", "INITENUM", "NEXTENUM", "INITSET", "INITGET", "ENDTRY", "ENDCATCH", "ENDFIN", "THROW", "INVLHS",
-	"XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX",
+	"NOP", "LDTHIS", "LDUNDEF", "LDNULL", "LDTRUE", "LDFALSE", "NEWOBJ", "NEWARR", "SETALEN", "TYPEOF",
+	"TYPEOFID", "TONUM", "INITENUM", "NEXTENUM", "INITSET", "INITGET", "ENDTRY", "ENDCATCH", "ENDFIN", "THROW",
+	"INVLHS", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX",
 	"XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX",
 	"XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX", "XXX",
 
@@ -21627,7 +27495,7 @@ static void print_hbuffer(duk_dprint_state *st, duk_hbuffer *h) {
 	if (st->hexdump) {
 		duk_fb_sprintf(fb, "=[");
 		n = DUK_HBUFFER_GET_SIZE(h);
-		p = DUK_HBUFFER_GET_DATA_PTR(h);
+		p = (duk_u8 *) DUK_HBUFFER_GET_DATA_PTR(h);
 		for (i = 0; i < n; i++) {
 			duk_fb_sprintf(fb, "%02x", (int) p[i]);
 		}
@@ -21783,7 +27651,7 @@ int duk_debug_vsnprintf(char *str, size_t size, const char *format, va_list ap) 
 	const char *p_end = p + strlen(format);
 	int retval;
 	
-	memset(&fb, 0, sizeof(fb));
+	DUK_MEMSET(&fb, 0, sizeof(fb));
 	fb.buffer = (duk_u8 *) str;
 	fb.length = size;
 	fb.offset = 0;
@@ -21807,7 +27675,7 @@ int duk_debug_vsnprintf(char *str, size_t size, const char *format, va_list ap) 
 		 *  understand.  See man 3 printf.
 		 */
 
-		memset(&st, 0, sizeof(st));
+		DUK_MEMSET(&st, 0, sizeof(st));
 		st.fb = &fb;
 		st.depth = 0;
 		st.depth_limit = 1;
@@ -21871,8 +27739,8 @@ int duk_debug_vsnprintf(char *str, size_t size, const char *format, va_list ap) 
 					/* format is too large, abort */
 					goto error;
 				}
-				memset(fmtbuf, 0, sizeof(fmtbuf));
-				memcpy(fmtbuf, p_begfmt, fmtlen);
+				DUK_MEMSET(fmtbuf, 0, sizeof(fmtbuf));
+				DUK_MEMCPY(fmtbuf, p_begfmt, fmtlen);
 
 				/* assume exactly 1 arg, which is why '*' is forbidden; arg size still
 				 * depends on type though.
@@ -21931,7 +27799,8 @@ int duk_debug_snprintf(char *str, size_t size, const char *format, ...) {
  *
  *  Ecmascript allows throwing any values, so all values cannot be
  *  augmented.  Currently, we only augment error values which are Error
- *  instances and are also extensible.
+ *  instances (= have the built-in Error.prototype in their prototype
+ *  chain) and are also extensible.
  */
 
 /* include removed: duk_internal.h */
@@ -21939,7 +27808,7 @@ int duk_debug_snprintf(char *str, size_t size, const char *format, ...) {
 #ifdef DUK_USE_AUGMENT_ERRORS
 
 #ifdef DUK_USE_TRACEBACKS
-static void add_traceback(duk_hthread *thr, duk_hthread *thr_callstack, duk_hobject *obj, int err_index) {
+static void add_traceback(duk_hthread *thr, duk_hthread *thr_callstack, duk_hobject *obj, int err_index, const char *filename, int line) {
 	duk_context *ctx = (duk_context *) thr;
 	int depth;
 	int i, i_min;
@@ -21954,7 +27823,7 @@ static void add_traceback(duk_hthread *thr, duk_hthread *thr_callstack, duk_hobj
 	/*
 	 *  The traceback format is pretty arcane in an attempt to keep it compact
 	 *  and cheap to create.  It may change arbitrarily from version to version.
-	 *  It should be decoded/accessed through version specific accessors.
+	 *  It should be decoded/accessed through version specific accessors only.
 	 *
 	 *  See doc/error-objects.txt.
 	 */
@@ -21962,20 +27831,37 @@ static void add_traceback(duk_hthread *thr, duk_hthread *thr_callstack, duk_hobj
 	DUK_DDDPRINT("adding traceback to object: %!O", (duk_heaphdr *) obj);
 
 	duk_push_array(ctx);  /* XXX: specify array size, as we know it */
+	arr_idx = 0;
 
+	/* filename/line from C macros (__FILE__, __LINE__) are added as an
+	 * entry with a special format: (string, number)
+	 */
+	if (filename) {
+		duk_push_string(ctx, filename);
+		duk_put_prop_index(ctx, -2, arr_idx);
+		arr_idx++;
+		duk_push_int(ctx, line);
+		duk_put_prop_index(ctx, -2, arr_idx);
+		arr_idx++;
+	}
+
+	/* traceback depth doesn't take into account the filename/line
+	 * special handling above (intentional)
+	 */
 	depth = DUK_OPT_TRACEBACK_DEPTH;
 	i_min = (thr_callstack->callstack_top > depth ? thr_callstack->callstack_top - depth : 0);
 	DUK_ASSERT(i_min >= 0);
-	arr_idx = 0;
 
 	for (i = thr_callstack->callstack_top - 1; i >= i_min; i--) {
 		double d;
+		int pc;
 
 		/*
 		 *  Note: each API operation potentially resizes the callstack,
 		 *  so be careful to re-lookup after every operation.  Currently
 		 *  these is no issue because we don't store a temporary 'act'
-		 *  pointer at all.
+		 *  pointer at all.  (This would be a non-issue if we operated
+		 *  directly on the array part.)
 		 */
 
 		/* [... arr] */
@@ -21989,30 +27875,33 @@ static void add_traceback(duk_hthread *thr, duk_hthread *thr_callstack, duk_hobj
 		arr_idx++;
 
 		/* add a number containing: pc, activation flags */
-		d = ((double) thr_callstack->callstack[i].flags) * DUK_DOUBLE_2TO32 +  /* assume PC is at most 32 bits and non-negative */
-		    (double) thr_callstack->callstack[i].pc;
+		pc = thr_callstack->callstack[i].pc;
+#if 0
+		/* FIXME: this is not the case always now */
+		pc--;  /* PC points to next instruction, find offending PC; note that
+		        * PC == 0 should never be possible for an error.
+		        */
+#endif
+		DUK_ASSERT(pc >= 0 && (double) pc < DUK_DOUBLE_2TO32);  /* assume PC is at most 32 bits and non-negative */
+		d = ((double) thr_callstack->callstack[i].flags) * DUK_DOUBLE_2TO32 + (double) pc;
 		duk_push_number(ctx, d);  /* -> [... arr num] */
 		duk_put_prop_index(ctx, -2, arr_idx);
 		arr_idx++;
-
-		/* FIXME: some more features to record (somehow):
-		 *   - current this binding?
-		 */
-
-		/* FIXME: efficient array pushing, e.g. preallocate array, write DIRECTLY to array entries, etc. */
 	}
 
 	/* [... arr] */
-	duk_put_prop_stridx(ctx, err_index, DUK_STRIDX_TRACEBACK);  /* -> [...] */
+	duk_put_prop_stridx(ctx, err_index, DUK_STRIDX_TRACEDATA);  /* -> [...] */
 }
 #endif  /* DUK_USE_TRACEBACKS */
 
 /*
+ *  Augment an error with tracedata, fileName, lineNumber, etc.
+ *
  *  thr: thread containing the error value
  *  thr_callstack: thread which should be used for generating callstack etc.
  */
 
-void duk_err_augment_error(duk_hthread *thr, duk_hthread *thr_callstack, int err_index) {
+void duk_err_augment_error(duk_hthread *thr, duk_hthread *thr_callstack, int err_index, const char *filename, int line) {
 	duk_context *ctx = (duk_context *) thr;
 	duk_hobject *obj;
 
@@ -22047,66 +27936,86 @@ void duk_err_augment_error(duk_hthread *thr, duk_hthread *thr_callstack, int err
 
 	/* Yes, augment error. */
 
-	/* FIXME: here we'd like to have a variant of "duk_def_prop_stridx" which
-	 * would refuse to add a property if it already exists to avoid any issues
-	 * with protected properties.
+#ifdef DUK_USE_TRACEBACKS
+	/*
+	 *  If tracebacks are enabled, the 'tracedata' property is the only
+	 *  thing we need: 'fileName' and 'lineNumber' are virtual properties
+	 *  which use 'tracedata'.
 	 */
 
-#ifdef DUK_USE_TRACEBACKS
-	if (duk_hobject_hasprop_raw(thr, obj, DUK_HTHREAD_STRING_TRACEBACK(thr))) {
+	if (duk_hobject_hasprop_raw(thr, obj, DUK_HTHREAD_STRING_TRACEDATA(thr))) {
 		DUK_DDDPRINT("error value already has a 'traceback' property, not modifying it");
 	} else {
-		add_traceback(thr, thr_callstack, obj, err_index);
+		add_traceback(thr, thr_callstack, obj, err_index, filename, line);
 	}
-#endif  /* DUK_USE_TRACEBACKS */
+#else
+	/*
+	 *  If tracebacks are disabled, 'fileName' and 'lineNumber' are added
+	 *  as plain own properties.  Since Error.prototype has accessors of
+	 *  the same name, we need to define own properties directly (cannot
+	 *  just use e.g. duk_put_prop_stridx).  Existing properties are not
+	 *  overwritten in case they already exist.
+	 */
 
-	if (thr_callstack->callstack_top > 0) {
+	if (filename) {
+		/* XXX: __FILE__/__LINE__ may not always be the most relevant,
+		 * see comments in traceback formatting.  Further these are
+		 * not currently set in minimal builds anyway, so disable?
+		 */
+		duk_push_string(ctx, filename);
+		duk_def_prop_stridx(ctx, err_index, DUK_STRIDX_FILE_NAME, DUK_PROPDESC_FLAGS_WC | DUK_PROPDESC_FLAG_NO_OVERWRITE);
+		duk_push_int(ctx, line);
+		duk_def_prop_stridx(ctx, err_index, DUK_STRIDX_LINE_NUMBER, DUK_PROPDESC_FLAGS_WC | DUK_PROPDESC_FLAG_NO_OVERWRITE);
+	} else if (thr_callstack->callstack_top > 0) {
 		duk_activation *act;
 		duk_hobject *func;
 		duk_hbuffer *pc2line;
 
 		act = thr_callstack->callstack + thr_callstack->callstack_top - 1;
+		DUK_ASSERT(act >= thr_callstack->callstack && act < thr_callstack->callstack + thr_callstack->callstack_size);
 		func = act->func;
 		if (func) {
-			int pc = act->pc;
+			int pc;
 			duk_u32 line;
-			act = NULL;  /* invalidated by pushes */
 
-			pc--;  /* PC points to next instruction, find offending PC */
+			pc = act->pc;
+#if 0
+			/* FIXME: this is not the case always now */
+			pc--;  /* PC points to next instruction, find offending PC; note that
+			        * PC == 0 should never be possible for an error.
+			        */
+#endif
+			DUK_ASSERT(pc >= 0 && (double) pc < DUK_DOUBLE_2TO32);  /* assume PC is at most 32 bits and non-negative */
+			act = NULL;  /* invalidated by pushes, so get out of the way */
 
 			duk_push_hobject(ctx, func);
 
-			/* FIXME: now set function name as filename; record function and file name
-			 * separately?  Function object is already in traceback though.
-			 */
-			duk_get_prop_stridx(ctx, -1, DUK_STRIDX_NAME);
-			duk_put_prop_stridx(ctx, err_index, DUK_STRIDX_FILE_NAME);
-
+			duk_get_prop_stridx(ctx, -1, DUK_STRIDX_FILE_NAME);
+			duk_def_prop_stridx(ctx, err_index, DUK_STRIDX_FILE_NAME, DUK_PROPDESC_FLAGS_WC | DUK_PROPDESC_FLAG_NO_OVERWRITE);
 			if (DUK_HOBJECT_IS_COMPILEDFUNCTION(func)) {
-				duk_push_false(ctx);
-				duk_put_prop_stridx(ctx, err_index, DUK_STRIDX_IS_NATIVE);
-
-				/* FIXME: add PC only if pc2line fails? */
+#if 0
 				duk_push_number(ctx, pc);
-				duk_put_prop_stridx(ctx, err_index, DUK_STRIDX_PC);
+				duk_def_prop_stridx(ctx, err_index, DUK_STRIDX_PC, DUK_PROPDESC_FLAGS_WC | DUK_PROPDESC_FLAGS_NO_OVERWRITE);
+#endif
 
 				duk_get_prop_stridx(ctx, -1, DUK_STRIDX_INT_PC2LINE);
 				if (duk_is_buffer(ctx, -1)) {
 					pc2line = duk_get_hbuffer(ctx, -1);
+					DUK_ASSERT(pc2line != NULL);
 					DUK_ASSERT(!DUK_HBUFFER_HAS_DYNAMIC(pc2line));
 					line = duk_hobject_pc2line_query((duk_hbuffer_fixed *) pc2line, pc);
 					duk_push_number(ctx, (double) line);  /* FIXME: u32 */
-					duk_put_prop_stridx(ctx, err_index, DUK_STRIDX_LINE_NUMBER);
+					duk_def_prop_stridx(ctx, err_index, DUK_STRIDX_LINE_NUMBER, DUK_PROPDESC_FLAGS_WC | DUK_PROPDESC_FLAG_NO_OVERWRITE);
 				}
 				duk_pop(ctx);
 			} else {
-				duk_push_true(ctx);
-				duk_put_prop_stridx(ctx, err_index, DUK_STRIDX_IS_NATIVE);
+				/* Native function, no relevant lineNumber. */
 			}
 
 			duk_pop(ctx);
 		}
 	}
+#endif  /* DUK_USE_TRACEBACKS */
 }
 
 #endif  /* DUK_USE_AUGMENT_ERRORS */
@@ -22156,7 +28065,6 @@ void duk_err_longjmp(duk_hthread *thr) {
  *  Error macro wrapper implementations.
  */
 
-#include <stdarg.h>
 /* include removed: duk_internal.h */
 
 #ifdef DUK_USE_VERBOSE_ERRORS
@@ -22167,9 +28075,9 @@ void duk_err_longjmp(duk_hthread *thr) {
 void duk_err_handle_error(const char *filename, int line, duk_hthread *thr, int code, const char *fmt, ...) {
 	va_list ap;
 	char msg[BUFSIZE];
-	memset(msg, 0, sizeof(msg));
+	DUK_MEMSET(msg, 0, sizeof(msg));
 	va_start(ap, fmt);
-	(void) vsnprintf(msg, sizeof(msg) - 1, fmt, ap);
+	(void) DUK_VSNPRINTF(msg, sizeof(msg) - 1, fmt, ap);
 	duk_err_create_and_throw(thr, code, msg, filename, line);
 	va_end(ap);  /* dead code, but ensures portability (see Linux man page notes) */
 }
@@ -22178,32 +28086,32 @@ void duk_err_handle_panic(const char *filename, int line, int code, const char *
 	va_list ap;
 	char msg1[BUFSIZE];
 	char msg2[BUFSIZE];
-	memset(msg1, 0, sizeof(msg1));
-	memset(msg2, 0, sizeof(msg2));
+	DUK_MEMSET(msg1, 0, sizeof(msg1));
+	DUK_MEMSET(msg2, 0, sizeof(msg2));
 	va_start(ap, fmt);
-	(void) vsnprintf(msg1, sizeof(msg1) - 1, fmt, ap);
-	(void) snprintf(msg2, sizeof(msg2) - 1, "(%s:%d): %s", filename ? filename : "null", line, msg1);
+	(void) DUK_VSNPRINTF(msg1, sizeof(msg1) - 1, fmt, ap);
+	(void) DUK_SNPRINTF(msg2, sizeof(msg2) - 1, "(%s:%d): %s", filename ? filename : "null", line, msg1);
 	DUK_PANIC_HANDLER(code, msg2);
 	va_end(ap);  /* dead code */
 }
 #else  /* DUK_USE_VARIADIC_MACROS */
 const char *duk_err_file_stash = NULL;
-int duk_err_line_stash = -1;
+int duk_err_line_stash = 0;
 
 static void _handle_error(const char *filename, int line, duk_hthread *thr, int code, const char *fmt, va_list ap) {
 	char msg[BUFSIZE];
-	memset(msg, 0, sizeof(msg));
-	(void) vsnprintf(msg, sizeof(msg) - 1, fmt, ap);
+	DUK_MEMSET(msg, 0, sizeof(msg));
+	(void) DUK_VSNPRINTF(msg, sizeof(msg) - 1, fmt, ap);
 	duk_err_create_and_throw(thr, code, msg, filename, line);
 }
 
 static void _handle_panic(const char *filename, int line, int code, const char *fmt, va_list ap) {
 	char msg1[BUFSIZE];
 	char msg2[BUFSIZE];
-	memset(msg1, 0, sizeof(msg1));
-	memset(msg2, 0, sizeof(msg2));
-	(void) vsnprintf(msg1, sizeof(msg1) - 1, fmt, ap);
-	(void) snprintf(msg2, sizeof(msg2) - 1, "(%s:%d): %s", filename ? filename : "null", line, msg1);
+	DUK_MEMSET(msg1, 0, sizeof(msg1));
+	DUK_MEMSET(msg2, 0, sizeof(msg2));
+	(void) DUK_VSNPRINTF(msg1, sizeof(msg1) - 1, fmt, ap);
+	(void) DUK_SNPRINTF(msg2, sizeof(msg2) - 1, "(%s:%d): %s", filename ? filename : "null", line, msg1);
 	DUK_PANIC_HANDLER(code, msg2);
 }
 
@@ -22464,10 +28372,11 @@ void duk_err_create_and_throw(duk_hthread *thr, duk_u32 code) {
 	} else {
 		/* Error object is augmented at its creation here. */
 		duk_require_stack(ctx, 1);
+		/* FIXME: unnecessary '%s' formatting here */
 #ifdef DUK_USE_VERBOSE_ERRORS
-		duk_push_error_object(ctx, code, msg);
+		duk_push_error_object_raw(ctx, code, filename, line, "%s", msg);
 #else
-		duk_push_error_object(ctx, code, NULL);
+		duk_push_error_object_raw(ctx, code, NULL, 0, NULL);
 #endif
 	}
 
@@ -22504,6 +28413,7 @@ void duk_err_create_and_throw(duk_hthread *thr, duk_u32 code) {
  */
 
 void duk_error_throw_from_negative_rc(duk_hthread *thr, int rc) {
+	duk_context *ctx = (duk_context *) thr;
 	const char *msg;
 	int code;
 
@@ -22536,11 +28446,16 @@ void duk_error_throw_from_negative_rc(duk_hthread *thr, int rc) {
 
 	DUK_UNREF(msg);
 
-	DUK_ERROR(thr, code, "%s (rc %d)", msg, rc);
+	/*
+	 *  The __FILE__ and __LINE__ information is intentionally not used in the
+	 *  creation of the error object, as it isn't useful in the tracedata.  The
+	 *  tracedata still contains the function which returned the negative return
+	 *  code, and having the file/line of this function isn't very useful.
+	 */
+
+	duk_error_raw(ctx, code, NULL, 0, "%s (rc %d)", msg, rc);
 	DUK_NEVER_HERE();
 }
-
-
 #line 1 "duk_hbuffer_alloc.c"
 /*
  *  duk_hbuffer allocation and freeing.
@@ -22561,13 +28476,13 @@ duk_hbuffer *duk_hbuffer_alloc(duk_heap *heap, size_t size, int dynamic) {
 		alloc_size = sizeof(duk_hbuffer_fixed) + size + 1;  /* +1 for a safety nul term */
 	}
 
-	res = DUK_ALLOC(heap, alloc_size);
+	res = (duk_hbuffer *) DUK_ALLOC(heap, alloc_size);
 	if (!res) {
 		goto error;
 	}
 
 	/* zero everything */
-	memset(res, 0, alloc_size);
+	DUK_MEMSET(res, 0, alloc_size);
 
 	if (dynamic) {
 		duk_hbuffer_dynamic *h = (duk_hbuffer_dynamic *) res;
@@ -22579,7 +28494,7 @@ duk_hbuffer *duk_hbuffer_alloc(duk_heap *heap, size_t size, int dynamic) {
 			if (!ptr) {
 				goto error;
 			}
-			memset(ptr, 0, size + 1);
+			DUK_MEMSET(ptr, 0, size + 1);
 
 			h->curr_alloc = ptr;
 			h->usable_size = size;  /* snug */
@@ -22675,9 +28590,9 @@ void duk_hbuffer_resize(duk_hthread *thr, duk_hbuffer_dynamic *buf, size_t new_s
 		 */
 
 		DUK_ASSERT(new_usable_size + 1 > new_size);
-		memset((void *) ((char *) res + new_size),
-		       0,
-		       new_usable_size + 1 - new_size);
+		DUK_MEMSET((void *) ((char *) res + new_size),
+		           0,
+		           new_usable_size + 1 - new_size);
 
 		buf->size = new_size;
 		buf->usable_size = new_usable_size;
@@ -22743,14 +28658,14 @@ void duk_hbuffer_insert_bytes(duk_hthread *thr, duk_hbuffer_dynamic *buf, size_t
 		/* not an append */
 
 		DUK_ASSERT(DUK_HBUFFER_GET_SIZE(buf) - offset > 0);  /* not a zero byte memmove */
-		memmove((void *) (p + offset + length),
-		        (void *) (p + offset),
-		        DUK_HBUFFER_GET_SIZE(buf) - offset);
+		DUK_MEMMOVE((void *) (p + offset + length),
+		            (void *) (p + offset),
+		            DUK_HBUFFER_GET_SIZE(buf) - offset);
 	}
 
-	memcpy((void *) (p + offset),
-	       data,
-	       length);
+	DUK_MEMCPY((void *) (p + offset),
+	           data,
+	           length);
 
 	buf->size += length;
 }
@@ -22979,14 +28894,14 @@ void duk_hbuffer_remove_slice(duk_hthread *thr, duk_hbuffer_dynamic *buf, size_t
 
 	if (end_offset < DUK_HBUFFER_GET_SIZE(buf)) {
 		/* not strictly from end of buffer; need to shuffle data */
-		memmove(p + offset,
-		        p + end_offset,
-	                DUK_HBUFFER_GET_SIZE(buf) - end_offset);  /* always > 0 */
+		DUK_MEMMOVE(p + offset,
+		            p + end_offset,
+	                    DUK_HBUFFER_GET_SIZE(buf) - end_offset);  /* always > 0 */
 	}
 
-	memset(p + DUK_HBUFFER_GET_SIZE(buf) - length,
-	       0,
-	       length);  /* always > 0 */
+	DUK_MEMSET(p + DUK_HBUFFER_GET_SIZE(buf) - length,
+	           0,
+	           length);  /* always > 0 */
 
 	buf->size -= length;
 
@@ -23035,34 +28950,34 @@ void duk_hbuffer_insert_slice(duk_hthread *thr, duk_hbuffer_dynamic *buf, size_t
 	/* create a hole for the insert */
 	len = DUK_HBUFFER_GET_SIZE(buf) - dst_offset;
 	if (len > 0) {
-		memmove(p + dst_offset + length,
-		        p + dst_offset,
-		        len);
+		DUK_MEMMOVE(p + dst_offset + length,
+		            p + dst_offset,
+		            len);
 	}
 
 	if (src_offset < dst_offset) {
 		if (src_end_offset <= dst_offset) {
 			/* entire source is before 'dst_offset' */
-			memcpy(p + dst_offset,
-			       p + src_offset,
-			       length);
+			DUK_MEMCPY(p + dst_offset,
+			           p + src_offset,
+			           length);
 		} else {
 			/* part of the source is before 'dst_offset'; straddles */
 			len = dst_offset - src_offset;
 			DUK_ASSERT(len >= 1 && len < length);
 			DUK_ASSERT(length - len >= 1);
-			memcpy(p + dst_offset,
-			       p + src_offset,
-			       len);
-			memcpy(p + dst_offset + len,
-			       p + src_offset + length + len,  /* take above memmove() into account */
-			       length - len);
+			DUK_MEMCPY(p + dst_offset,
+			           p + src_offset,
+			           len);
+			DUK_MEMCPY(p + dst_offset + len,
+			           p + src_offset + length + len,  /* take above memmove() into account */
+			           length - len);
 		}
 	} else {
 		/* entire source is after 'dst_offset' */
-		memcpy(p + dst_offset,
-		       p + src_offset + length,  /* take above memmove() into account */
-		       length);
+		DUK_MEMCPY(p + dst_offset,
+		           p + src_offset + length,  /* take above memmove() into account */
+		           length);
 	}
 
 	buf->size += length;
@@ -23289,7 +29204,7 @@ static int init_heap_strings(duk_heap *heap) {
 	duk_bitdecoder_ctx *bd = &bd_ctx;  /* convenience */
 	int i, j;
 
-	memset(&bd_ctx, 0, sizeof(bd_ctx));
+	DUK_MEMSET(&bd_ctx, 0, sizeof(bd_ctx));
 	bd->data = (duk_u8 *) duk_strings_data;
 	bd->length = DUK_STRDATA_DATA_LENGTH;
 
@@ -23372,7 +29287,7 @@ static int init_heap_thread(duk_heap *heap) {
 	thr = duk_hthread_alloc(heap,
 	                        DUK_HOBJECT_FLAG_EXTENSIBLE |
 	                        DUK_HOBJECT_FLAG_THREAD |
-	                        DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_OBJECT));
+	                        DUK_HOBJECT_CLASS_AS_FLAGS(DUK_HOBJECT_CLASS_THREAD));
 	if (!thr) {
 		DUK_DPRINT("failed to alloc heap_thread");
 		return 0;
@@ -23392,6 +29307,9 @@ static int init_heap_thread(duk_heap *heap) {
 	/* FIXME: this may now fail, and is not handled correctly */
 	duk_hthread_create_builtin_objects(thr);
 
+	/* default prototype (Note: 'thr' must be reachable) */
+	DUK_HOBJECT_SET_PROTOTYPE(thr, (duk_hobject *) thr, thr->builtins[DUK_BIDX_THREAD_PROTOTYPE]);
+
 	return 1;
 }
 
@@ -23404,14 +29322,39 @@ duk_heap *duk_heap_alloc(duk_alloc_function alloc_func,
 
 	DUK_DPRINT("allocate heap");
 
+#ifdef DUK_USE_COMPUTED_NAN
+	do {
+		/* Workaround for some exotic platforms where NAN is missing
+		 * and the expression (0.0 / 0.0) does NOT result in a NaN.
+		 * Such platforms use the global 'duk_computed_nan' which must
+		 * be initialized at runtime.  Use 'volatile' to ensure that
+		 * the compiler will actually do the computation and not try
+		 * to do constant folding which might result in the original
+		 * problem.
+		 */
+		volatile double dbl1 = 0.0;
+		volatile double dbl2 = 0.0;
+		duk_computed_nan = dbl1 / dbl2;
+	} while(0);
+#endif
+
+#ifdef DUK_USE_COMPUTED_INFINITY
+	do {
+		/* Similar workaround for INFINITY. */
+		volatile double dbl1 = 1.0;
+		volatile double dbl2 = 0.0;
+		duk_computed_infinity = dbl1 / dbl2;
+	} while(0);
+#endif
+
 	/* use a raw call, all macros expect the heap to be initialized */
-	res = alloc_func(alloc_udata, sizeof(duk_heap));
+	res = (duk_heap *) alloc_func(alloc_udata, sizeof(duk_heap));
 	if (!res) {
 		goto error;
 	}
 
 	/* zero everything */
-	memset(res, 0, sizeof(*res));
+	DUK_MEMSET(res, 0, sizeof(*res));
 
 	/* explicit NULL inits */
 #ifdef DUK_USE_EXPLICIT_NULL_INIT
@@ -23486,7 +29429,7 @@ duk_heap *duk_heap_alloc(duk_alloc_function alloc_func,
 	        }
 	}
 #else
-	memset(res->st, 0, sizeof(duk_hstring *) * DUK_STRTAB_INITIAL_SIZE);
+	DUK_MEMSET(res->st, 0, sizeof(duk_hstring *) * DUK_STRTAB_INITIAL_SIZE);
 #endif
 
 	/* strcache init */
@@ -24830,7 +30773,7 @@ void *duk_heap_mem_alloc_zeroed(duk_heap *heap, size_t size) {
 	res = DUK_ALLOC(heap, size);
 	if (res) {
 		/* assume memset with zero size is OK */
-		memset(res, 0, size);
+		DUK_MEMSET(res, 0, size);
 	}
 	return res;
 }
@@ -25106,7 +31049,7 @@ void *duk_heap_mem_alloc_checked_zeroed(duk_hthread *thr, size_t size) {
 		DUK_ERROR(thr, DUK_ERR_ALLOC_ERROR, "memory alloc failed");
 	}
 	/* assume memset with zero size is OK */
-	memset(res, 0, size);
+	DUK_MEMSET(res, 0, size);
 	return res;
 }
 
@@ -25911,9 +31854,9 @@ duk_u32 duk_heap_strcache_offset_char2byte(duk_hthread *thr, duk_hstring *h, duk
 			duk_strcache tmp;
 
 			tmp = *sce;
-			memmove((void *) (&heap->strcache[1]),
-			        (void *) (&heap->strcache[0]),
-			        (size_t) (((char *) sce) - ((char *) &heap->strcache[0])));
+			DUK_MEMMOVE((void *) (&heap->strcache[1]),
+			            (void *) (&heap->strcache[0]),
+			            (size_t) (((char *) sce) - ((char *) &heap->strcache[0])));
 			heap->strcache[0] = tmp;
 
 			/* 'sce' points to the wrong entry here, but is no longer used */
@@ -25966,12 +31909,12 @@ static duk_hstring *alloc_init_hstring(duk_heap *heap,
 	/* NUL terminate for convenient C access */
 
 	alloc_size = sizeof(duk_hstring) + blen + 1;
-	res = DUK_ALLOC(heap, alloc_size);
+	res = (duk_hstring *) DUK_ALLOC(heap, alloc_size);
 	if (!res) {
 		goto error;
 	}
 
-	memset(res, 0, sizeof(duk_hstring));
+	DUK_MEMSET(res, 0, sizeof(duk_hstring));
 #ifdef DUK_USE_EXPLICIT_NULL_INIT
 	DUK_HEAPHDR_STRING_INIT_NULLS(&res->hdr);
 #endif
@@ -25986,7 +31929,7 @@ static duk_hstring *alloc_init_hstring(duk_heap *heap,
 	res->clen = duk_unicode_unvalidated_utf8_length(str, blen);
 
 	data = (duk_u8 *) (res + 1);
-	memcpy(data, str, blen);
+	DUK_MEMCPY(data, str, blen);
 	data[blen] = (duk_u8) 0;
 
 	DUK_DDDPRINT("interned string, hash=0x%08x, blen=%d, clen=%d, arridx=%d",
@@ -26069,7 +32012,7 @@ static duk_hstring *find_matching_string(duk_heap *heap, duk_hstring **entries, 
 			return NULL;
 		}
 		if (e != DELETED_MARKER(heap) && DUK_HSTRING_GET_BYTELEN(e) == blen) {
-			if (memcmp(str, DUK_HSTRING_GET_DATA(e), blen) == 0) {
+			if (DUK_MEMCMP(str, DUK_HSTRING_GET_DATA(e), blen) == 0) {
 				DUK_DDDPRINT("find matching hit: %d (step %d, size %d)", i, step, size);
 				return e;
 			}
@@ -26173,7 +32116,7 @@ static int resize_hash_raw(duk_heap *heap, duk_u32 new_size) {
 		new_entries[i] = NULL;
 	}
 #else
-	memset(new_entries, 0, sizeof(duk_hstring *) * new_size);
+	DUK_MEMSET(new_entries, 0, sizeof(duk_hstring *) * new_size);
 #endif
 
 	/* Because new_size > count_used(heap), guaranteed to work */
@@ -26320,13 +32263,13 @@ duk_hstring *duk_heap_string_intern_checked(duk_hthread *thr, duk_u8 *str, duk_u
 
 duk_hstring *duk_heap_string_lookup_u32(duk_heap *heap, duk_u32 val) {
 	char buf[DUK_STRTAB_U32_MAX_STRLEN+1];
-	sprintf(buf, "%u", (unsigned int) val);
+	DUK_SPRINTF(buf, "%u", (unsigned int) val);
 	return duk_heap_string_lookup(heap, (duk_u8 *) buf, strlen(buf));
 }
 
 duk_hstring *duk_heap_string_intern_u32(duk_heap *heap, duk_u32 val) {
 	char buf[DUK_STRTAB_U32_MAX_STRLEN+1];
-	sprintf(buf, "%u", (unsigned int) val);
+	DUK_SPRINTF(buf, "%u", (unsigned int) val);
 	return duk_heap_string_intern(heap, (duk_u8 *) buf, strlen(buf));
 }
 
@@ -26406,11 +32349,11 @@ duk_hobject *duk_hobject_alloc(duk_heap *heap, int hobject_flags) {
 	DUK_ASSERT((hobject_flags & DUK_HOBJECT_FLAG_NATIVEFUNCTION) == 0);
 	DUK_ASSERT((hobject_flags & DUK_HOBJECT_FLAG_THREAD) == 0);
 
-	res = DUK_ALLOC(heap, sizeof(duk_hobject));
+	res = (duk_hobject *) DUK_ALLOC(heap, sizeof(duk_hobject));
 	if (!res) {
 		return NULL;
 	}
-	memset(res, 0, sizeof(duk_hobject));
+	DUK_MEMSET(res, 0, sizeof(duk_hobject));
 
 	init_object_parts(heap, res, hobject_flags);
 
@@ -26420,11 +32363,11 @@ duk_hobject *duk_hobject_alloc(duk_heap *heap, int hobject_flags) {
 duk_hcompiledfunction *duk_hcompiledfunction_alloc(duk_heap *heap, int hobject_flags) {
 	duk_hcompiledfunction *res;
 
-	res = DUK_ALLOC(heap, sizeof(duk_hcompiledfunction));
+	res = (duk_hcompiledfunction *) DUK_ALLOC(heap, sizeof(duk_hcompiledfunction));
 	if (!res) {
 		return NULL;
 	}
-	memset(res, 0, sizeof(duk_hcompiledfunction));
+	DUK_MEMSET(res, 0, sizeof(duk_hcompiledfunction));
 
 	init_object_parts(heap, &res->obj, hobject_flags);
 
@@ -26440,11 +32383,11 @@ duk_hcompiledfunction *duk_hcompiledfunction_alloc(duk_heap *heap, int hobject_f
 duk_hnativefunction *duk_hnativefunction_alloc(duk_heap *heap, int hobject_flags) {
 	duk_hnativefunction *res;
 
-	res = DUK_ALLOC(heap, sizeof(duk_hnativefunction));
+	res = (duk_hnativefunction *) DUK_ALLOC(heap, sizeof(duk_hnativefunction));
 	if (!res) {
 		return NULL;
 	}
-	memset(res, 0, sizeof(duk_hnativefunction));
+	DUK_MEMSET(res, 0, sizeof(duk_hnativefunction));
 
 	init_object_parts(heap, &res->obj, hobject_flags);
 
@@ -26466,11 +32409,11 @@ duk_hnativefunction *duk_hnativefunction_alloc(duk_heap *heap, int hobject_flags
 duk_hthread *duk_hthread_alloc(duk_heap *heap, int hobject_flags) {
 	duk_hthread *res;
 
-	res = DUK_ALLOC(heap, sizeof(duk_hthread));
+	res = (duk_hthread *) DUK_ALLOC(heap, sizeof(duk_hthread));
 	if (!res) {
 		return NULL;
 	}
-	memset(res, 0, sizeof(duk_hthread));
+	DUK_MEMSET(res, 0, sizeof(duk_hthread));
 
 	init_object_parts(heap, &res->obj, hobject_flags);
 
@@ -26563,7 +32506,7 @@ duk_hobject *duk_hobject_alloc_checked(duk_hthread *thr, int hobject_flags) {
 #endif
 
 /* Note: assumes that these string indexes are 8-bit, genstrings.py must ensure that */
-duk_u8 duk_class_number_to_stridx[16] = {
+duk_u8 duk_class_number_to_stridx[32] = {
 	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
 	DUK_STRIDX_UC_ARGUMENTS,
 	DUK_STRIDX_ARRAY,
@@ -26578,8 +32521,24 @@ duk_u8 duk_class_number_to_stridx[16] = {
 	DUK_STRIDX_REG_EXP,
 	DUK_STRIDX_UC_STRING,
 	DUK_STRIDX_GLOBAL,
-	DUK_STRIDX_EMPTY_STRING,  /* OBJENV, intentionally empty */
-	DUK_STRIDX_EMPTY_STRING,  /* DECENV, intentionally empty */
+	DUK_STRIDX_OBJ_ENV,
+	DUK_STRIDX_DEC_ENV,
+	DUK_STRIDX_UC_BUFFER,
+	DUK_STRIDX_UC_POINTER,
+	DUK_STRIDX_UC_THREAD,     /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
+	DUK_STRIDX_EMPTY_STRING,  /* UNUSED, intentionally empty */
 };
 
 #line 1 "duk_hobject_enum.c"
@@ -26715,9 +32674,9 @@ static void sort_array_indices(duk_hobject *h_obj) {
 		             (void *) (p_insert + 1), (void *) p_insert,
 		             (int) (p_curr - p_insert), (void *) h_curr);
 
-		memmove((void *) (p_insert + 1),
-		        (void *) p_insert,
-		        (size_t) ((p_curr - p_insert) * sizeof(duk_hstring *)));
+		DUK_MEMMOVE((void *) (p_insert + 1),
+		            (void *) p_insert,
+		            (size_t) ((p_curr - p_insert) * sizeof(duk_hstring *)));
 		*p_insert = h_curr;
 		/* keep val_highest */
 	}
@@ -27255,7 +33214,7 @@ void duk_hobject_pc2line_pack(duk_hthread *thr, duk_compiler_instr *instrs, size
 		             (int) hdr[hdr_index + 1]);
 #endif
 
-		memset(be_ctx, 0, sizeof(*be_ctx));
+		DUK_MEMSET(be_ctx, 0, sizeof(*be_ctx));
 		be_ctx->data = ((unsigned char *) hdr) + curr_offset;
 		be_ctx->length = DUK_PC2LINE_MAX_DIFF_LENGTH;
 
@@ -27351,7 +33310,7 @@ duk_u32 duk_hobject_pc2line_query(duk_hbuffer_fixed *buf, int pc) {
 		goto error;
 	}
 
-	memset(bd_ctx, 0, sizeof(*bd_ctx));
+	DUK_MEMSET(bd_ctx, 0, sizeof(*bd_ctx));
 	bd_ctx->data = ((unsigned char *) hdr) + start_offset;
 	bd_ctx->length = DUK_HBUFFER_GET_SIZE(buf) - start_offset;
 
@@ -27776,7 +33735,7 @@ static void realloc_props(duk_hthread *thr,
 		 * allocation later.
 		 */
 
-		new_p = duk_push_dynamic_buffer(ctx, new_alloc_size);  /* errors out if out of memory */
+		new_p = (duk_u8 *) duk_push_dynamic_buffer(ctx, new_alloc_size);  /* errors out if out of memory */
 		DUK_ASSERT(new_p != NULL);  /* since new_alloc_size > 0 */
 	}
 
@@ -27911,7 +33870,7 @@ static void realloc_props(duk_hthread *thr,
 		if (obj->a_size > 0) {
 			/* avoid zero copy; if a_size == 0, obj->p might be NULL */
 			DUK_ASSERT(obj->p != NULL);
-			memcpy((void *) new_a, (void *) DUK_HOBJECT_A_GET_BASE(obj), sizeof(duk_tval) * obj->a_size);
+			DUK_MEMCPY((void *) new_a, (void *) DUK_HOBJECT_A_GET_BASE(obj), sizeof(duk_tval) * obj->a_size);
 		}
 
 		/* fill new entries with -unused- (required, gc reachable) */
@@ -27936,7 +33895,7 @@ static void realloc_props(duk_hthread *thr,
 			/* avoid zero copy; if new_a_size == obj->a_size == 0, obj->p might be NULL */
 			DUK_ASSERT(obj->a_size > 0);
 			DUK_ASSERT(obj->p != NULL);
-			memcpy((void *) new_a, (void *) DUK_HOBJECT_A_GET_BASE(obj), sizeof(duk_tval) * new_a_size);
+			DUK_MEMCPY((void *) new_a, (void *) DUK_HOBJECT_A_GET_BASE(obj), sizeof(duk_tval) * new_a_size);
 		}
 	}
 
@@ -27952,7 +33911,7 @@ static void realloc_props(duk_hthread *thr,
 		DUK_ASSERT(new_h != NULL);
 
 		/* fill new_h with u32 0xff = UNUSED */
-		memset(new_h, 0xff, sizeof(duk_u32) * new_h_size);
+		DUK_MEMSET(new_h, 0xff, sizeof(duk_u32) * new_h_size);
 
 		DUK_ASSERT(new_e_used <= new_h_size);  /* equality not actually possible */
 		for (i = 0; i < new_e_used; i++) {
@@ -29064,11 +35023,7 @@ int duk_hobject_getprop(duk_hthread *thr, duk_tval *tv_obj, duk_tval *tv_key) {
 
 	switch (DUK_TVAL_GET_TAG(tv_obj)) {
 	case DUK_TAG_UNDEFINED:
-	case DUK_TAG_NULL:
-	case DUK_TAG_BUFFER:
-	case DUK_TAG_POINTER: {
-		/* FIXME: add a prototype object for buffers and perhaps for pointers? */
-
+	case DUK_TAG_NULL: {
 		/* Note: unconditional throw */
 		DUK_DDDPRINT("base object is undefined, null, buffer, or pointer -> reject");
 		DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "invalid base reference for property read");
@@ -29174,6 +35129,19 @@ int duk_hobject_getprop(duk_hthread *thr, duk_tval *tv_obj, duk_tval *tv_key) {
 
 			goto lookup;  /* avoid double coercion */
 		}
+		break;
+	}
+
+	/* Buffer doesn't have virtual properties at the moment (indices or length). */
+	case DUK_TAG_BUFFER: {
+		DUK_DDDPRINT("base object is a buffer, start lookup from buffer prototype");
+		curr = thr->builtins[DUK_BIDX_BUFFER_PROTOTYPE];
+		break;
+	}
+
+	case DUK_TAG_POINTER: {
+		DUK_DDDPRINT("base object is a pointer, start lookup from pointer prototype");
+		curr = thr->builtins[DUK_BIDX_POINTER_PROTOTYPE];
 		break;
 	}
 
@@ -30534,8 +36502,9 @@ int duk_hobject_delprop(duk_hthread *thr, duk_tval *tv_obj, duk_tval *tv_key, in
 /*
  *  Internal helper to define a property with specific flags, ignoring
  *  normal semantics such as extensibility, write protection etc.
- *  Overwrites any existing value and attributes.  If target has an array
- *  part, asserts that propflags are correct (WEC).
+ *  Overwrites any existing value and attributes unless caller requests
+ *  that value only be updated if it doesn't already exists.  If target
+ *  has an array part, asserts that propflags are correct (WEC).
  *
  *  Does not support:
  *    - virtual properties
@@ -30548,7 +36517,7 @@ int duk_hobject_delprop(duk_hthread *thr, duk_tval *tv_obj, duk_tval *tv_key, in
  *  operations.
  */
 
-void duk_hobject_define_property_internal(duk_hthread *thr, duk_hobject *obj, duk_hstring *key, int propflags) {
+void duk_hobject_define_property_internal(duk_hthread *thr, duk_hobject *obj, duk_hstring *key, int flags) {
 	duk_context *ctx = (duk_context *) thr;
 	duk_propdesc desc;
 	duk_u32 arr_idx;
@@ -30556,15 +36525,15 @@ void duk_hobject_define_property_internal(duk_hthread *thr, duk_hobject *obj, du
 	duk_tval tv_tmp;
 	duk_tval *tv1 = NULL;
 	duk_tval *tv2 = NULL;
+	int propflags = flags & DUK_PROPDESC_FLAGS_MASK;  /* mask out flags not actually stored */
 
 	DUK_DDDPRINT("define new property (internal): thr=%p, obj=%!O, key=%!O, flags=0x%02x, val=%!T",
-	             (void *) thr, obj, key, propflags, duk_get_tval(ctx, -1));
+	             (void *) thr, obj, key, flags, duk_get_tval(ctx, -1));
 
 	DUK_ASSERT(thr != NULL);
 	DUK_ASSERT(thr->heap != NULL);
 	DUK_ASSERT(obj != NULL);
 	DUK_ASSERT(key != NULL);
-	DUK_ASSERT((propflags & ~DUK_PROPDESC_FLAGS_MASK) == 0);
 
 	ASSERT_VALSTACK_SPACE(thr, VALSTACK_SPACE);
 	DUK_ASSERT(duk_is_valid_index(ctx, -1));  /* contains value */
@@ -30573,17 +36542,29 @@ void duk_hobject_define_property_internal(duk_hthread *thr, duk_hobject *obj, du
 
 	if (get_own_property_desc_raw(thr, obj, key, arr_idx, &desc, 0)) {  /* push_value = 0 */
 		if (desc.e_idx >= 0) {
+			if (flags & DUK_PROPDESC_FLAG_NO_OVERWRITE) {
+				DUK_DDDPRINT("property already exists in the entry part -> skip as requested");
+				goto skip_write;
+			}
 			DUK_DDDPRINT("property already exists in the entry part -> update value and attributes");
 			DUK_ASSERT(!DUK_HOBJECT_E_SLOT_IS_ACCESSOR(obj, desc.e_idx));
 
 			DUK_HOBJECT_E_SET_FLAGS(obj, desc.e_idx, propflags);
 			tv1 = DUK_HOBJECT_E_GET_VALUE_TVAL_PTR(obj, desc.e_idx);
 		} else if (desc.a_idx >= 0) {
+			if (flags & DUK_PROPDESC_FLAG_NO_OVERWRITE) {
+				DUK_DDDPRINT("property already exists in the array part -> skip as requested");
+				goto skip_write;
+			}
 			DUK_DDDPRINT("property already exists in the array part -> update value (assert attributes)");
 			DUK_ASSERT(propflags == DUK_PROPDESC_FLAGS_WEC);
 
 			tv1 = DUK_HOBJECT_A_GET_VALUE_PTR(obj, desc.a_idx);
 		} else {
+			if (flags & DUK_PROPDESC_FLAG_NO_OVERWRITE) {
+				DUK_DDDPRINT("property already exists but is virtual -> skip as requested");
+				goto skip_write;
+			}
 			DUK_DDDPRINT("property already exists but is virtual -> failure");
 			DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "attempt to redefine virtual property");
 			DUK_NEVER_HERE();
@@ -30628,7 +36609,48 @@ void duk_hobject_define_property_internal(duk_hthread *thr, duk_hobject *obj, du
 	DUK_TVAL_INCREF(thr, tv1);
 	DUK_TVAL_DECREF(thr, &tv_tmp);    /* side effects */
 
+ skip_write:
 	duk_pop(ctx);  /* remove in_val */
+}
+
+/*
+ *  Internal helper for defining an accessor property, ignoring
+ *  normal semantics such as extensibility, write protection etc.
+ *  Overwrites any existing value and attributes.  This is called
+ *  very rarely, so the implementation first sets a value to undefined
+ *  and then changes the entry to an accessor (this is to save code space).
+ */
+
+void duk_hobject_define_accessor_internal(duk_hthread *thr, duk_hobject *obj, duk_hstring *key, duk_hobject *getter, duk_hobject *setter, int propflags) {
+	duk_context *ctx = (duk_context *) thr;
+	int e_idx;
+	int h_idx;
+
+	DUK_DDDPRINT("define new accessor (internal): thr=%p, obj=%!O, key=%!O, getter=%!O, setter=%!O, flags=0x%02x",
+	             (void *) thr, obj, key, getter, setter, propflags);
+
+	DUK_ASSERT(thr != NULL);
+	DUK_ASSERT(thr->heap != NULL);
+	DUK_ASSERT(obj != NULL);
+	DUK_ASSERT(key != NULL);
+	DUK_ASSERT((propflags & ~DUK_PROPDESC_FLAGS_MASK) == 0);
+	/* setter and/or getter may be NULL */
+
+	ASSERT_VALSTACK_SPACE(thr, VALSTACK_SPACE);
+
+	/* force the property to 'undefined' to create a slot for it */
+	duk_push_undefined(ctx);
+	duk_hobject_define_property_internal(thr, obj, key, propflags);
+	duk_hobject_find_existing_entry(obj, key, &e_idx, &h_idx);
+	DUK_DDDPRINT("accessor slot: e_idx=%d, h_idx=%d", e_idx, h_idx);
+	DUK_ASSERT(e_idx >= 0 && e_idx < obj->e_used);
+
+	/* no need to decref, as previous value is 'undefined' */
+	DUK_HOBJECT_E_SLOT_SET_ACCESSOR(obj, e_idx);
+	DUK_HOBJECT_E_SET_VALUE_GETTER(obj, e_idx, getter);
+	DUK_HOBJECT_E_SET_VALUE_SETTER(obj, e_idx, setter);
+	DUK_HOBJECT_INCREF(thr, getter);
+	DUK_HOBJECT_INCREF(thr, setter);
 }
 
 /*
@@ -31988,11 +38010,11 @@ int duk_hthread_init_stacks(duk_heap *heap, duk_hthread *thr) {
 
 	/* valstack */
 	alloc_size = sizeof(duk_tval) * DUK_VALSTACK_INITIAL_SIZE;
-	thr->valstack = DUK_ALLOC(heap, alloc_size);
+	thr->valstack = (duk_tval *) DUK_ALLOC(heap, alloc_size);
 	if (!thr->valstack) {
 		goto fail;
 	}
-	memset(thr->valstack, 0, alloc_size);
+	DUK_MEMSET(thr->valstack, 0, alloc_size);
 	thr->valstack_end = thr->valstack + DUK_VALSTACK_INITIAL_SIZE;
 	thr->valstack_bottom = thr->valstack;
 	thr->valstack_top = thr->valstack;
@@ -32003,21 +38025,21 @@ int duk_hthread_init_stacks(duk_heap *heap, duk_hthread *thr) {
 
 	/* callstack */
 	alloc_size = sizeof(duk_activation) * DUK_CALLSTACK_INITIAL_SIZE;
-	thr->callstack = DUK_ALLOC(heap, alloc_size);
+	thr->callstack = (duk_activation *) DUK_ALLOC(heap, alloc_size);
 	if (!thr->callstack) {
 		goto fail;
 	}
-	memset(thr->callstack, 0, alloc_size);
+	DUK_MEMSET(thr->callstack, 0, alloc_size);
 	thr->callstack_size = DUK_CALLSTACK_INITIAL_SIZE;
 	DUK_ASSERT(thr->callstack_top == 0);
 
 	/* catchstack */
 	alloc_size = sizeof(duk_catcher) * DUK_CATCHSTACK_INITIAL_SIZE;
-	thr->catchstack = DUK_ALLOC(heap, alloc_size);
+	thr->catchstack = (duk_catcher *) DUK_ALLOC(heap, alloc_size);
 	if (!thr->catchstack) {
 		goto fail;
 	}
-	memset(thr->catchstack, 0, alloc_size);
+	DUK_MEMSET(thr->catchstack, 0, alloc_size);
 	thr->catchstack_size = DUK_CATCHSTACK_INITIAL_SIZE;
 	DUK_ASSERT(thr->catchstack_top == 0);
 
@@ -32056,7 +38078,7 @@ typedef union {
  *  Encoding constants, must match genbuiltins.py
  */
 
-#define  CLASS_BITS                  4
+#define  CLASS_BITS                  5
 #define  BIDX_BITS                   6
 #define  STRIDX_BITS                 9  /* FIXME: try to optimize to 8 */
 #define  NATIDX_BITS                 8
@@ -32081,6 +38103,7 @@ typedef union {
 #define  PROP_TYPE_UNDEFINED         4
 #define  PROP_TYPE_BOOLEAN_TRUE      5
 #define  PROP_TYPE_BOOLEAN_FALSE     6
+#define  PROP_TYPE_ACCESSOR          7
 
 /*
  *  Create built-in objects by parsing an init bitstream generated
@@ -32096,7 +38119,7 @@ void duk_hthread_create_builtin_objects(duk_hthread *thr) {
 
 	DUK_DPRINT("INITBUILTINS BEGIN");
 
-	memset(&bd_ctx, 0, sizeof(bd_ctx));
+	DUK_MEMSET(&bd_ctx, 0, sizeof(bd_ctx));
 	bd->data = (duk_u8 *) duk_builtins_data;
 	bd->length = DUK_BUILTINS_DATA_LENGTH;
 
@@ -32105,6 +38128,10 @@ void duk_hthread_create_builtin_objects(duk_hthread *thr) {
 	 *  During init, their indices will correspond to built-in indices.
 	 *
 	 *  Built-ins will be reachable from both valstack and thr->builtins.
+	 */
+
+	/* XXX: there is no need to resize valstack because builtin count
+	 * is much less than the default space; assert for it.
 	 */
 
 	DUK_DDPRINT("create empty built-ins");
@@ -32247,7 +38274,7 @@ void duk_hthread_create_builtin_objects(duk_hthread *thr) {
 
 		t = duk_bd_decode(bd, BIDX_BITS);
 		if (t != NO_BIDX_MARKER) {
-			DUK_DDDPRINT("set prototype: built-in %d", (int) t);
+			DUK_DDDPRINT("set internal prototype: built-in %d", (int) t);
 			DUK_HOBJECT_SET_PROTOTYPE(thr, h, thr->builtins[t]);
 		}
 
@@ -32361,13 +38388,44 @@ void duk_hthread_create_builtin_objects(duk_hthread *thr) {
 				duk_push_false(ctx);
 				break;
 			}
+			case PROP_TYPE_ACCESSOR: {
+				int natidx_getter = duk_bd_decode(bd, NATIDX_BITS);
+				int natidx_setter = duk_bd_decode(bd, NATIDX_BITS);
+				duk_c_function c_func_getter;
+				duk_c_function c_func_setter;
+
+				/* XXX: this is a bit awkward because there is no exposed helper
+				 * in the API style, only this internal helper.
+				 */
+				DUK_DDDPRINT("built-in accessor property: objidx=%d, stridx=%d, getteridx=%d, setteridx=%d, flags=0x%04x",
+				             i, stridx, natidx_getter, natidx_setter, prop_flags);
+
+				c_func_getter = duk_builtin_native_functions[natidx_getter];
+				c_func_setter = duk_builtin_native_functions[natidx_setter];
+				duk_push_c_function(ctx, c_func_getter, 0);  /* always 0 args */
+				duk_push_c_function(ctx, c_func_setter, 1);  /* always 1 arg */
+
+				prop_flags |= DUK_PROPDESC_FLAG_ACCESSOR;  /* accessor flag not encoded explicitly */
+				duk_hobject_define_accessor_internal(thr,
+				                                     duk_require_hobject(ctx, i),
+				                                     DUK_HTHREAD_GET_STRING(thr, stridx),
+				                                     duk_require_hobject(ctx, -2),
+				                                     duk_require_hobject(ctx, -1),
+				                                     prop_flags);
+				duk_pop_2(ctx);  /* getter and setter, now reachable through object */
+				goto skip_value;
+			}
 			default: {
 				/* exhaustive */
 				DUK_NEVER_HERE();
 			}
 			}
 
+			DUK_ASSERT((prop_flags & DUK_PROPDESC_FLAG_ACCESSOR) == 0);
 			duk_def_prop_stridx(ctx, i, stridx, prop_flags);
+
+		 skip_value:
+			continue;  /* avoid empty label at the end of a compound statement */
 		}
 
 		/* native function properties */
@@ -32600,7 +38658,7 @@ void duk_hthread_callstack_grow(duk_hthread *thr) {
 	 *  pointer may be changed by mark-and-sweep.
 	 */
 
-	thr->callstack = DUK_REALLOC_INDIRECT_CHECKED(thr, (void **) &thr->callstack, sizeof(duk_activation) * new_size);
+	thr->callstack = (duk_activation *) DUK_REALLOC_INDIRECT_CHECKED(thr, (void **) &thr->callstack, sizeof(duk_activation) * new_size);
 	thr->callstack_size = new_size;
 
 	/* note: any entries above the callstack top are garbage and not zeroed */
@@ -32712,16 +38770,16 @@ void duk_hthread_callstack_unwind(duk_hthread *thr, int new_top) {
 #endif
 
 		DUK_ASSERT((p->lex_env == NULL) ||
-		           ((duk_hobject_find_existing_entry_tval_ptr(p->lex_env, DUK_HEAP_STRING_INT_CALLEE(thr)) == NULL) &&
-		            (duk_hobject_find_existing_entry_tval_ptr(p->lex_env, DUK_HEAP_STRING_INT_VARMAP(thr)) == NULL) &&
-		            (duk_hobject_find_existing_entry_tval_ptr(p->lex_env, DUK_HEAP_STRING_INT_THREAD(thr)) == NULL) &&
-		            (duk_hobject_find_existing_entry_tval_ptr(p->lex_env, DUK_HEAP_STRING_INT_REGBASE(thr)) == NULL)));
+		           ((duk_hobject_find_existing_entry_tval_ptr(p->lex_env, DUK_HTHREAD_STRING_INT_CALLEE(thr)) == NULL) &&
+		            (duk_hobject_find_existing_entry_tval_ptr(p->lex_env, DUK_HTHREAD_STRING_INT_VARMAP(thr)) == NULL) &&
+		            (duk_hobject_find_existing_entry_tval_ptr(p->lex_env, DUK_HTHREAD_STRING_INT_THREAD(thr)) == NULL) &&
+		            (duk_hobject_find_existing_entry_tval_ptr(p->lex_env, DUK_HTHREAD_STRING_INT_REGBASE(thr)) == NULL)));
 
 		DUK_ASSERT((p->var_env == NULL) ||
-		           ((duk_hobject_find_existing_entry_tval_ptr(p->var_env, DUK_HEAP_STRING_INT_CALLEE(thr)) == NULL) &&
-		            (duk_hobject_find_existing_entry_tval_ptr(p->var_env, DUK_HEAP_STRING_INT_VARMAP(thr)) == NULL) &&
-		            (duk_hobject_find_existing_entry_tval_ptr(p->var_env, DUK_HEAP_STRING_INT_THREAD(thr)) == NULL) &&
-		            (duk_hobject_find_existing_entry_tval_ptr(p->var_env, DUK_HEAP_STRING_INT_REGBASE(thr)) == NULL)));
+		           ((duk_hobject_find_existing_entry_tval_ptr(p->var_env, DUK_HTHREAD_STRING_INT_CALLEE(thr)) == NULL) &&
+		            (duk_hobject_find_existing_entry_tval_ptr(p->var_env, DUK_HTHREAD_STRING_INT_VARMAP(thr)) == NULL) &&
+		            (duk_hobject_find_existing_entry_tval_ptr(p->var_env, DUK_HTHREAD_STRING_INT_THREAD(thr)) == NULL) &&
+		            (duk_hobject_find_existing_entry_tval_ptr(p->var_env, DUK_HTHREAD_STRING_INT_REGBASE(thr)) == NULL)));
 
 	 skip_env_close:
 
@@ -32819,7 +38877,7 @@ void duk_hthread_catchstack_grow(duk_hthread *thr) {
 	 *  pointer may be changed by mark-and-sweep.
 	 */
 
-	thr->catchstack = DUK_REALLOC_INDIRECT_CHECKED(thr, (void **) &thr->catchstack, sizeof(duk_catcher) * new_size);
+	thr->catchstack = (duk_catcher *) DUK_REALLOC_INDIRECT_CHECKED(thr, (void **) &thr->catchstack, sizeof(duk_catcher) * new_size);
 	thr->catchstack_size = new_size;
 
 	/* note: any entries above the catchstack top are garbage and not zeroed */
@@ -33324,13 +39382,13 @@ static void handle_oldenv_for_call(duk_hthread *thr,
 	DUK_ASSERT(!DUK_HOBJECT_HAS_NEWENV(func));
 	DUK_ASSERT(!DUK_HOBJECT_HAS_CREATEARGS(func));
 
-	tv = duk_hobject_find_existing_entry_tval_ptr(func, DUK_HEAP_STRING_INT_LEXENV(thr));
+	tv = duk_hobject_find_existing_entry_tval_ptr(func, DUK_HTHREAD_STRING_INT_LEXENV(thr));
 	if (tv) {
 		DUK_ASSERT(DUK_TVAL_IS_OBJECT(tv));
 		DUK_ASSERT(DUK_HOBJECT_IS_ENV(DUK_TVAL_GET_OBJECT(tv)));
 		act->lex_env = DUK_TVAL_GET_OBJECT(tv);
 
-		tv = duk_hobject_find_existing_entry_tval_ptr(func, DUK_HEAP_STRING_INT_VARENV(thr));
+		tv = duk_hobject_find_existing_entry_tval_ptr(func, DUK_HTHREAD_STRING_INT_VARENV(thr));
 		if (tv) {
 			DUK_ASSERT(DUK_TVAL_IS_OBJECT(tv));
 			DUK_ASSERT(DUK_HOBJECT_IS_ENV(DUK_TVAL_GET_OBJECT(tv)));
@@ -33732,7 +39790,7 @@ int duk_handle_call(duk_hthread *thr,
 	 */
 
 	if (!duk_is_callable(thr, idx_func)) {
-		DUK_ERROR(ctx, DUK_ERR_TYPE_ERROR, "call target not callable");
+		DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "call target not callable");
 	}
 	func = duk_get_hobject(thr, idx_func);
 	DUK_ASSERT(func != NULL);
@@ -34647,7 +40705,7 @@ void duk_handle_ecma_call_setup(duk_hthread *thr,
 	 */
 
 	if (!duk_is_callable(thr, idx_func)) {
-		DUK_ERROR(ctx, DUK_ERR_TYPE_ERROR, "call target not callable");
+		DUK_ERROR(thr, DUK_ERR_TYPE_ERROR, "call target not callable");
 	}
 	func = duk_get_hobject(thr, idx_func);
 	DUK_ASSERT(func != NULL);
@@ -34984,13 +41042,18 @@ void duk_handle_ecma_call_setup(duk_hthread *thr,
 /* FIXME: hack, remove when const lookup is not O(n) */
 #define  GETCONST_MAX_CONSTS_CHECK    256
 
+/* these limits are based on bytecode limits */
+#define  MAX_CONSTS       (DUK_BC_BC_MAX + 1)
+#define  MAX_FUNCS        (DUK_BC_BC_MAX + 1)
+#define  MAX_TEMPS        (DUK_BC_BC_MAX + 1)
+
 #define  RECURSION_INCREASE(comp_ctx,thr)  do { \
-		DUK_DDDPRINT("RECURSION INCREASE: %s:%d", __FILE__, __LINE__); \
+		DUK_DDDPRINT("RECURSION INCREASE: %s:%d", DUK_FILE_MACRO, DUK_LINE_MACRO); \
 		recursion_increase((comp_ctx)); \
 	} while(0)
 
 #define  RECURSION_DECREASE(comp_ctx,thr)  do { \
-		DUK_DDDPRINT("RECURSION DECREASE: %s:%d", __FILE__, __LINE__); \
+		DUK_DDDPRINT("RECURSION DECREASE: %s:%d", DUK_FILE_MACRO, DUK_LINE_MACRO); \
 		recursion_decrease((comp_ctx)); \
 	} while(0)
 
@@ -35034,6 +41097,7 @@ static void emit_a_bc(duk_compiler_ctx *comp_ctx, int op, int a, int bc);
 static void emit_abc(duk_compiler_ctx *comp_ctx, int op, int abc);
 static void emit_extraop_b_c(duk_compiler_ctx *comp_ctx, int extraop, int b, int c);
 static void emit_extraop_b(duk_compiler_ctx *comp_ctx, int extraop, int b);
+static void emit_extraop_bc(duk_compiler_ctx *comp_ctx, int extraop, int bc);
 static void emit_extraop_only(duk_compiler_ctx *comp_ctx, int extraop);
 static void emit_loadint(duk_compiler_ctx *comp_ctx, int reg, int val);
 static void emit_jump(duk_compiler_ctx *comp_ctx, int target_pc);
@@ -35363,7 +41427,7 @@ static void advance_helper(duk_compiler_ctx *comp_ctx, int expect) {
 	}
 
 	/* make current token the previous; need to fiddle with valstack "backing store" */
-	memcpy(&comp_ctx->prev_token, &comp_ctx->curr_token, sizeof(duk_token));
+	DUK_MEMCPY(&comp_ctx->prev_token, &comp_ctx->curr_token, sizeof(duk_token));
 	duk_dup(ctx, comp_ctx->tok11_idx);
 	duk_replace(ctx, comp_ctx->tok21_idx);
 	duk_dup(ctx, comp_ctx->tok12_idx);
@@ -35416,7 +41480,7 @@ static void init_function_valstack_slots(duk_compiler_ctx *comp_ctx) {
 
 	entry_top = duk_get_top(ctx);
 
-	memset(func, 0, sizeof(*func));  /* intentional overlap with earlier memzero */
+	DUK_MEMSET(func, 0, sizeof(*func));  /* intentional overlap with earlier memzero */
 #ifdef DUK_USE_EXPLICIT_NULL_INIT
 	func->h_name = NULL;
 	func->h_code = NULL;
@@ -35724,7 +41788,7 @@ static void convert_to_function_template(duk_compiler_ctx *comp_ctx) {
 		duk_def_prop_stridx(ctx, -2, DUK_STRIDX_INT_FORMALS, DUK_PROPDESC_FLAGS_NONE);
 	}
 
-	/* _name */
+	/* name */
 	if (func->h_name) {
 		duk_push_hstring(ctx, func->h_name);
 		duk_def_prop_stridx(ctx, -2, DUK_STRIDX_NAME, DUK_PROPDESC_FLAGS_NONE);
@@ -35783,14 +41847,14 @@ static void convert_to_function_template(duk_compiler_ctx *comp_ctx) {
 		 */
 	}
 
-	/* _filename */
+	/* fileName */
 	if (comp_ctx->h_filename) {
 		/*
 		 *  Source filename (or equivalent), for identifying thrown errors.
 		 */
 
 		duk_push_hstring(ctx, comp_ctx->h_filename);
-		duk_def_prop_stridx(ctx, -2, DUK_STRIDX_INT_FILENAME, DUK_PROPDESC_FLAGS_NONE);
+		duk_def_prop_stridx(ctx, -2, DUK_STRIDX_FILE_NAME, DUK_PROPDESC_FLAGS_NONE);
 	}
 
 	/*
@@ -35957,6 +42021,11 @@ static void emit_extraop_b_c(duk_compiler_ctx *comp_ctx, int extraop, int b, int
 static void emit_extraop_b(duk_compiler_ctx *comp_ctx, int extraop, int b) {
 	DUK_ASSERT(extraop >= DUK_BC_EXTRAOP_MIN && extraop <= DUK_BC_EXTRAOP_MAX);
 	emit_a_b_c(comp_ctx, DUK_OP_EXTRA, extraop, b, 0);
+}
+
+static void emit_extraop_bc(duk_compiler_ctx *comp_ctx, int extraop, int bc) {
+	DUK_ASSERT(extraop >= DUK_BC_EXTRAOP_MIN && extraop <= DUK_BC_EXTRAOP_MAX);
+	emit_a_bc(comp_ctx, DUK_OP_EXTRA, extraop, bc);
 }
 
 static void emit_extraop_only(duk_compiler_ctx *comp_ctx, int extraop) {
@@ -36136,6 +42205,7 @@ static void peephole_optimize_bytecode(duk_compiler_ctx *comp_ctx) {
  */
 
 #define  ISREG(comp_ctx,x)              (((x) & CONST_MARKER) == 0)
+#define  ISCONST(comp_ctx,x)            (((x) & CONST_MARKER) != 0)
 #define  ISTEMP(comp_ctx,x)             (ISREG((comp_ctx), (x)) && (x) >= ((comp_ctx)->curr_func.temp_first))
 #define  GETTEMP(comp_ctx)              ((comp_ctx)->curr_func.temp_next)
 #define  SETTEMP(comp_ctx,x)            ((comp_ctx)->curr_func.temp_next = (x))  /* dangerous: must only lower (temp_max not updated) */
@@ -36175,7 +42245,7 @@ static void copy_ivalue(duk_compiler_ctx *comp_ctx, duk_ivalue *src, duk_ivalue 
 static int is_whole_get_i32(double x, duk_i32 *ival) {
 	duk_i32 t;
 
-	if (fpclassify(x) != FP_NORMAL) {
+	if (DUK_FPCLASSIFY(x) != DUK_FP_NORMAL) {
 		return 0;
 	}
 
@@ -36195,10 +42265,15 @@ static int alloctemps(duk_compiler_ctx *comp_ctx, int num) {
 	comp_ctx->curr_func.temp_next += num;
 
 	/* FIXME: placeholder, catches most cases */
+#if 1
 	if (comp_ctx->curr_func.temp_next > 256) { /* 256 is OK */
-		DUK_ERROR(comp_ctx->thr, DUK_ERR_INTERNAL_ERROR, "out of temp regs");
+		DUK_ERROR(comp_ctx->thr, DUK_ERR_INTERNAL_ERROR, "out of temps");
 	}
-
+#else
+	if (comp_ctx->curr_func.temp_next > MAX_TEMPS) {  /* == MAX_TEMPS is OK */
+		DUK_ERROR(comp_ctx->thr, DUK_ERR_INTERNAL_ERROR, "out of temps");
+	}
+#endif
 	/* maintain highest 'used' temporary, needed to figure out nregs of function */
 	if (comp_ctx->curr_func.temp_next > comp_ctx->curr_func.temp_max) {
 		comp_ctx->curr_func.temp_max = comp_ctx->curr_func.temp_next;
@@ -36249,9 +42324,15 @@ static int getconst(duk_compiler_ctx *comp_ctx) {
 	}
 
 	/* FIXME: placeholder, catches most cases */
+#if 1
 	if (n > 255) { /* 255 is OK */
 		DUK_ERROR(comp_ctx->thr, DUK_ERR_INTERNAL_ERROR, "out of consts");
 	}
+#else
+	if (n >= MAX_CONSTS) {
+		DUK_ERROR(comp_ctx->thr, DUK_ERR_INTERNAL_ERROR, "out of consts");
+	}
+#endif
 
 	DUK_DDDPRINT("allocating new constant for %!T -> const index %d", tv1, n);
 	(void) duk_put_prop_index(ctx, f->consts_idx, n);  /* invalidates tv1, tv2 */
@@ -36301,17 +42382,19 @@ static int ispec_toregconst_raw(duk_compiler_ctx *comp_ctx,
 			 * the 'void' operator.
 			 */
 			int dest = (forced_reg >= 0 ? forced_reg : ALLOCTEMP(comp_ctx));
-			emit_extraop_b_c(comp_ctx, DUK_EXTRAOP_LDUNDEF, dest, 0);
+			emit_extraop_bc(comp_ctx, DUK_EXTRAOP_LDUNDEF, dest);
 			return dest; 
 		}
 		case DUK_TAG_NULL: {
 			int dest = (forced_reg >= 0 ? forced_reg : ALLOCTEMP(comp_ctx));
-			emit_extraop_b_c(comp_ctx, DUK_EXTRAOP_LDNULL, dest, 0);
+			emit_extraop_bc(comp_ctx, DUK_EXTRAOP_LDNULL, dest);
 			return dest;
 		}
 		case DUK_TAG_BOOLEAN: {
 			int dest = (forced_reg >= 0 ? forced_reg : ALLOCTEMP(comp_ctx));
-			emit_extraop_b_c(comp_ctx, DUK_EXTRAOP_LDBOOL, dest, DUK_TVAL_GET_BOOLEAN(tv));
+			emit_extraop_bc(comp_ctx,
+			                (DUK_TVAL_GET_BOOLEAN(tv) ? DUK_EXTRAOP_LDTRUE : DUK_EXTRAOP_LDFALSE),
+			                dest);
 			return dest;
 		}
 		case DUK_TAG_POINTER: {
@@ -36566,7 +42649,7 @@ static void ivalue_toplain_raw(duk_compiler_ctx *comp_ctx, duk_ivalue *x, int fo
 			x->x1.regconst = reg_varbind;
 		} else {
 			dest = (forced_reg >= 0 ? forced_reg : ALLOCTEMP(comp_ctx));
-			emit_a_b(comp_ctx, DUK_OP_GETVAR, dest, reg_varname);
+			emit_a_bc(comp_ctx, DUK_OP_GETVAR, dest, reg_varname);
 			x->t = DUK_IVAL_PLAIN;
 			x->x1.t = DUK_ISPEC_REGCONST;
 			x->x1.regconst = dest;
@@ -37618,7 +43701,7 @@ static void expr_nud(duk_compiler_ctx *comp_ctx, duk_ivalue *res) {
 			duk_dup(ctx, res->x1.valstack_idx);
 			if (lookup_lhs(comp_ctx, &reg_varbind, &reg_varname)) {
 				/* register bound variables are non-configurable -> always false */
-				emit_extraop_b_c(comp_ctx, DUK_EXTRAOP_LDBOOL, reg_temp, 0);
+				emit_extraop_bc(comp_ctx, DUK_EXTRAOP_LDFALSE, reg_temp);
 			} else {
 				duk_dup(ctx, res->x1.valstack_idx);
 				reg_varname = getconst(comp_ctx);
@@ -37794,9 +43877,9 @@ static void expr_nud(duk_compiler_ctx *comp_ctx, duk_ivalue *res) {
 				emit_a_b(comp_ctx, args_op, reg_varbind, reg_varbind);
 				emit_a_bc(comp_ctx, DUK_OP_LDREG, reg_res, reg_varbind);
 			} else {
-				emit_a_b(comp_ctx, DUK_OP_GETVAR, reg_res, reg_varname);
+				emit_a_bc(comp_ctx, DUK_OP_GETVAR, reg_res, reg_varname);
 				emit_a_b(comp_ctx, args_op, reg_res, reg_res);
-				emit_a_b_c(comp_ctx, DUK_OP_PUTVAR, 0, reg_varname, reg_res);
+				emit_a_bc(comp_ctx, DUK_OP_PUTVAR, reg_res, reg_varname);
 			}
 
 			DUK_DDDPRINT("postincdec to '%!O' -> reg_varbind=%d, reg_varname=%d",
@@ -38384,7 +44467,7 @@ static void expr_led(duk_compiler_ctx *comp_ctx, duk_ivalue *left, duk_ivalue *r
 				if (reg_varbind >= 0) {
 					emit_a_b_c(comp_ctx, args_op, reg_temp, reg_varbind, res->x1.regconst);
 				} else {
-					emit_a_b(comp_ctx, DUK_OP_GETVAR, reg_temp, reg_varname);
+					emit_a_bc(comp_ctx, DUK_OP_GETVAR, reg_temp, reg_varname);
 					emit_a_b_c(comp_ctx, args_op, reg_temp, reg_temp, res->x1.regconst);
 				}
 				reg_res = reg_temp;
@@ -38393,7 +44476,19 @@ static void expr_led(duk_compiler_ctx *comp_ctx, duk_ivalue *left, duk_ivalue *r
 			if (reg_varbind >= 0) {
 				emit_a_bc(comp_ctx, DUK_OP_LDREG, reg_varbind, reg_res);
 			} else {
-				emit_a_b_c(comp_ctx, DUK_OP_PUTVAR, 0, reg_varname, reg_res);
+				/* Only a reg fits into 'A' and reg_res may be a const in
+				 * straight assignment.
+				 *
+				 * XXX: here the current A/B/C split is suboptimal: we could
+				 * just use 9 bits for reg_res (and support constants) and 17
+				 * instead of 18 bits for the varname const index.
+				 */
+				if (ISCONST(comp_ctx, reg_res)) {
+					reg_temp = ALLOCTEMP(comp_ctx);
+					emit_a_bc(comp_ctx, DUK_OP_LDCONST, reg_temp, reg_res);
+					reg_res = reg_temp;
+				}
+				emit_a_bc(comp_ctx, DUK_OP_PUTVAR, reg_res, reg_varname);
 			}
 
 			res->t = DUK_IVAL_PLAIN;
@@ -38500,10 +44595,10 @@ static void expr_led(duk_compiler_ctx *comp_ctx, duk_ivalue *left, duk_ivalue *r
 				emit_a_b(comp_ctx, args_op, reg_varbind, reg_res);
 			} else {
 				int reg_temp = ALLOCTEMP(comp_ctx);
-				emit_a_b(comp_ctx, DUK_OP_GETVAR, reg_res, reg_varname);
+				emit_a_bc(comp_ctx, DUK_OP_GETVAR, reg_res, reg_varname);
 				emit_extraop_b_c(comp_ctx, DUK_EXTRAOP_TONUM, reg_res, reg_res);
 				emit_a_b(comp_ctx, args_op, reg_temp, reg_res);
-				emit_a_b_c(comp_ctx, DUK_OP_PUTVAR, 0, reg_varname, reg_temp);
+				emit_a_bc(comp_ctx, DUK_OP_PUTVAR, reg_temp, reg_varname);
 			}
 
 			DUK_DDDPRINT("postincdec to '%!O' -> reg_varbind=%d, reg_varname=%d",
@@ -38602,7 +44697,7 @@ static void expr(duk_compiler_ctx *comp_ctx, duk_ivalue *res, int rbp_flags) {
 	DUK_DDDPRINT("expr(), rbp_flags=%d, rbp=%d, allow_in=%d, paren_level=%d",
 	             rbp_flags, rbp, comp_ctx->curr_func.allow_in, comp_ctx->curr_func.paren_level);
 
-	memset(&tmp_alloc, 0, sizeof(tmp_alloc));
+	DUK_MEMSET(&tmp_alloc, 0, sizeof(tmp_alloc));
 	tmp->x1.valstack_idx = duk_get_top(ctx);
 	tmp->x2.valstack_idx = tmp->x1.valstack_idx + 1;
 	duk_push_undefined(ctx);
@@ -38840,7 +44935,7 @@ static void parse_variable_declaration(duk_compiler_ctx *comp_ctx, duk_ivalue *r
 		} else {
 			int reg_val;
 			reg_val = ivalue_toreg(comp_ctx, res);
-			emit_a_b_c(comp_ctx, DUK_OP_PUTVAR, 0, reg_varname, reg_val);
+			emit_a_bc(comp_ctx, DUK_OP_PUTVAR, reg_val, reg_varname);
 		}
 	}
 
@@ -38937,7 +45032,7 @@ static void parse_for_statement(duk_compiler_ctx *comp_ctx, duk_ivalue *res, int
 			if (reg_varbind >= 0) {
 				emit_a_bc(comp_ctx, DUK_OP_LDREG, reg_varbind, reg_temps + 0);
 			} else {
-				emit_a_b_c(comp_ctx, DUK_OP_PUTVAR, 0, reg_varname, reg_temps + 0);
+				emit_a_bc(comp_ctx, DUK_OP_PUTVAR, reg_temps + 0, reg_varname);
 			}
 			goto parse_3_or_4;
 		} else {
@@ -38989,7 +45084,7 @@ static void parse_for_statement(duk_compiler_ctx *comp_ctx, duk_ivalue *res, int
 				if (lookup_lhs(comp_ctx, &reg_varbind, &reg_varname)) {
 					emit_a_bc(comp_ctx, DUK_OP_LDREG, reg_varbind, reg_temps + 0);
 				} else {
-					emit_a_b_c(comp_ctx, DUK_OP_PUTVAR, 0, reg_varname, reg_temps + 0);
+					emit_a_bc(comp_ctx, DUK_OP_PUTVAR, reg_temps + 0, reg_varname);
 				}
 			} else if (res->t == DUK_IVAL_PROP) {
 				/* Don't allow a constant for the object (even for a number etc), as
@@ -39610,7 +45705,7 @@ static void parse_throw_statement(duk_compiler_ctx *comp_ctx, duk_ivalue *res) {
 	    comp_ctx->curr_token.allow_auto_semi) {         /* automatic semi will be inserted */
 		DUK_DDDPRINT("empty throw value -> undefined");
 		reg_val = ALLOCTEMP(comp_ctx);
-		emit_extraop_b_c(comp_ctx, DUK_EXTRAOP_LDUNDEF, reg_val, 0);
+		emit_extraop_bc(comp_ctx, DUK_EXTRAOP_LDUNDEF, reg_val);
 	} else {
 		DUK_DDDPRINT("throw with a value");
 
@@ -39744,7 +45839,7 @@ static void parse_try_statement(duk_compiler_ctx *comp_ctx, duk_ivalue *res) {
 		duk_push_null(ctx);
 		duk_put_prop(ctx, comp_ctx->curr_func.varmap_idx);
 
-		emit_a_b_c(comp_ctx, DUK_OP_PUTVAR, 0 /*unused */, const_varname /*varname*/, reg_catch + 0 /*value*/);
+		emit_a_bc(comp_ctx, DUK_OP_PUTVAR, reg_catch + 0 /*value*/, const_varname /*varname*/);
 
 		DUK_DDDPRINT("varmap before parsing catch clause: %!iT", duk_get_tval(ctx, comp_ctx->curr_func.varmap_idx));
 
@@ -40235,7 +46330,7 @@ static void parse_statement(duk_compiler_ctx *comp_ctx, duk_ivalue *res, int all
 				 */
 
 				if (DUK_HSTRING_GET_BYTELEN(h_dir) == 10 &&
-				    strncmp((const char *) DUK_HSTRING_GET_DATA(h_dir), "use strict", 10) == 0) {
+				    DUK_STRNCMP((const char *) DUK_HSTRING_GET_DATA(h_dir), "use strict", 10) == 0) {
 					DUK_DDDPRINT("use strict directive detected: strict flag %d -> %d",
 					             comp_ctx->curr_func.is_strict, 1);
 					comp_ctx->curr_func.is_strict = 1;
@@ -40368,7 +46463,7 @@ static void parse_statements(duk_compiler_ctx *comp_ctx, int allow_source_elem, 
 	 * for nested functions (which may occur inside expressions).
 	 */
 
-	memset(&res_alloc, 0, sizeof(res_alloc));
+	DUK_MEMSET(&res_alloc, 0, sizeof(res_alloc));
 	res->t = DUK_IVAL_PLAIN;
 	res->x1.t = DUK_ISPEC_VALUE;
 	res->x1.valstack_idx = duk_get_top(ctx);
@@ -40420,6 +46515,12 @@ static void parse_statements(duk_compiler_ctx *comp_ctx, int allow_source_elem, 
  *  to be tracked for detecting duplicates.  Currently such identifiers
  *  are put into the varmap with a 'null' value, which is later cleaned up.
  *
+ *  To support functions with a large number of variable and function
+ *  declarations, registers are not allocated beyond a certain limit;
+ *  after that limit, variables and functions need slow path access.
+ *  Arguments are currently always register bound, which imposes a hard
+ *  (and relatively small) argument count limit.
+ *
  *  Some bindings in E5 are not configurable (= deletable) and almost all
  *  are mutable (writable).  Exceptions are:
  * 
@@ -40464,10 +46565,13 @@ static void init_varmap_and_prologue_for_pass2(duk_compiler_ctx *comp_ctx, int *
 
 	/*
 	 *  Function formal arguments, always bound to registers
+	 *  (there's no support for shuffling them now).
 	 */
 
 	num_args = duk_get_length(ctx, comp_ctx->curr_func.argnames_idx);
 	DUK_DDDPRINT("num_args=%d", num_args);
+	/* FIXME: check num_args */
+
 	for (i = 0; i < num_args; i++) {
 		duk_get_prop_index(ctx, comp_ctx->curr_func.argnames_idx, i);
 		h_name = duk_get_hstring(ctx, -1);
@@ -40539,6 +46643,7 @@ static void init_varmap_and_prologue_for_pass2(duk_compiler_ctx *comp_ctx, int *
 
 		duk_get_prop_index(ctx, comp_ctx->curr_func.decls_idx, i);  /* decl name */
 
+		/* FIXME: spilling */
 		if (comp_ctx->curr_func.is_function) {
 			int reg_bind;
 			duk_dup_top(ctx);
@@ -40640,6 +46745,7 @@ static void init_varmap_and_prologue_for_pass2(duk_compiler_ctx *comp_ctx, int *
 				continue;
 			}
 
+			/* FIXME: spilling */
 			if (comp_ctx->curr_func.is_function) {
 				int reg_bind = ALLOCTEMP(comp_ctx);
 				/* no need to init reg, it will be undefined on entry */
@@ -40754,7 +46860,7 @@ static void parse_function_body(duk_compiler_ctx *comp_ctx, int expect_eof, int 
 		 * it here.
 		 */
 #if 0
-		emit_extraop_b_c(comp_ctx, DUK_EXTRAOP_LDUNDEF, 0, 0);
+		emit_extraop_bc(comp_ctx, DUK_EXTRAOP_LDUNDEF, 0);
 #endif
 	}
 
@@ -40859,7 +46965,7 @@ static void parse_function_body(duk_compiler_ctx *comp_ctx, int expect_eof, int 
 	 */
 
 	if (implicit_return_value) {
-		emit_extraop_b_c(comp_ctx, DUK_EXTRAOP_LDUNDEF, 0, 0);
+		emit_extraop_bc(comp_ctx, DUK_EXTRAOP_LDUNDEF, 0);
 	}
 
 	DUK_DDDPRINT("begin 2nd pass");
@@ -41085,9 +47191,9 @@ static int parse_function_like_fnum(duk_compiler_ctx *comp_ctx, int is_decl, int
 	 */
 
 	entry_top = duk_get_top(ctx);
-	memcpy(&old_func, &comp_ctx->curr_func, sizeof(duk_compiler_func));
+	DUK_MEMCPY(&old_func, &comp_ctx->curr_func, sizeof(duk_compiler_func));
 
-	memset(&comp_ctx->curr_func, 0, sizeof(duk_compiler_func));
+	DUK_MEMSET(&comp_ctx->curr_func, 0, sizeof(duk_compiler_func));
 	init_function_valstack_slots(comp_ctx);
 	DUK_ASSERT(comp_ctx->curr_func.num_formals == 0);
 
@@ -41105,10 +47211,7 @@ static int parse_function_like_fnum(duk_compiler_ctx *comp_ctx, int is_decl, int
 	/* FIXME: append primitive */
 	n_funcs = duk_get_length(ctx, old_func.funcs_idx);
 
-	/* FIXME: placeholder, catches most cases; this limit is actually too tight
-	 * because CLOSURE can handle much more.
-	 */
-	if (n_funcs > 255) {
+	if (n_funcs >= MAX_FUNCS) {
 		DUK_ERROR(comp_ctx->thr, DUK_ERR_INTERNAL_ERROR, "out of funcs");
 	}
 
@@ -41118,7 +47221,7 @@ static int parse_function_like_fnum(duk_compiler_ctx *comp_ctx, int is_decl, int
 	 *  Cleanup: restore original function, restore valstack state.
 	 */
 	
-	memcpy(&comp_ctx->curr_func, &old_func, sizeof(duk_compiler_func));
+	DUK_MEMCPY(&comp_ctx->curr_func, &old_func, sizeof(duk_compiler_func));
 	duk_set_top(ctx, entry_top);
 
 	DUK_ASSERT_TOP(ctx, entry_top);
@@ -41144,7 +47247,7 @@ static int parse_function_like_fnum(duk_compiler_ctx *comp_ctx, int is_decl, int
  *  Compilation context can be either global code or eval code (see E5
  *  Sections 14 and 15.1.2.1).
  *
- *  Input stack:  [ ... sourcecode ]
+ *  Input stack:  [ ... sourcecode filename ]
  *  Output stack: [ ... func_template ]
  */
 
@@ -41153,6 +47256,7 @@ static int parse_function_like_fnum(duk_compiler_ctx *comp_ctx, int is_decl, int
 void duk_js_compile(duk_hthread *thr, int flags) {
 	duk_context *ctx = (duk_context *) thr;
 	duk_hstring *h_sourcecode;
+	duk_hstring *h_filename;
 	duk_compiler_ctx comp_ctx_alloc;
 	duk_compiler_ctx *comp_ctx = &comp_ctx_alloc;
 	duk_lexer_point lex_pt_alloc;
@@ -41174,14 +47278,15 @@ void duk_js_compile(duk_hthread *thr, int flags) {
 	 */
 
 	entry_top = duk_get_top(ctx);
-	h_sourcecode = duk_require_hstring(ctx, -1);
-	DUK_ASSERT(entry_top >= 1);
+	h_sourcecode = duk_require_hstring(ctx, -2);
+	h_filename = duk_get_hstring(ctx, -1);  /* may be undefined */
+	DUK_ASSERT(entry_top >= 2);
 
 	/*
 	 *  Init compiler and lexer contexts
 	 */
 
-	memset(comp_ctx, 0, sizeof(*comp_ctx));
+	DUK_MEMSET(comp_ctx, 0, sizeof(*comp_ctx));
 #ifdef DUK_USE_EXPLICIT_NULL_INIT
 	comp_ctx->thr = NULL;
 	comp_ctx->h_filename = NULL;
@@ -41199,8 +47304,8 @@ void duk_js_compile(duk_hthread *thr, int flags) {
 	duk_push_undefined(ctx);               /* entry_top + 3 */
 	duk_push_undefined(ctx);               /* entry_top + 4 */
 
-	/* FIXME: h_filename */
 	comp_ctx->thr = thr;
+	comp_ctx->h_filename = h_filename;
 	comp_ctx->tok11_idx = entry_top + 1;
 	comp_ctx->tok12_idx = entry_top + 2;
 	comp_ctx->tok21_idx = entry_top + 3;
@@ -41219,7 +47324,7 @@ void duk_js_compile(duk_hthread *thr, int flags) {
 	DUK_ASSERT(DUK_HBUFFER_HAS_DYNAMIC(comp_ctx->lex.buf));
 
 #if 0  /* not needed */
-	memset(lex_pt, 0, sizeof(*lex_pt));
+	DUK_MEMSET(lex_pt, 0, sizeof(*lex_pt));
 #endif
 	lex_pt->offset = 0;
 	lex_pt->line = 1;
@@ -41279,15 +47384,15 @@ void duk_js_compile(duk_hthread *thr, int flags) {
 	 *  Mangle stack for result
 	 */
 
-	/* [ ... sourcecode (temps) func ] */
+	/* [ ... sourcecode filename (temps) func ] */
 
-	DUK_ASSERT(entry_top - 1 >= 0);
-	duk_replace(ctx, entry_top - 1);  /* replace sourcecode with func */
-	duk_set_top(ctx, entry_top);
+	DUK_ASSERT(entry_top - 2 >= 0);
+	duk_replace(ctx, entry_top - 2);  /* replace sourcecode with func */
+	duk_set_top(ctx, entry_top - 1);
 
 	/* [ ... func ] */
 
-	DUK_ASSERT_TOP(ctx, entry_top);
+	DUK_ASSERT_TOP(ctx, entry_top - 1);
 }
 
 #line 1 "duk_js_executor.c"
@@ -41376,6 +47481,8 @@ static void _vm_arith_add(duk_hthread *thr, duk_tval *tv_x, duk_tval *tv_y, int 
 	 *  the exact semantics.
 	 *
 	 *  E5 Section 11.6.1.
+	 *
+	 *  Custom types also have special behavior implemented here.
 	 */
 
 	duk_context *ctx = (duk_context *) thr;
@@ -41416,7 +47523,12 @@ static void _vm_arith_add(duk_hthread *thr, duk_tval *tv_x, duk_tval *tv_y, int 
 	duk_to_primitive(ctx, -2, DUK_HINT_NONE);  /* side effects -> don't use tv_x, tv_y after */
 	duk_to_primitive(ctx, -1, DUK_HINT_NONE);
 
-	if (duk_is_string(ctx, -2) || duk_is_string(ctx, -1)) {
+	/* As a first approximation, buffer values are coerced to strings
+	 * for addition.  This means that adding two buffers currently
+	 * results in a string.
+	 */
+	if (duk_check_type_mask(ctx, -2, DUK_TYPE_MASK_STRING | DUK_TYPE_MASK_BUFFER) ||
+	    duk_check_type_mask(ctx, -1, DUK_TYPE_MASK_STRING | DUK_TYPE_MASK_BUFFER)) {
 		duk_to_string(ctx, -2);
 		duk_to_string(ctx, -1);
 		duk_concat(ctx, 2);  /* [... s1 s2] -> [... s1+s2] */
@@ -41495,7 +47607,7 @@ static void _vm_arith_binary_op(duk_hthread *thr, duk_tval *tv_x, duk_tval *tv_y
 		break;
 	}
 	default: {
-		val = NAN;  /* should not happen */
+		val = DUK_DOUBLE_NAN;  /* should not happen */
 		break;
 	}
 	}
@@ -41654,7 +47766,7 @@ static void _vm_arith_unary_op(duk_hthread *thr, duk_tval *tv_x, int idx_z, int 
 		break;
 	}
 	default: {
-		val = NAN;  /* should not happen */
+		val = DUK_DOUBLE_NAN;  /* should not happen */
 		break;
 	}
 	}
@@ -41998,7 +48110,7 @@ static int handle_longjmp(duk_hthread *thr,
 		DUK_ASSERT(thr->callstack_top >= 2);                                                                         /* Ecmascript activation + __duk__.resume() activation */
 		DUK_ASSERT((thr->callstack + thr->callstack_top - 1)->func != NULL &&
 		           DUK_HOBJECT_IS_NATIVEFUNCTION((thr->callstack + thr->callstack_top - 1)->func) &&
-		           ((duk_hnativefunction *) (thr->callstack + thr->callstack_top - 1)->func)->func == duk_builtin_duk_object_resume);
+		           ((duk_hnativefunction *) (thr->callstack + thr->callstack_top - 1)->func)->func == duk_builtin_thread_resume);
 		DUK_ASSERT((thr->callstack + thr->callstack_top - 2)->func != NULL &&
 		           DUK_HOBJECT_IS_COMPILEDFUNCTION((thr->callstack + thr->callstack_top - 2)->func));                /* an Ecmascript function */
 		DUK_ASSERT((thr->callstack + thr->callstack_top - 2)->idx_retval >= 0);                                      /* waiting for a value */
@@ -42018,7 +48130,7 @@ static int handle_longjmp(duk_hthread *thr,
 		DUK_ASSERT(resumee->state != DUK_HTHREAD_STATE_YIELDED ||
 		           ((resumee->callstack + resumee->callstack_top - 1)->func != NULL &&
 		            DUK_HOBJECT_IS_NATIVEFUNCTION((resumee->callstack + resumee->callstack_top - 1)->func) &&
-		            ((duk_hnativefunction *) (resumee->callstack + resumee->callstack_top - 1)->func)->func == duk_builtin_duk_object_yield));
+		            ((duk_hnativefunction *) (resumee->callstack + resumee->callstack_top - 1)->func)->func == duk_builtin_thread_yield));
 		DUK_ASSERT(resumee->state != DUK_HTHREAD_STATE_YIELDED ||
 		           ((resumee->callstack + resumee->callstack_top - 2)->func != NULL &&
 		            DUK_HOBJECT_IS_COMPILEDFUNCTION((resumee->callstack + resumee->callstack_top - 2)->func)));      /* an Ecmascript function */
@@ -42137,7 +48249,7 @@ static int handle_longjmp(duk_hthread *thr,
 		DUK_ASSERT(thr->callstack_top >= 2);                                                                         /* Ecmascript activation + __duk__.yield() activation */
 		DUK_ASSERT((thr->callstack + thr->callstack_top - 1)->func != NULL &&
 		           DUK_HOBJECT_IS_NATIVEFUNCTION((thr->callstack + thr->callstack_top - 1)->func) &&
-		           ((duk_hnativefunction *) (thr->callstack + thr->callstack_top - 1)->func)->func == duk_builtin_duk_object_yield);
+		           ((duk_hnativefunction *) (thr->callstack + thr->callstack_top - 1)->func)->func == duk_builtin_thread_yield);
 		DUK_ASSERT((thr->callstack + thr->callstack_top - 2)->func != NULL &&
 		           DUK_HOBJECT_IS_COMPILEDFUNCTION((thr->callstack + thr->callstack_top - 2)->func));                /* an Ecmascript function */
 		DUK_ASSERT((thr->callstack + thr->callstack_top - 2)->idx_retval >= 0);                                      /* waiting for a value */
@@ -42149,7 +48261,7 @@ static int handle_longjmp(duk_hthread *thr,
 		DUK_ASSERT(resumer->callstack_top >= 2);                                                                     /* Ecmascript activation + __duk__.resume() activation */
 		DUK_ASSERT((resumer->callstack + resumer->callstack_top - 1)->func != NULL &&
 		           DUK_HOBJECT_IS_NATIVEFUNCTION((resumer->callstack + resumer->callstack_top - 1)->func) &&
-		           ((duk_hnativefunction *) (resumer->callstack + resumer->callstack_top - 1)->func)->func == duk_builtin_duk_object_resume);
+		           ((duk_hnativefunction *) (resumer->callstack + resumer->callstack_top - 1)->func)->func == duk_builtin_thread_resume);
 		DUK_ASSERT((resumer->callstack + resumer->callstack_top - 2)->func != NULL &&
 		           DUK_HOBJECT_IS_COMPILEDFUNCTION((resumer->callstack + resumer->callstack_top - 2)->func));        /* an Ecmascript function */
 		DUK_ASSERT((resumer->callstack + resumer->callstack_top - 2)->idx_retval >= 0);                              /* waiting for a value */
@@ -42289,7 +48401,7 @@ static int handle_longjmp(duk_hthread *thr,
 		DUK_ASSERT(thr->resumer->callstack_top >= 2);  /* Ecmascript activation + __duk__.resume() activation */
 		DUK_ASSERT((thr->resumer->callstack + thr->resumer->callstack_top - 1)->func != NULL &&
 		           DUK_HOBJECT_IS_NATIVEFUNCTION((thr->resumer->callstack + thr->resumer->callstack_top - 1)->func) &&
-		           ((duk_hnativefunction *) (thr->resumer->callstack + thr->resumer->callstack_top - 1)->func)->func == duk_builtin_duk_object_resume);  /* __duk__.resume() */
+		           ((duk_hnativefunction *) (thr->resumer->callstack + thr->resumer->callstack_top - 1)->func)->func == duk_builtin_thread_resume);  /* __duk__.resume() */
 		DUK_ASSERT((thr->resumer->callstack + thr->resumer->callstack_top - 2)->func != NULL &&
 		           DUK_HOBJECT_IS_COMPILEDFUNCTION((thr->resumer->callstack + thr->resumer->callstack_top - 2)->func));  /* an Ecmascript function */
 		DUK_ASSERT((thr->resumer->callstack + thr->resumer->callstack_top - 2)->idx_retval >= 0);                        /* waiting for a value */
@@ -42464,7 +48576,7 @@ static int handle_longjmp(duk_hthread *thr,
 		DUK_ASSERT(thr->resumer->callstack_top >= 2);  /* Ecmascript activation + __duk__.resume() activation */
 		DUK_ASSERT((thr->resumer->callstack + thr->resumer->callstack_top - 1)->func != NULL &&
 		           DUK_HOBJECT_IS_NATIVEFUNCTION((thr->resumer->callstack + thr->resumer->callstack_top - 1)->func) &&
-		           ((duk_hnativefunction *) (thr->resumer->callstack + thr->resumer->callstack_top - 1)->func)->func == duk_builtin_duk_object_resume);  /* __duk__.resume() */
+		           ((duk_hnativefunction *) (thr->resumer->callstack + thr->resumer->callstack_top - 1)->func)->func == duk_builtin_thread_resume);  /* __duk__.resume() */
 		DUK_ASSERT((thr->resumer->callstack + thr->resumer->callstack_top - 2)->func != NULL &&
 		           DUK_HOBJECT_IS_COMPILEDFUNCTION((thr->resumer->callstack + thr->resumer->callstack_top - 2)->func));  /* an Ecmascript function */
 
@@ -42517,7 +48629,7 @@ static int handle_longjmp(duk_hthread *thr,
 	return retval;
 
  convert_to_internal_error:
-	DUK_ERROR((duk_context *) thr, DUK_ERR_INTERNAL_ERROR, "internal error in bytecode executor longjmp handler");
+	DUK_ERROR(thr, DUK_ERR_INTERNAL_ERROR, "internal error in bytecode executor longjmp handler");
 #if 0
 	/* FIXME: could also handle internally */
 	thr->heap->lj.type = DUK_LJ_TYPE_THROW;
@@ -43055,7 +49167,7 @@ void duk_js_execute_bytecode(duk_hthread *entry_thread) {
 
 			duk_push_tval(ctx, REGCONSTP(c));
 			duk_push_tval(ctx, REGCONSTP(b));  /* -> [ ... escaped_source bytecode ] */
-			duk_regexp_create_instance(ctx);   /* -> [ ... regexp_instance ] */
+			duk_regexp_create_instance(thr);   /* -> [ ... regexp_instance ] */
 			DUK_DDDPRINT("regexp instance: %!iT", duk_get_tval(ctx, -1));
 			duk_replace(ctx, a);
 #else
@@ -43099,11 +49211,11 @@ void duk_js_execute_bytecode(duk_hthread *entry_thread) {
 		case DUK_OP_GETVAR: {
 			duk_context *ctx = (duk_context *) thr;
 			int a = DUK_DEC_A(ins);
-			int b = DUK_DEC_B(ins);
+			int bc = DUK_DEC_BC(ins);
 			duk_tval *tv1;
 			duk_hstring *name;
 
-			tv1 = REGCONSTP(b);
+			tv1 = CONSTP(bc);
 			if (!DUK_TVAL_IS_STRING(tv1)) {
 				DUK_DDDPRINT("GETVAR not a string: %!T", tv1);
 				INTERNAL_ERROR("GETVAR name not a string");
@@ -43118,22 +49230,22 @@ void duk_js_execute_bytecode(duk_hthread *entry_thread) {
 		}
 
 		case DUK_OP_PUTVAR: {
-			int b = DUK_DEC_B(ins);
-			int c = DUK_DEC_C(ins);
+			int a = DUK_DEC_A(ins);
+			int bc = DUK_DEC_BC(ins);
 			duk_tval *tv1;
 			duk_hstring *name;
 
-			tv1 = REGCONSTP(b);
+			tv1 = CONSTP(bc);
 			if (!DUK_TVAL_IS_STRING(tv1)) {
 				INTERNAL_ERROR("PUTVAR name not a string");
 			}
 			name = DUK_TVAL_GET_STRING(tv1);
 
-			/* FIXME: putvar takes an duk_tval pointer, which is awkward and
+			/* FIXME: putvar takes a duk_tval pointer, which is awkward and
 			 * should be reworked.
 			 */
 
-			tv1 = REGCONSTP(c);  /* val */
+			tv1 = REGP(a);  /* val */
 			duk_js_putvar_activation(thr, act, name, tv1, STRICT());
 			break;
 		}
@@ -44011,7 +50123,8 @@ void duk_js_execute_bytecode(duk_hthread *entry_thread) {
 		case DUK_OP_EXTRA: {
 			/* FIXME: shared decoding of 'b' and 'c'? */
 
-			switch (DUK_DEC_A(ins)) {
+			int extraop = DUK_DEC_A(ins);
+			switch (extraop) {
 
 			case DUK_EXTRAOP_NOP: {
 				/* nop */
@@ -44038,11 +50151,11 @@ void duk_js_execute_bytecode(duk_hthread *entry_thread) {
 			}
 
 			case DUK_EXTRAOP_LDUNDEF: {
-				int b = DUK_DEC_B(ins);
+				int bc = DUK_DEC_BC(ins);
 				duk_tval tv_tmp;
 				duk_tval *tv1;
 
-				tv1 = REGP(b);
+				tv1 = REGP(bc);
 				DUK_TVAL_SET_TVAL(&tv_tmp, tv1);
 				DUK_TVAL_SET_UNDEFINED_ACTUAL(tv1);
 				DUK_TVAL_DECREF(thr, &tv_tmp);  /* side effects */
@@ -44050,28 +50163,27 @@ void duk_js_execute_bytecode(duk_hthread *entry_thread) {
 			}
 
 			case DUK_EXTRAOP_LDNULL: {
-				int b = DUK_DEC_B(ins);
+				int bc = DUK_DEC_BC(ins);
 				duk_tval tv_tmp;
 				duk_tval *tv1;
 
-				tv1 = REGP(b);
+				tv1 = REGP(bc);
 				DUK_TVAL_SET_TVAL(&tv_tmp, tv1);
 				DUK_TVAL_SET_NULL(tv1);
 				DUK_TVAL_DECREF(thr, &tv_tmp);  /* side effects */
 				break;
 			}
 
-			case DUK_EXTRAOP_LDBOOL: {
-				int b = DUK_DEC_B(ins);
-				int c = DUK_DEC_C(ins);
+			case DUK_EXTRAOP_LDTRUE:
+			case DUK_EXTRAOP_LDFALSE: {
+				int bc = DUK_DEC_BC(ins);
 				duk_tval tv_tmp;
 				duk_tval *tv1;
+				int bval = (extraop == DUK_EXTRAOP_LDTRUE ? 1 : 0);
 
-				DUK_ASSERT(c == 0 || c == 1);
-
-				tv1 = REGP(b);
+				tv1 = REGP(bc);
 				DUK_TVAL_SET_TVAL(&tv_tmp, tv1);
-				DUK_TVAL_SET_BOOLEAN(tv1, c);
+				DUK_TVAL_SET_BOOLEAN(tv1, bval);
 				DUK_TVAL_DECREF(thr, &tv_tmp);  /* side effects */
 				break;
 			}
@@ -44614,8 +50726,8 @@ int duk_js_toboolean(duk_tval *tv) {
 		/* number */
 		int c;
 		DUK_ASSERT(DUK_TVAL_IS_NUMBER(tv));
-		c = fpclassify(DUK_TVAL_GET_NUMBER(tv));  /* FIXME: portability */
-		if (c == FP_ZERO || c == FP_NAN) {
+		c = DUK_FPCLASSIFY(DUK_TVAL_GET_NUMBER(tv));
+		if (c == DUK_FP_ZERO || c == DUK_FP_NAN) {
 			return 0;
 		} else {
 			return 1;
@@ -44627,6 +50739,8 @@ int duk_js_toboolean(duk_tval *tv) {
 
 /*
  *  ToNumber()  (E5 Section 9.3)
+ *
+ *  Value to convert must be on stack top, and is popped before exit.
  *
  *  See: http://www.cs.indiana.edu/~burger/FP-Printing-PLDI96.pdf
  *       http://www.cs.indiana.edu/~burger/fp/index.html
@@ -44649,18 +50763,13 @@ int duk_js_toboolean(duk_tval *tv) {
  *
  *    - Unlike source code literals, ToNumber() coerces empty strings
  *      and strings with only whitespace to zero (not NaN).
- *
- *  FIXME: unify E5 Section 9.3.1 and main source literal syntax parsers
- *  into a shared helper, providing both (slightly different) semantics?
  */	
 
 /* E5 Section 9.3.1 */
-static double tonumber_string_raw(duk_hthread *thr, duk_hstring *h) {
+static double tonumber_string_raw(duk_hthread *thr) {
 	duk_context *ctx = (duk_context *) thr;
 	int s2n_flags;
 	double d;
-
-	duk_push_hstring(ctx, h);
 
 	/* Quite lenient, e.g. allow empty as zero, but don't allow trailing
 	 * garbage.
@@ -44692,7 +50801,7 @@ double duk_js_tonumber(duk_hthread *thr, duk_tval *tv) {
 
 	switch (DUK_TVAL_GET_TAG(tv)) {
 	case DUK_TAG_UNDEFINED: {
-		/* return a specific NAN (although not strictly necessary) */
+		/* return a specific NaN (although not strictly necessary) */
 		double d;
 		DUK_DOUBLE_SET_NAN(&d);
 		DUK_ASSERT(DUK_DOUBLE_IS_NORMALIZED(&d));
@@ -44710,7 +50819,8 @@ double duk_js_tonumber(duk_hthread *thr, duk_tval *tv) {
 	}
 	case DUK_TAG_STRING: {
 		duk_hstring *h = DUK_TVAL_GET_STRING(tv);
-		return tonumber_string_raw(thr, h);
+		duk_push_hstring(ctx, h);
+		return tonumber_string_raw(thr);
 	}
 	case DUK_TAG_OBJECT: {
 		/* Note: ToPrimitive(object,hint) == [[DefaultValue]](object,hint),
@@ -44729,16 +50839,19 @@ double duk_js_tonumber(duk_hthread *thr, duk_tval *tv) {
 		return d;
 	}
 	case DUK_TAG_BUFFER: {
-		/* FIXME: what's a good conversion?  parse contents as a string (tonumber_string_raw)? */
+		/* Coerce like a string.  This makes sense because addition also treats
+		 * buffers like strings.
+		 */
 		duk_hbuffer *h = DUK_TVAL_GET_BUFFER(tv);
-		DUK_ASSERT(h != NULL);
-		if (DUK_HBUFFER_GET_SIZE(h) > 0) {
-			return 1.0;
-		}
-		return 0.0;
+		duk_push_hbuffer(ctx, h);
+		duk_to_string(ctx, -1);  /* XXX: expensive, but numconv now expects to see a string */
+		return tonumber_string_raw(thr);
 	}
 	case DUK_TAG_POINTER: {
-		/* FIXME: what's a good conversion?  pointer as a number?  NAN? */
+		/* Coerce like boolean.  This allows code to do something like:
+		 *
+		 *    if (ptr) { ... }
+		 */
 		void *p = DUK_TVAL_GET_POINTER(tv);
 		return (p != NULL ? 1.0 : 0.0);
 	}
@@ -44758,17 +50871,17 @@ double duk_js_tonumber(duk_hthread *thr, duk_tval *tv) {
 
 /* exposed, used by e.g. duk_builtin_date.c */
 double duk_js_tointeger_number(double x) {
-	int c = fpclassify(x);
+	int c = DUK_FPCLASSIFY(x);
 
-	if (c == FP_NAN) {
+	if (c == DUK_FP_NAN) {
 		return 0.0;
-	} else if (c == FP_ZERO || c == FP_INFINITE) {
+	} else if (c == DUK_FP_ZERO || c == DUK_FP_INFINITE) {
 		/* FIXME: FP_ZERO check can be removed, the else clause handles it
 		 * correctly (preserving sign).
 		 */
 		return x;
 	} else {
-		int s = signbit(x);
+		int s = DUK_SIGNBIT(x);
 		x = floor(fabs(x));  /* truncate towards zero */
 		if (s) {
 			x = -x;
@@ -44788,16 +50901,16 @@ double duk_js_tointeger(duk_hthread *thr, duk_tval *tv) {
 
 /* combined algorithm matching E5 Sections 9.5 and 9.6 */	
 static double toint32_or_touint32_helper(double x, int is_toint32) {
-	int c = fpclassify(x);
+	int c = DUK_FPCLASSIFY(x);
 	int s;
 
-	if (c == FP_NAN || c == FP_ZERO || c == FP_INFINITE) {
+	if (c == DUK_FP_NAN || c == DUK_FP_ZERO || c == DUK_FP_INFINITE) {
 		return 0.0;
 	}
 
 
 	/* x = sign(x) * floor(abs(x)), i.e. truncate towards zero, keep sign */
-	s = signbit(x);
+	s = DUK_SIGNBIT(x);
 	x = floor(fabs(x));
 	if (s) {
 		x = -x;
@@ -44828,7 +50941,7 @@ static double toint32_or_touint32_helper(double x, int is_toint32) {
 duk_i32 duk_js_toint32(duk_hthread *thr, duk_tval *tv) {
 	double d = duk_js_tonumber(thr, tv);  /* invalidates tv */
 	d = toint32_or_touint32_helper(d, 1);
-	DUK_ASSERT(fpclassify(d) == FP_ZERO || fpclassify(d) == FP_NORMAL);
+	DUK_ASSERT(DUK_FPCLASSIFY(d) == DUK_FP_ZERO || DUK_FPCLASSIFY(d) == DUK_FP_NORMAL);
 	DUK_ASSERT(d >= -2147483648.0 && d <= 2147483647.0);  /* [-0x80000000,0x7fffffff] */
 	DUK_ASSERT(d == ((double) ((duk_i32) d)));  /* whole, won't clip */
 	return (duk_i32) d;
@@ -44838,7 +50951,7 @@ duk_i32 duk_js_toint32(duk_hthread *thr, duk_tval *tv) {
 duk_u32 duk_js_touint32(duk_hthread *thr, duk_tval *tv) {
 	double d = duk_js_tonumber(thr, tv);  /* invalidates tv */
 	d = toint32_or_touint32_helper(d, 0);
-	DUK_ASSERT(fpclassify(d) == FP_ZERO || fpclassify(d) == FP_NORMAL);
+	DUK_ASSERT(DUK_FPCLASSIFY(d) == DUK_FP_ZERO || DUK_FPCLASSIFY(d) == DUK_FP_NORMAL);
 	DUK_ASSERT(d >= 0.0 && d <= 4294967295.0);  /* [0x00000000, 0xffffffff] */
 	DUK_ASSERT(d == ((double) ((duk_u32) d)));  /* whole, won't clip */
 	return (duk_u32) d;
@@ -44933,16 +51046,16 @@ int duk_js_iscallable(duk_tval *tv_x) {
  */
 
 int duk_js_equals_number(double x, double y) {
-	int cx = fpclassify(x);
-	int cy = fpclassify(y);
+	int cx = DUK_FPCLASSIFY(x);
+	int cy = DUK_FPCLASSIFY(y);
 
-	if (cx == FP_NAN || cy == FP_NAN) {
+	if (cx == DUK_FP_NAN || cy == DUK_FP_NAN) {
 		return 0;
 	}
 
 	/* FIXME: optimize */
 
-	if (cx == FP_ZERO && cy == FP_ZERO) {
+	if (cx == DUK_FP_ZERO && cy == DUK_FP_ZERO) {
 		return 1;
 	}
 
@@ -44953,20 +51066,21 @@ int duk_js_equals_number(double x, double y) {
 	return 0;
 }
 
-/* E5 Section 11.9.3 */
+/* E5 Section 11.9.3. */
 int duk_js_equals(duk_hthread *thr, duk_tval *tv_x, duk_tval *tv_y) {
 	duk_context *ctx = (duk_context *) thr;
+	duk_tval *tv_tmp;
 
 	/*
-	 *  FIXME: very direct translation now - should be made more
-	 *  efficient, avoid recursion, etc.
+	 *  XXX: very direct translation now - should be made more efficient,
+	 *  avoid recursion, etc.
 	 */
 
 	/*
 	 *  Same type?
 	 *
-	 *  Note: since number values have no explicit tag, need the awkward
-	 *  if + switch.
+	 *  Note: since number values have no explicit tag in the 8-byte
+	 *  representation, need the awkward if + switch.
 	 */
 
 	if (DUK_TVAL_IS_NUMBER(tv_x) && DUK_TVAL_IS_NUMBER(tv_y)) {
@@ -44987,13 +51101,34 @@ int duk_js_equals(duk_hthread *thr, duk_tval *tv_x, duk_tval *tv_y) {
 			return DUK_TVAL_GET_POINTER(tv_x) == DUK_TVAL_GET_POINTER(tv_y);
 		}
 		case DUK_TAG_STRING:
-		case DUK_TAG_OBJECT:
-		case DUK_TAG_BUFFER: {
+		case DUK_TAG_OBJECT: {
 			/* heap pointer comparison suffices */
 			return DUK_TVAL_GET_HEAPHDR(tv_x) == DUK_TVAL_GET_HEAPHDR(tv_y);
 		}
+		case DUK_TAG_BUFFER: {
+			/* non-strict equality for buffers compares contents */
+			duk_hbuffer *h_x = DUK_TVAL_GET_BUFFER(tv_x);
+			duk_hbuffer *h_y = DUK_TVAL_GET_BUFFER(tv_y);
+			size_t len_x = DUK_HBUFFER_GET_SIZE(h_x);
+			size_t len_y = DUK_HBUFFER_GET_SIZE(h_y);
+			void *buf_x;
+			void *buf_y;
+			if (len_x != len_y) {
+				return 0;
+			}
+			buf_x = (void *) DUK_HBUFFER_GET_DATA_PTR(h_x);
+			buf_y = (void *) DUK_HBUFFER_GET_DATA_PTR(h_y);
+			/* if len_x == len_y == 0, buf_x and/or buf_y may
+			 * be NULL, but that's OK.
+			 */
+			DUK_ASSERT(len_x == len_y);
+			DUK_ASSERT(len_x == 0 || buf_x != NULL);
+			DUK_ASSERT(len_y == 0 || buf_y != NULL);
+			return (DUK_MEMCMP(buf_x, buf_y, len_x) == 0) ? 1 : 0;
+		}
 		default: {
 			DUK_ASSERT(DUK_TVAL_IS_NUMBER(tv_x));
+			DUK_ASSERT(DUK_TVAL_IS_NUMBER(tv_y));
 			DUK_NEVER_HERE();
 			return 0;
 		}
@@ -45002,71 +51137,93 @@ int duk_js_equals(duk_hthread *thr, duk_tval *tv_x, duk_tval *tv_y) {
 
 	/*
 	 *  Types are different; various cases
+	 *
+	 *  Since comparison is symmetric, we use a "swap trick" to reduce
+	 *  code size.
 	 */
 
-	/* undefined/null are considered equal (e.g. "null == undefined" -> true) */
+	/* Undefined/null are considered equal (e.g. "null == undefined" -> true). */
 	if ((DUK_TVAL_IS_UNDEFINED(tv_x) && DUK_TVAL_IS_NULL(tv_y)) ||
 	    (DUK_TVAL_IS_NULL(tv_x) && DUK_TVAL_IS_UNDEFINED(tv_y))) {
 		return 1;
 	}
 
-	/* number/string -> coerce string to number (e.g. "'1.5' == 1.5" -> true) */
-	if (DUK_TVAL_IS_NUMBER(tv_x) && DUK_TVAL_IS_STRING(tv_y)) {
-		/* FIXME: this is possible without resorting to the value stack */
-		double d1, d2;
-		d1 = DUK_TVAL_GET_NUMBER(tv_x);
-		duk_push_tval(ctx, tv_y);
-		duk_to_number(ctx, -1);
-		d2 = duk_require_number(ctx, -1);
-		duk_pop(ctx);
-		return duk_js_equals_number(d1, d2);
+	/* Number/string-or-buffer -> coerce string to number (e.g. "'1.5' == 1.5" -> true). */
+	if (DUK_TVAL_IS_NUMBER(tv_x) && (DUK_TVAL_IS_STRING(tv_y) || DUK_TVAL_IS_BUFFER(tv_y))) {
+		/* the next 'if' is guaranteed to match after swap */
+		tv_tmp = tv_x;
+		tv_x = tv_y;
+		tv_y = tv_tmp;
 	}
-	if (DUK_TVAL_IS_STRING(tv_x) && DUK_TVAL_IS_NUMBER(tv_y)) {
+	if ((DUK_TVAL_IS_STRING(tv_x) || DUK_TVAL_IS_BUFFER(tv_x)) && DUK_TVAL_IS_NUMBER(tv_y)) {
 		/* FIXME: this is possible without resorting to the value stack */
 		double d1, d2;
 		d2 = DUK_TVAL_GET_NUMBER(tv_y);
 		duk_push_tval(ctx, tv_x);
+		duk_to_string(ctx, -1);  /* buffer values are coerced first to string here */
 		duk_to_number(ctx, -1);
 		d1 = duk_require_number(ctx, -1);
 		duk_pop(ctx);
 		return duk_js_equals_number(d1, d2);
 	}
 
-	/* boolean/(any) -> coerce boolean to number and try again */
+	/* Buffer/string -> compare contents. */
+	if (DUK_TVAL_IS_BUFFER(tv_x) && DUK_TVAL_IS_STRING(tv_y)) {
+		tv_tmp = tv_x;
+		tv_x = tv_y;
+		tv_y = tv_tmp;
+	}
+	if (DUK_TVAL_IS_STRING(tv_x) && DUK_TVAL_IS_BUFFER(tv_y)) {
+		duk_hstring *h_x = DUK_TVAL_GET_STRING(tv_x);
+		duk_hbuffer *h_y = DUK_TVAL_GET_BUFFER(tv_y);
+		size_t len_x = DUK_HSTRING_GET_BYTELEN(h_x);
+		size_t len_y = DUK_HBUFFER_GET_SIZE(h_y);
+		void *buf_x;
+		void *buf_y;
+		if (len_x != len_y) {
+			return 0;
+		}
+		buf_x = (void *) DUK_HSTRING_GET_DATA(h_x);
+		buf_y = (void *) DUK_HBUFFER_GET_DATA_PTR(h_y);
+		/* if len_x == len_y == 0, buf_x and/or buf_y may
+		 * be NULL, but that's OK.
+		 */
+		DUK_ASSERT(len_x == len_y);
+		DUK_ASSERT(len_x == 0 || buf_x != NULL);
+		DUK_ASSERT(len_y == 0 || buf_y != NULL);
+		return (DUK_MEMCMP(buf_x, buf_y, len_x) == 0) ? 1 : 0;
+	}
+
+	/* Boolean/any -> coerce boolean to number and try again.  If boolean is
+	 * compared to a pointer, the final comparison after coercion now always
+	 * yields false (as pointer vs. number compares to false), but this is
+	 * not special cased.
+	 */
 	if (DUK_TVAL_IS_BOOLEAN(tv_x)) {
-		/* FIXME: ToNumber(bool) is +1.0 or 0.0 -> make faster */
-		int rc;
-		duk_push_tval(ctx, tv_x);
-		duk_push_tval(ctx, tv_y);
-		duk_to_number(ctx, -2);
-		rc = duk_js_equals(thr, duk_get_tval(ctx, -2), duk_get_tval(ctx, -1));
-		duk_pop_2(ctx);
-		return rc;
+		tv_tmp = tv_x;
+		tv_x = tv_y;
+		tv_y = tv_tmp;
 	}
 	if (DUK_TVAL_IS_BOOLEAN(tv_y)) {
-		/* FIXME: ToNumber(bool) is +1.0 or 0.0 -> make faster */
+		/* ToNumber(bool) is +1.0 or 0.0.  Tagged boolean value is always 0 or 1. */
 		int rc;
+		DUK_ASSERT(DUK_TVAL_GET_BOOLEAN(tv_y) == 0 || DUK_TVAL_GET_BOOLEAN(tv_y) == 1);
 		duk_push_tval(ctx, tv_x);
-		duk_push_tval(ctx, tv_y);
-		duk_to_number(ctx, -1);
+		duk_push_int(ctx, DUK_TVAL_GET_BOOLEAN(tv_y));
 		rc = duk_js_equals(thr, duk_get_tval(ctx, -2), duk_get_tval(ctx, -1));
 		duk_pop_2(ctx);
 		return rc;
 	}
 
-	/* string-or-number/object -> coerce object to primitive (apparently without hint), then try again */
-	if ((DUK_TVAL_IS_STRING(tv_x) || DUK_TVAL_IS_NUMBER(tv_x)) &&
+	/* String-number-buffer/object -> coerce object to primitive (apparently without hint), then try again. */
+	if ((DUK_TVAL_IS_STRING(tv_x) || DUK_TVAL_IS_NUMBER(tv_x) || DUK_TVAL_IS_BUFFER(tv_x)) &&
 	    DUK_TVAL_IS_OBJECT(tv_y)) {
-		int rc;
-		duk_push_tval(ctx, tv_x);
-		duk_push_tval(ctx, tv_y);
-		duk_to_primitive(ctx, -1, DUK_HINT_NONE);  /* apparently no hint? */
-		rc = duk_js_equals(thr, duk_get_tval(ctx, -2), duk_get_tval(ctx, -1));
-		duk_pop_2(ctx);
-		return rc;
+		tv_tmp = tv_x;
+		tv_x = tv_y;
+		tv_y = tv_tmp;
 	}
 	if (DUK_TVAL_IS_OBJECT(tv_x) &&
-	    (DUK_TVAL_IS_STRING(tv_y) || DUK_TVAL_IS_NUMBER(tv_y))) {
+	    (DUK_TVAL_IS_STRING(tv_y) || DUK_TVAL_IS_NUMBER(tv_y) || DUK_TVAL_IS_BUFFER(tv_y))) {
 		int rc;
 		duk_push_tval(ctx, tv_x);
 		duk_push_tval(ctx, tv_y);
@@ -45076,9 +51233,7 @@ int duk_js_equals(duk_hthread *thr, duk_tval *tv_x, duk_tval *tv_y) {
 		return rc;
 	}
 
-	/* FIXME: coercion rules for internal types */
-
-	/* nothing worked -> not equal */
+	/* Nothing worked -> not equal. */
 	return 0;
 }
 
@@ -45134,23 +51289,23 @@ int duk_js_strict_equals(duk_tval *tv_x, duk_tval *tv_y) {
 
 /* E5 Section 9.12 */
 int duk_js_samevalue_number(double x, double y) {
-	int cx = fpclassify(x);
-	int cy = fpclassify(y);
+	int cx = DUK_FPCLASSIFY(x);
+	int cy = DUK_FPCLASSIFY(y);
 
-	if (cx == FP_NAN && cy == FP_NAN) {
+	if (cx == DUK_FP_NAN && cy == DUK_FP_NAN) {
 		/* SameValue(NaN, NaN) = true, regardless of NaN sign or extra bits */
 		return 1;
 	}
 
-	if (cx == FP_ZERO && cy == FP_ZERO) {
+	if (cx == DUK_FP_ZERO && cy == DUK_FP_ZERO) {
 		/* Note: cannot assume that a non-zero return value of signbit() would
 		 * always be the same -- hence cannot (portably) use something like:
 		 *
 		 *     signbit(x) == signbit(y)
 		 */
 
-		int sx = (signbit(x) ? 1 : 0);
-		int sy = (signbit(y) ? 1 : 0);
+		int sx = (DUK_SIGNBIT(x) ? 1 : 0);
+		int sy = (DUK_SIGNBIT(y) ? 1 : 0);
 
 		return (sx == sy);
 	}
@@ -45246,21 +51401,18 @@ int duk_js_string_compare(duk_hstring *h1, duk_hstring *h2) {
 	h2_len = DUK_HSTRING_GET_BYTELEN(h2);
 	prefix_len = (h1_len <= h2_len ? h1_len : h2_len);
 
+	/* FIXME: this special case can now be removed with DUK_MEMCMP */
 	/* memcmp() should return zero (equal) for zero length, but avoid
 	 * it because there are some platform specific bugs.  Don't use
 	 * strncmp() because it stops comparing at a NUL.
 	 */
 
-	/* FIXME: use a wrapper utility memcmp() instead of doing the zero
-	 * check everywhere separately.
-	 */
-
 	if (prefix_len == 0) {
 		rc = 0;
 	} else {
-		rc = memcmp((const char *) DUK_HSTRING_GET_DATA(h1),
-		            (const char *) DUK_HSTRING_GET_DATA(h2),
-		            prefix_len);
+		rc = DUK_MEMCMP((const char *) DUK_HSTRING_GET_DATA(h1),
+		                (const char *) DUK_HSTRING_GET_DATA(h2),
+		                prefix_len);
 	}
 
 	if (rc < 0) {
@@ -45328,16 +51480,16 @@ int duk_js_compare_helper(duk_hthread *thr, duk_tval *tv_x, duk_tval *tv_y, int 
 			d1 = duk_to_number(ctx, -2);
 		}
 
-		c1 = fpclassify(d1);
-		s1 = signbit(d1);
-		c2 = fpclassify(d2);
-		s2 = signbit(d2);
+		c1 = DUK_FPCLASSIFY(d1);
+		s1 = DUK_SIGNBIT(d1);
+		c2 = DUK_FPCLASSIFY(d2);
+		s2 = DUK_SIGNBIT(d2);
 
-		if (c1 == FP_NAN || c2 == FP_NAN) {
+		if (c1 == DUK_FP_NAN || c2 == DUK_FP_NAN) {
 			goto lt_undefined;
 		}
 
-		if (c1 == FP_ZERO && c2 == FP_ZERO) {
+		if (c1 == DUK_FP_ZERO && c2 == DUK_FP_ZERO) {
 			/* For all combinations: +0 < +0, +0 < -0, -0 < +0, -0 < -0,
 			 * steps e, f, and g.
 			 */
@@ -45348,22 +51500,22 @@ int duk_js_compare_helper(duk_hthread *thr, duk_tval *tv_x, duk_tval *tv_y, int 
 			goto lt_false;
 		}
 
-		if (c1 == FP_INFINITE && s1 == 0) {
+		if (c1 == DUK_FP_INFINITE && s1 == 0) {
 			/* x == +Infinity */
 			goto lt_false;
 		}
 
-		if (c2 == FP_INFINITE && s2 == 0) {
+		if (c2 == DUK_FP_INFINITE && s2 == 0) {
 			/* y == +Infinity */
 			goto lt_true;
 		}
 
-		if (c2 == FP_INFINITE && s2 != 0) {
+		if (c2 == DUK_FP_INFINITE && s2 != 0) {
 			/* y == -Infinity */
 			goto lt_false;
 		}
 
-		if (c1 == FP_INFINITE && s1 != 0) {
+		if (c1 == DUK_FP_INFINITE && s1 != 0) {
 			/* x == -Infinity */
 			goto lt_true;
 		}
@@ -45652,7 +51804,7 @@ duk_hstring *duk_js_typeof(duk_hthread *thr, duk_tval *tv_x) {
 	}
 	case DUK_TAG_POINTER: {
 		/* implementation specific */
-		idx = DUK_STRIDX_POINTER;
+		idx = DUK_STRIDX_LC_POINTER;
 		break;
 	}
 	case DUK_TAG_STRING: {
@@ -45671,7 +51823,7 @@ duk_hstring *duk_js_typeof(duk_hthread *thr, duk_tval *tv_x) {
 	}
 	case DUK_TAG_BUFFER: {
 		/* implementation specific */
-		idx = DUK_STRIDX_BUFFER;
+		idx = DUK_STRIDX_LC_BUFFER;
 		break;
 	}
 	default: {
@@ -45706,7 +51858,7 @@ static int raw_string_to_arrayindex(duk_u8 *str, duk_u32 blen, duk_u32 *out_idx)
 	if (blen > 10) {
 		return 0;
 	}
-	memcpy(buf, str, blen);
+	DUK_MEMCPY(buf, str, blen);
 	buf[blen] = (char) 0;
 
 	if (sscanf(buf, "%d", (int *) out_idx) == 1 && strstr(buf, ".") == NULL) {
@@ -45876,10 +52028,10 @@ void duk_js_push_closure(duk_hthread *thr,
 	duk_hcompiledfunction *fun_clos;
 	duk_u16 proplist[] = { DUK_STRIDX_INT_VARMAP,
 	                       DUK_STRIDX_INT_FORMALS,
-	                       DUK_STRIDX_INT_SOURCE,
 	                       DUK_STRIDX_NAME,
 	                       DUK_STRIDX_INT_PC2LINE,
-	                       DUK_STRIDX_INT_FILENAME };  /* order: most frequent to least frequent */
+	                       DUK_STRIDX_FILE_NAME,
+	                       DUK_STRIDX_INT_SOURCE };  /* order: most frequent to least frequent */
 	int i;
 	duk_u32 len_value;
 
@@ -46143,6 +52295,8 @@ void duk_js_push_closure(duk_hthread *thr,
 	 *  For Rhino and smjs it is non-writable, non-enumerable, and non-configurable;
 	 *  for V8 it is writable, non-enumerable, non-configurable.  It is also defined
 	 *  for an anonymous function expression in which case the value is an empty string.
+	 *  We could also leave name 'undefined' for anonymous functions but that would
+	 *  differ from behavior of other engines, so use an empty string.
 	 *
 	 *  FIXME: make optional?  costs something per function.
 	 */
@@ -46207,7 +52361,7 @@ duk_hobject *duk_create_activation_environment_record(duk_hthread *thr,
 	DUK_ASSERT(thr != NULL);
 	DUK_ASSERT(func != NULL);
 
-	tv = duk_hobject_find_existing_entry_tval_ptr(func, DUK_HEAP_STRING_INT_LEXENV(thr));
+	tv = duk_hobject_find_existing_entry_tval_ptr(func, DUK_HTHREAD_STRING_INT_LEXENV(thr));
 	if (tv) {
 		DUK_ASSERT(DUK_TVAL_IS_OBJECT(tv));
 		DUK_ASSERT(DUK_HOBJECT_IS_ENV(DUK_TVAL_GET_OBJECT(tv)));
@@ -46471,12 +52625,12 @@ static int get_identifier_open_decl_env_regs(duk_hthread *thr,
 
 	DUK_ASSERT(DUK_HOBJECT_IS_DECENV(env));
 
-	tv = duk_hobject_find_existing_entry_tval_ptr(env, DUK_HEAP_STRING_INT_CALLEE(thr));
+	tv = duk_hobject_find_existing_entry_tval_ptr(env, DUK_HTHREAD_STRING_INT_CALLEE(thr));
 	if (!tv) {
 		/* env is closed, should be missing _callee, _thread, _regbase */
-		DUK_ASSERT(duk_hobject_find_existing_entry_tval_ptr(env, DUK_HEAP_STRING_INT_CALLEE(thr)) == NULL);
-		DUK_ASSERT(duk_hobject_find_existing_entry_tval_ptr(env, DUK_HEAP_STRING_INT_THREAD(thr)) == NULL);
-		DUK_ASSERT(duk_hobject_find_existing_entry_tval_ptr(env, DUK_HEAP_STRING_INT_REGBASE(thr)) == NULL);
+		DUK_ASSERT(duk_hobject_find_existing_entry_tval_ptr(env, DUK_HTHREAD_STRING_INT_CALLEE(thr)) == NULL);
+		DUK_ASSERT(duk_hobject_find_existing_entry_tval_ptr(env, DUK_HTHREAD_STRING_INT_THREAD(thr)) == NULL);
+		DUK_ASSERT(duk_hobject_find_existing_entry_tval_ptr(env, DUK_HTHREAD_STRING_INT_REGBASE(thr)) == NULL);
 		return 0;
 	}
 
@@ -46502,7 +52656,7 @@ static int get_identifier_open_decl_env_regs(duk_hthread *thr,
 	reg_rel = DUK_TVAL_GET_NUMBER(tv);
 	DUK_ASSERT(reg_rel >= 0 && reg_rel < ((duk_hcompiledfunction *) env_func)->nregs);
 
-	tv = duk_hobject_find_existing_entry_tval_ptr(env, DUK_HEAP_STRING_INT_THREAD(thr));
+	tv = duk_hobject_find_existing_entry_tval_ptr(env, DUK_HTHREAD_STRING_INT_THREAD(thr));
 	DUK_ASSERT(tv != NULL);
 	DUK_ASSERT(DUK_TVAL_IS_OBJECT(tv));
 	DUK_ASSERT(DUK_TVAL_GET_OBJECT(tv) != NULL);
@@ -46514,7 +52668,7 @@ static int get_identifier_open_decl_env_regs(duk_hthread *thr,
 	 * with what thread is used for valstack lookup.
 	 */
 
-	tv = duk_hobject_find_existing_entry_tval_ptr(env, DUK_HEAP_STRING_INT_REGBASE(thr));
+	tv = duk_hobject_find_existing_entry_tval_ptr(env, DUK_HTHREAD_STRING_INT_REGBASE(thr));
 	DUK_ASSERT(tv != NULL);
 	DUK_ASSERT(DUK_TVAL_IS_NUMBER(tv));
 	env_regbase = DUK_TVAL_GET_NUMBER(tv);
@@ -46762,7 +52916,7 @@ static int get_identifier_reference(duk_hthread *thr,
 
 			DUK_ASSERT(cl == DUK_HOBJECT_CLASS_OBJENV);
 
-			tv = duk_hobject_find_existing_entry_tval_ptr(env, DUK_HEAP_STRING_INT_TARGET(thr));
+			tv = duk_hobject_find_existing_entry_tval_ptr(env, DUK_HTHREAD_STRING_INT_TARGET(thr));
 			DUK_ASSERT(tv != NULL);
 			DUK_ASSERT(DUK_TVAL_IS_OBJECT(tv));
 			target = DUK_TVAL_GET_OBJECT(tv);
@@ -46779,7 +52933,7 @@ static int get_identifier_reference(duk_hthread *thr,
 			if (duk_hobject_hasprop_raw(thr, target, name)) {
 				out->value = NULL;  /* can't get value, may be accessor */
 
-				tv = duk_hobject_find_existing_entry_tval_ptr(env, DUK_HEAP_STRING_INT_THIS(thr));
+				tv = duk_hobject_find_existing_entry_tval_ptr(env, DUK_HTHREAD_STRING_INT_THIS(thr));
 				out->this_binding = tv;  /* may be NULL */
 
 				out->env = env;
@@ -46885,7 +53039,7 @@ static int getvar_helper(duk_hthread *thr,
                          duk_hobject *env,
                          duk_activation *act,
                          duk_hstring *name,
-                         int throw) {
+                         int throw_flag) {
 	duk_context *ctx = (duk_context *) thr;
 	duk_id_lookup_result ref;
 	duk_tval tv_tmp_obj;
@@ -46934,7 +53088,7 @@ static int getvar_helper(duk_hthread *thr,
 
 		return 1;
 	} else {
-		if (throw) {
+		if (throw_flag) {
 			DUK_ERROR(thr, DUK_ERR_REFERENCE_ERROR,
 			          "identifier '%s' undefined",
 			          (char *) DUK_HSTRING_GET_DATA(name));
@@ -46947,16 +53101,16 @@ static int getvar_helper(duk_hthread *thr,
 int duk_js_getvar_envrec(duk_hthread *thr,
                          duk_hobject *env,
                          duk_hstring *name,
-                         int throw) {
-	return getvar_helper(thr, env, NULL, name, throw);
+                         int throw_flag) {
+	return getvar_helper(thr, env, NULL, name, throw_flag);
 }
 
 int duk_js_getvar_activation(duk_hthread *thr,
                              duk_activation *act,
                              duk_hstring *name,
-                             int throw) {
+                             int throw_flag) {
 	DUK_ASSERT(act != NULL);
-	return getvar_helper(thr, act->lex_env, act, name, throw);
+	return getvar_helper(thr, act->lex_env, act, name, throw_flag);
 }
 
 /*
@@ -47403,7 +53557,7 @@ static int declvar_helper(duk_hthread *thr,
 	} else {
 		DUK_ASSERT(DUK_HOBJECT_IS_OBJENV(env));
 
-		tv = duk_hobject_find_existing_entry_tval_ptr(env, DUK_HEAP_STRING_INT_TARGET(thr));
+		tv = duk_hobject_find_existing_entry_tval_ptr(env, DUK_HTHREAD_STRING_INT_TARGET(thr));
 		DUK_ASSERT(tv != NULL);
 		DUK_ASSERT(DUK_TVAL_IS_OBJECT(tv));
 		holder = DUK_TVAL_GET_OBJECT(tv);
@@ -47836,7 +53990,7 @@ static void internbuffer(duk_lexer_ctx *lex_ctx, int valstack_idx) {
 void duk_lexer_initctx(duk_lexer_ctx *lex_ctx) {
 	DUK_ASSERT(lex_ctx != NULL);
 
-	memset(lex_ctx, 0, sizeof(*lex_ctx));
+	DUK_MEMSET(lex_ctx, 0, sizeof(*lex_ctx));
 #ifdef DUK_USE_EXPLICIT_NULL_INIT
 	lex_ctx->thr = NULL;
 	lex_ctx->input = NULL;
@@ -47989,7 +54143,7 @@ static void parse_input_element_raw(duk_lexer_ctx *lex_ctx,
 
 	out_token->t = DUK_TOK_EOF;
 	out_token->t_nores = -1;	/* marker: copy t if not changed */
-	out_token->num = NAN;
+	out_token->num = DUK_DOUBLE_NAN;
 	out_token->str1 = NULL;
 	out_token->str2 = NULL;
 	out_token->num_escapes = 0;
@@ -48542,7 +54696,7 @@ static void parse_input_element_raw(duk_lexer_ctx *lex_ctx,
 		duk_dup((duk_context *) lex_ctx->thr, lex_ctx->slot1_idx);
 		duk_numconv_parse((duk_context *) lex_ctx->thr, 10 /*radix*/, s2n_flags);
 		val = duk_to_number((duk_context *) lex_ctx->thr, -1);
-		if (isnan(val)) {
+		if (DUK_ISNAN(val)) {
 			DUK_ERROR(lex_ctx->thr, DUK_ERR_SYNTAX_ERROR, "invalid numeric literal");
 		}
 		duk_replace((duk_context *) lex_ctx->thr, lex_ctx->slot1_idx);  /* FIXME: or pop? */
@@ -48789,7 +54943,7 @@ void duk_lexer_parse_re_token(duk_lexer_ctx *lex_ctx, duk_re_token *out_token) {
 	int advtok = 0;  /* init is unnecessary but suppresses "may be used uninitialized" warnings */
 	int x, y;
 
-	memset(out_token, 0, sizeof(*out_token));
+	DUK_MEMSET(out_token, 0, sizeof(*out_token));
 
 	x = L0();
 	y = L1();
@@ -49387,12 +55541,12 @@ static void bi_print(const char *name, duk_bigint *x) {
 	char *p = buf;
 	int i;
 
-	p += sprintf(p, "%p n=%d", (void *) x, x->n);
+	p += DUK_SPRINTF(p, "%p n=%d", (void *) x, x->n);
 	if (x->n == 0) {
-		p += sprintf(p, " 0");
+		p += DUK_SPRINTF(p, " 0");
 	}
 	for (i = x->n - 1; i >= 0; i--) {
-		p += sprintf(p, " %08x", (unsigned int) x->v[i]);
+		p += DUK_SPRINTF(p, " %08x", (unsigned int) x->v[i]);
 	}
 
 	DUK_DDDPRINT("%s: %s", name, buf);
@@ -49430,7 +55584,7 @@ static void bi_copy(duk_bigint *x, duk_bigint *y) {
 	if (n == 0) {
 		return;
 	}
-	memcpy((void *) x->v, (void *) y->v, (size_t) (sizeof(uint32_t) * n));
+	DUK_MEMCPY((void *) x->v, (void *) y->v, (size_t) (sizeof(uint32_t) * n));
 }
 
 static void bi_set_small(duk_bigint *x, uint32_t v) {
@@ -49485,6 +55639,7 @@ static int bi_compare(duk_bigint *x, duk_bigint *y) {
 }
 
 /* x <- y + z */
+#ifdef DUK_USE_64BIT_OPS
 static void bi_add(duk_bigint *x, duk_bigint *y, duk_bigint *z) {
 	uint64_t tmp;
 	int i, ny, nz;
@@ -49519,6 +55674,58 @@ static void bi_add(duk_bigint *x, duk_bigint *y, duk_bigint *z) {
 	/* no need to normalize */
 	DUK_ASSERT(bi_is_valid(x));
 }
+#else  /* DUK_USE_64BIT_OPS */
+static void bi_add(duk_bigint *x, duk_bigint *y, duk_bigint *z) {
+	uint32_t carry, tmp1, tmp2;
+	int i, ny, nz;
+
+	DUK_ASSERT(bi_is_valid(y));
+	DUK_ASSERT(bi_is_valid(z));
+
+	if (z->n > y->n) {
+		duk_bigint *t;
+		t = y; y = z; z = t;
+	}
+	DUK_ASSERT(y->n >= z->n);
+
+	ny = y->n; nz = z->n;
+	carry = 0;
+	for (i = 0; i < ny; i++) {
+		/* Carry is detected based on wrapping which relies on exact 32-bit
+		 * types.
+		 */
+		DUK_ASSERT(i < BI_MAX_PARTS);
+		tmp1 = y->v[i];
+		tmp2 = tmp1;
+		if (i < nz) {
+			tmp2 += z->v[i];
+		}
+
+		/* Careful with carry condition:
+		 *  - If carry not added: 0x12345678 + 0 + 0xffffffff = 0x12345677 (< 0x12345678)
+		 *  - If carry added:     0x12345678 + 1 + 0xffffffff = 0x12345678 (== 0x12345678)
+		 */
+		if (carry) {
+			tmp2++;
+			carry = (tmp2 <= tmp1 ? 1 : 0);
+		} else {
+			carry = (tmp2 < tmp1 ? 1 : 0);
+		}
+
+		x->v[i] = tmp2;
+	}
+	if (carry) {
+		DUK_ASSERT(i < BI_MAX_PARTS);
+		DUK_ASSERT(carry == 1);
+		x->v[i++] = carry;
+	}
+	x->n = i;
+	DUK_ASSERT(x->n <= BI_MAX_PARTS);
+
+	/* no need to normalize */
+	DUK_ASSERT(bi_is_valid(x));
+}
+#endif  /* DUK_USE_64BIT_OPS */
 
 /* x <- y + z */
 static void bi_add_small(duk_bigint *x, duk_bigint *y, uint32_t z) {
@@ -49542,6 +55749,7 @@ static void bi_add_copy(duk_bigint *x, duk_bigint *y, duk_bigint *t) {
 #endif
 
 /* x <- y - z, require x >= y => z >= 0, i.e. y >= z */
+#ifdef DUK_USE_64BIT_OPS
 static void bi_sub(duk_bigint *x, duk_bigint *y, duk_bigint *z) {
 	int ny, nz;
 	int i;
@@ -49572,6 +55780,49 @@ static void bi_sub(duk_bigint *x, duk_bigint *y, duk_bigint *z) {
 	bi_normalize(x);  /* need to normalize, may even cancel to 0 */
 	DUK_ASSERT(bi_is_valid(x));
 }
+#else
+static void bi_sub(duk_bigint *x, duk_bigint *y, duk_bigint *z) {
+	int ny, nz;
+	int i;
+	uint32_t tmp1, tmp2, borrow;
+
+	DUK_ASSERT(bi_is_valid(y));
+	DUK_ASSERT(bi_is_valid(z));
+	DUK_ASSERT(bi_compare(y, z) >= 0);
+	DUK_ASSERT(y->n >= z->n);
+
+	ny = y->n; nz = z->n;
+	borrow = 0;
+	for (i = 0; i < ny; i++) {
+		/* Borrow is detected based on wrapping which relies on exact 32-bit
+		 * types.
+		 */
+		tmp1 = y->v[i];
+		tmp2 = tmp1;
+		if (i < nz) {
+			tmp2 -= z->v[i];
+		}
+
+		/* Careful with borrow condition:
+		 *  - If borrow not subtracted: 0x12345678 - 0 - 0xffffffff = 0x12345679 (> 0x12345678)
+		 *  - If borrow subtracted:     0x12345678 - 1 - 0xffffffff = 0x12345678 (== 0x12345678)
+		 */
+		if (borrow) {
+			tmp2--;
+			borrow = (tmp2 >= tmp1 ? 1 : 0);
+		} else {
+			borrow = (tmp2 > tmp1 ? 1 : 0);
+		}
+
+		x->v[i] = tmp2;
+	}
+	DUK_ASSERT(borrow == 0);
+
+	x->n = i;
+	bi_normalize(x);  /* need to normalize, may even cancel to 0 */
+	DUK_ASSERT(bi_is_valid(x));
+}
+#endif
 
 #if 0  /* unused */
 /* x <- y - z */
@@ -49597,7 +55848,6 @@ static void bi_sub_copy(duk_bigint *x, duk_bigint *y, duk_bigint *t) {
 /* x <- y * z */
 static void bi_mul(duk_bigint *x, duk_bigint *y, duk_bigint *z) {
 	int i, j, nx, nz;
-	uint64_t tmp;
 
 	DUK_ASSERT(bi_is_valid(y));
 	DUK_ASSERT(bi_is_valid(z));
@@ -49613,12 +55863,13 @@ static void bi_mul(duk_bigint *x, duk_bigint *y, duk_bigint *z) {
 		return;
 	}
 
-	memset((void *) x->v, 0, (size_t) (sizeof(uint32_t) * nx));
+	DUK_MEMSET((void *) x->v, 0, (size_t) (sizeof(uint32_t) * nx));
 	x->n = nx;
 
 	nz = z->n;
 	for (i = 0; i < y->n; i++) {
-		tmp = 0;
+#ifdef DUK_USE_64BIT_OPS
+		uint64_t tmp = 0;
 		for (j = 0; j < nz; j++) {
 			tmp += (uint64_t) y->v[i] * (uint64_t) z->v[j] + x->v[i+j];
 			x->v[i+j] = (uint32_t) (tmp & 0xffffffffU);
@@ -49627,8 +55878,78 @@ static void bi_mul(duk_bigint *x, duk_bigint *y, duk_bigint *z) {
 		if (tmp > 0) {
 			DUK_ASSERT(i + j < nx);
 			DUK_ASSERT(i + j < BI_MAX_PARTS);
-			x->v[i+j] += (uint32_t) tmp;
+			DUK_ASSERT(x->v[i+j] == 0);
+			x->v[i+j] = (uint32_t) tmp;
 		}
+#else
+		/*
+		 *  Multiply + add + carry for 32-bit components using only 16x16->32
+		 *  multiplies and carry detection based on unsigned overflow.
+		 *
+		 *    1st mult, 32-bit: (A*2^16 + B)
+		 *    2nd mult, 32-bit: (C*2^16 + D)
+		 *    3rd add, 32-bit: E
+		 *    4th add, 32-bit: F
+		 *
+		 *      (AC*2^16 + B) * (C*2^16 + D) + E + F
+		 *    = AC*2^32 + AD*2^16 + BC*2^16 + BD + E + F
+		 *    = AC*2^32 + (AD + BC)*2^16 + (BD + E + F)
+		 *    = AC*2^32 + AD*2^16 + BC*2^16 + (BD + E + F)
+		 */
+		uint32_t a, b, c, d, e, f;
+		uint32_t r, s, t;
+
+		a = y->v[i]; b = a & 0xffff; a = a >> 16;
+
+		f = 0;
+		for (j = 0; j < nz; j++) {
+			c = z->v[j]; d = c & 0xffff; c = c >> 16;
+			e = x->v[i+j];
+
+			/* build result as: (r << 32) + s: start with (BD + E + F) */
+			r = 0;
+			s = b * d;
+
+			/* add E */
+			t = s + e;
+			if (t < s) { r++; }  /* carry */
+			s = t;
+
+			/* add F */
+			t = s + f;
+			if (t < s) { r++; }  /* carry */
+			s = t;
+
+			/* add BC*2^16 */
+			t = b * c;
+			r += (t >> 16);
+			t = s + ((t & 0xffff) << 16);
+			if (t < s) { r++; }  /* carry */
+			s = t;
+
+			/* add AD*2^16 */
+			t = a * d;
+			r += (t >> 16);
+			t = s + ((t & 0xffff) << 16);
+			if (t < s) { r++; }  /* carry */
+			s = t;
+
+			/* add AC*2^32 */
+			t = a * c;
+			r += t;
+
+			DUK_DDDPRINT("ab=%08x cd=%08x ef=%08x -> rs=%08x %08x", y->v[i], z->v[j], x->v[i+j], r, s);
+
+			x->v[i+j] = s;
+			f = r;
+		}
+		if (f > 0) {
+			DUK_ASSERT(i + j < nx);
+			DUK_ASSERT(i + j < BI_MAX_PARTS);
+			DUK_ASSERT(x->v[i+j] == 0);
+			x->v[i+j] = (uint32_t) f;
+		}
+#endif  /* DUK_USE_64BIT_OPS */
 	}
 
 	bi_normalize(x);
@@ -49688,7 +56009,7 @@ static void bi_twoexp(duk_bigint *x, int y) {
 	n = (y / 32) + 1;
 	DUK_ASSERT(n > 0);
 	r = y % 32;
-	memset((void *) x->v, 0, sizeof(uint32_t) * n);
+	DUK_MEMSET((void *) x->v, 0, sizeof(uint32_t) * n);
 	x->n = n;
 	x->v[n - 1] = (((uint32_t) 1) << r);
 }
@@ -49824,7 +56145,7 @@ size_t dragon4_format_uint32(char *buf, unsigned int x, int radix) {
 	}
 	len = (buf + 32) - p;
 
-	memmove((void *) buf, (void *) p, len);
+	DUK_MEMMOVE((void *) buf, (void *) p, len);
 
 	return len;
 }
@@ -50219,7 +56540,7 @@ static void dragon4_generate(duk_numconv_stringify_ctx *nc_ctx) {
 	{
 		char buf[2048];
 		int i, t;
-		memset(buf, 0, sizeof(buf));
+		DUK_MEMSET(buf, 0, sizeof(buf));
 		for (i = 0; i < nc_ctx->count; i++) {
 			t = nc_ctx->digits[i];
 			if (t < 0 || t > 36) {
@@ -50282,9 +56603,9 @@ static int dragon4_fixed_format_round(duk_numconv_stringify_ctx *nc_ctx, int rou
 			*p = 0;
 			if (p == &nc_ctx->digits[0]) {
 				DUK_DDDPRINT("carry propagated to first digit -> special case handling");
-				memmove((void *) (&nc_ctx->digits[1]),
-				        (void *) (&nc_ctx->digits[0]),
-				        (size_t) (sizeof(char) * nc_ctx->count));
+				DUK_MEMMOVE((void *) (&nc_ctx->digits[1]),
+				            (void *) (&nc_ctx->digits[0]),
+				            (size_t) (sizeof(char) * nc_ctx->count));
 				nc_ctx->digits[0] = 1;  /* don't increase 'count' */
 				nc_ctx->k++;  /* position of highest digit changed */
 				nc_ctx->count++;  /* number of digits changed */
@@ -50650,19 +56971,19 @@ void duk_numconv_stringify(duk_context *ctx, int radix, int digits, int flags) {
 	 *  Handle special cases (NaN, infinity, zero).
 	 */
 
-	c = fpclassify(x);
-	if (signbit(x)) {
+	c = DUK_FPCLASSIFY(x);
+	if (DUK_SIGNBIT(x)) {
 		x = -x;
 		neg = 1;
 	} else {
 		neg = 0;
 	}
-	DUK_ASSERT(signbit(x) == 0);
+	DUK_ASSERT(DUK_SIGNBIT(x) == 0);
 
-	if (c == FP_NAN) {
+	if (c == DUK_FP_NAN) {
 		duk_push_hstring_stridx(ctx, DUK_STRIDX_NAN);
 		return;
-	} else if (c == FP_INFINITE) {
+	} else if (c == DUK_FP_INFINITE) {
 		if (neg) {
 			/* -Infinity */
 			duk_push_hstring_stridx(ctx, DUK_STRIDX_MINUS_INFINITY);
@@ -50671,7 +56992,7 @@ void duk_numconv_stringify(duk_context *ctx, int radix, int digits, int flags) {
 			duk_push_hstring_stridx(ctx, DUK_STRIDX_INFINITY);
 		}
 		return;
-	} else if (c == FP_ZERO) {
+	} else if (c == DUK_FP_ZERO) {
 		/* We can't shortcut zero here if it goes through special formatting
 		 * (such as forced exponential notation).
 		 */
@@ -50721,7 +57042,7 @@ void duk_numconv_stringify(duk_context *ctx, int radix, int digits, int flags) {
 	 * is 1-2 kilobytes and nothing should rely on it being zeroed.
 	 */
 #if 0
-	memset((void *) nc_ctx, 0, sizeof(*nc_ctx));  /* slow init, do only for slow path cases */
+	DUK_MEMSET((void *) nc_ctx, 0, sizeof(*nc_ctx));  /* slow init, do only for slow path cases */
 #endif
 
 	nc_ctx->is_s2n = 0;
@@ -50744,7 +57065,7 @@ void duk_numconv_stringify(duk_context *ctx, int radix, int digits, int flags) {
 		nc_ctx->req_digits = 0;
 	}
 
-	if (c == FP_ZERO) {
+	if (c == DUK_FP_ZERO) {
 		/* Zero special case: fake requested number of zero digits; ensure
 		 * no sign bit is printed.  Relative and absolute fixed format
 		 * require separate handling.
@@ -50761,7 +57082,7 @@ void duk_numconv_stringify(duk_context *ctx, int radix, int digits, int flags) {
 		}
 		DUK_DDDPRINT("count=%d", count);
 		DUK_ASSERT(count >= 1);
-		memset((void *) nc_ctx->digits, 0, count);
+		DUK_MEMSET((void *) nc_ctx->digits, 0, count);
 		nc_ctx->count = count;
 		nc_ctx->k = 1;  /* 0.000... */
 		neg = 0;
@@ -50938,13 +57259,13 @@ void duk_numconv_parse(duk_context *ctx, int radix, int flags) {
 
 		/* borrow literal Infinity from builtin string */
 		q = (const unsigned char *) DUK_HSTRING_GET_DATA(DUK_HTHREAD_STRING_INFINITY(thr));
-		if (strcmp((const char *) p, (const char *) q) == 0) {
+		if (DUK_STRCMP((const char *) p, (const char *) q) == 0) {
 			if (!allow_garbage && (p[8] != (unsigned char) 0)) {
 				DUK_DDDPRINT("parse failed: trailing garbage after matching 'Infinity' not allowed");
 				goto parse_fail;
 			} else {
 				/* FIXME: compile warning here on gcc-4.0, floating constant exceeds range of 'float' */
-				res = INFINITY;
+				res = DUK_DOUBLE_INFINITY;
 				goto neg_and_ret;
 			}
 		}
@@ -51283,8 +57604,7 @@ void duk_numconv_parse(duk_context *ctx, int radix, int flags) {
 	explim = &str2num_exp_limits[radix - 2];
 	if (exp > explim->upper) {
 		DUK_DDDPRINT("exponent too large -> infinite");
-		/* FIXME: compile warning here on gcc-4.0, floating constant exceeds range of 'float' */
-		res = INFINITY;
+		res = DUK_DOUBLE_INFINITY;
 		goto neg_and_ret;
 	} else if (exp < explim->lower) {
 		DUK_DDDPRINT("exponent too small -> zero");
@@ -52195,7 +58515,7 @@ void duk_regexp_compile(duk_hthread *thr) {
 
 	/* [ ... pattern flags escaped_source buffer ] */
 
-	memset(&re_ctx, 0, sizeof(re_ctx));
+	DUK_MEMSET(&re_ctx, 0, sizeof(re_ctx));
 	DUK_LEXER_INITCTX(&re_ctx.lex);  /* duplicate zeroing, expect for (possible) NULL inits */
 	re_ctx.thr = thr;
 	re_ctx.lex.thr = thr;
@@ -52802,10 +59122,10 @@ static duk_u8 *match_regexp(duk_re_matcher_ctx *re_ctx, duk_u8 *pc, duk_u8 *sp) 
 			DUK_ASSERT(re_ctx->nsaved > 0);
 
 			duk_require_stack((duk_context *) re_ctx->thr, 1);
-			full_save = duk_push_fixed_buffer((duk_context *) re_ctx->thr,
-			                                   sizeof(duk_u8 *) * re_ctx->nsaved);
+			full_save = (duk_u8 **) duk_push_fixed_buffer((duk_context *) re_ctx->thr,
+			                                              sizeof(duk_u8 *) * re_ctx->nsaved);
 			DUK_ASSERT(full_save != NULL);
-			memcpy(full_save, re_ctx->saved, sizeof(duk_u8 *) * re_ctx->nsaved);
+			DUK_MEMCPY(full_save, re_ctx->saved, sizeof(duk_u8 *) * re_ctx->nsaved);
 
 			skip = bc_get_i32(re_ctx, &pc);
 			sub_sp = match_regexp(re_ctx, pc, sp);
@@ -52830,7 +59150,7 @@ static duk_u8 *match_regexp(duk_re_matcher_ctx *re_ctx, duk_u8 *pc, duk_u8 *sp) 
 
 		 lookahead_fail:
 			/* fail: restore saves */
-			memcpy(re_ctx->saved, full_save, sizeof(duk_u8 *) * re_ctx->nsaved);
+			DUK_MEMCPY(re_ctx->saved, full_save, sizeof(duk_u8 *) * re_ctx->nsaved);
 			duk_pop((duk_context *) re_ctx->thr);
 			goto fail;
 		}
@@ -52970,7 +59290,7 @@ static void regexp_match_helper(duk_hthread *thr, int force_global) {
 
 	/* [ ... re_obj input bc ] */
 
-	memset(&re_ctx, 0, sizeof(re_ctx));
+	DUK_MEMSET(&re_ctx, 0, sizeof(re_ctx));
 
 	re_ctx.thr = thr;
 	re_ctx.input = (duk_u8 *) DUK_HSTRING_GET_DATA(h_input);
@@ -52993,7 +59313,7 @@ static void regexp_match_helper(duk_hthread *thr, int force_global) {
 	DUK_ASSERT((re_ctx.nsaved % 2) == 0);
 
 	duk_push_fixed_buffer(ctx, sizeof(duk_u8 *) * re_ctx.nsaved);
-	re_ctx.saved = duk_get_buffer(ctx, -1, NULL);
+	re_ctx.saved = (duk_u8 **) duk_get_buffer(ctx, -1, NULL);
 	DUK_ASSERT(re_ctx.saved != NULL);
 
 	/* [ ... re_obj input bc saved_buf ] */
@@ -53253,371 +59573,80 @@ void duk_regexp_match_force_global(duk_hthread *thr) {
 
 #endif  /* DUK_USE_REGEXP_SUPPORT */
 
-#line 1 "duk_strings.c"
+#line 1 "duk_replacements.c"
 /*
- *  Automatically generated by genstrings.py, do not edit!
+ *  Replacements for missing platform functions.
+ *
+ *  Unlike the originals, fpclassify() and signbit() replacements don't
+ *  work on any floating point types, only doubles.
  */
 
-char duk_strings_data[] = {
-(char)'\x01', (char)'\x8c', (char)'\xb7', (char)'\x04', (char)'\x0b', 
-(char)'\x4f', (char)'\x41', (char)'\x13', (char)'\x51', (char)'\x84', 
-(char)'\x6c', (char)'\xe4', (char)'\x4f', (char)'\x26', (char)'\x4e', 
-(char)'\x69', (char)'\x3a', (char)'\xc0', (char)'\x4c', (char)'\xe5', 
-(char)'\xe9', (char)'\x23', (char)'\x17', (char)'\x44', (char)'\xdd', 
-(char)'\x89', (char)'\x0d', (char)'\xd2', (char)'\x5d', (char)'\xe4', 
-(char)'\xe8', (char)'\xc1', (char)'\x32', (char)'\x1b', (char)'\xad', 
-(char)'\xa3', (char)'\x02', (char)'\x48', (char)'\x9f', (char)'\xa1', 
-(char)'\x73', (char)'\x96', (char)'\x40', (char)'\x34', (char)'\xdd', 
-(char)'\x94', (char)'\xe2', (char)'\x86', (char)'\x98', (char)'\xbd', 
-(char)'\x04', (char)'\x62', (char)'\x0c', (char)'\x23', (char)'\xa5', 
-(char)'\xa3', (char)'\x45', (char)'\x34', (char)'\x39', (char)'\xa6', 
-(char)'\xeb', (char)'\x82', (char)'\x92', (char)'\x0a', (char)'\x6e', 
-(char)'\xff', (char)'\xbf', (char)'\xa2', (char)'\xd3', (char)'\x50', 
-(char)'\xd2', (char)'\xfd', (char)'\x17', (char)'\xdd', (char)'\x4e', 
-(char)'\x34', (char)'\x27', (char)'\xfe', (char)'\xb7', (char)'\xfe', 
-(char)'\xfe', (char)'\x8b', (char)'\x48', (char)'\x69', (char)'\x7e', 
-(char)'\x8b', (char)'\xee', (char)'\xa7', (char)'\x1a', (char)'\x13', 
-(char)'\xff', (char)'\x5b', (char)'\xff', (char)'\x7f', (char)'\x45', 
-(char)'\xa6', (char)'\x81', (char)'\xbf', (char)'\x45', (char)'\xf7', 
-(char)'\x53', (char)'\x8d', (char)'\x09', (char)'\xff', (char)'\xb3', 
-(char)'\xff', (char)'\xbf', (char)'\xa2', (char)'\xd5', (char)'\x1a', 
-(char)'\x32', (char)'\x15', (char)'\x0d', (char)'\x20', (char)'\xfe', 
-(char)'\x8b', (char)'\xee', (char)'\xa7', (char)'\x1a', (char)'\x13', 
-(char)'\xff', (char)'\x4b', (char)'\x25', (char)'\x90', (char)'\x8f', 
-(char)'\x30', (char)'\x41', (char)'\x22', (char)'\x7d', (char)'\xb7', 
-(char)'\xda', (char)'\x0c', (char)'\xe4', (char)'\xb8', (char)'\xc6', 
-(char)'\x41', (char)'\x0c', (char)'\x8d', (char)'\x13', (char)'\x0c', 
-(char)'\x49', (char)'\xf4', (char)'\xa8', (char)'\x68', (char)'\x16', 
-(char)'\x8c', (char)'\x92', (char)'\x2c', (char)'\x91', (char)'\x27', 
-(char)'\xd2', (char)'\xa1', (char)'\xa0', (char)'\x5a', (char)'\x32', 
-(char)'\x48', (char)'\x92', (char)'\x68', (char)'\x61', (char)'\x04', 
-(char)'\x61', (char)'\x10', (char)'\x54', (char)'\x8c', (char)'\x4d', 
-(char)'\x12', (char)'\x4a', (char)'\x8c', (char)'\x21', (char)'\x64', 
-(char)'\xf0', (char)'\x59', (char)'\xa4', (char)'\x89', (char)'\x0a', 
-(char)'\x22', (char)'\x00', (char)'\x63', (char)'\x89', (char)'\x43', 
-(char)'\x44', (char)'\x2c', (char)'\x67', (char)'\xa9', (char)'\x23', 
-(char)'\x24', (char)'\x39', (char)'\xa7', (char)'\xd6', (char)'\x87', 
-(char)'\x45', (char)'\x6b', (char)'\x48', (char)'\xdc', (char)'\x48', 
-(char)'\x60', (char)'\x82', (char)'\x44', (char)'\x3e', (char)'\xe6', 
-(char)'\x78', (char)'\x90', (char)'\x03', (char)'\x56', (char)'\xca', 
-(char)'\x86', (char)'\x81', (char)'\x68', (char)'\xc9', (char)'\x22', 
-(char)'\xad', (char)'\xb0', (char)'\x93', (char)'\x04', (char)'\xc0', 
-(char)'\x15', (char)'\x90', (char)'\xfb', (char)'\x10', (char)'\x16', 
-(char)'\xb2', (char)'\x10', (char)'\x9b', (char)'\x60', (char)'\x1e', 
-(char)'\x5d', (char)'\x82', (char)'\x26', (char)'\x91', (char)'\x77', 
-(char)'\x33', (char)'\xa2', (char)'\x49', (char)'\xd9', (char)'\x50', 
-(char)'\xb2', (char)'\x34', (char)'\x0c', (char)'\x22', (char)'\x36', 
-(char)'\xf1', (char)'\x7d', (char)'\x92', (char)'\xd0', (char)'\xd2', 
-(char)'\x1f', (char)'\x72', (char)'\x75', (char)'\x22', (char)'\x22', 
-(char)'\x1f', (char)'\x75', (char)'\x04', (char)'\x48', (char)'\xda', 
-(char)'\x9f', (char)'\x6b', (char)'\x25', (char)'\xc8', (char)'\xda', 
-(char)'\x9f', (char)'\x75', (char)'\x04', (char)'\x58', (char)'\x07', 
-(char)'\xa3', (char)'\x65', (char)'\x74', (char)'\x58', (char)'\x05', 
-(char)'\xc9', (char)'\x3b', (char)'\x0e', (char)'\x26', (char)'\x41', 
-(char)'\x38', (char)'\x64', (char)'\x2e', (char)'\xda', (char)'\x4b', 
-(char)'\xcc', (char)'\xfb', (char)'\x98', (char)'\x22', (char)'\x62', 
-(char)'\x4c', (char)'\xdb', (char)'\xa8', (char)'\x17', (char)'\x42', 
-(char)'\x1d', (char)'\xee', (char)'\x43', (char)'\x66', (char)'\x48', 
-(char)'\x98', (char)'\x34', (char)'\x29', (char)'\x49', (char)'\x12', 
-(char)'\xce', (char)'\x34', (char)'\x68', (char)'\x93', (char)'\x38', 
-(char)'\x80', (char)'\x44', (char)'\x08', (char)'\x04', (char)'\xa2', 
-(char)'\x88', (char)'\x14', (char)'\x91', (char)'\x08', (char)'\x27', 
-(char)'\x0c', (char)'\x88', (char)'\x44', (char)'\xba', (char)'\xd0', 
-(char)'\x4d', (char)'\x15', (char)'\x22', (char)'\x96', (char)'\x86', 
-(char)'\x93', (char)'\xad', (char)'\xa3', (char)'\x02', (char)'\x48', 
-(char)'\xa0', (char)'\xa8', (char)'\x59', (char)'\x3a', (char)'\xd0', 
-(char)'\x30', (char)'\x82', (char)'\x78', (char)'\x9d', (char)'\xd9', 
-(char)'\x9e', (char)'\x2e', (char)'\xb7', (char)'\x67', (char)'\x87', 
-(char)'\x93', (char)'\xa4', (char)'\x8c', (char)'\x5d', (char)'\x13', 
-(char)'\x08', (char)'\x0b', (char)'\x59', (char)'\x08', (char)'\xce', 
-(char)'\xa1', (char)'\xb5', (char)'\x02', (char)'\xd0', (char)'\x3f', 
-(char)'\xa0', (char)'\xe8', (char)'\xc1', (char)'\x32', (char)'\x07', 
-(char)'\xe8', (char)'\x03', (char)'\xf5', (char)'\x82', (char)'\xfa', 
-(char)'\xdf', (char)'\xb0', (char)'\x17', (char)'\xd5', (char)'\xfd', 
-(char)'\x80', (char)'\x7e', (char)'\xc1', (char)'\x3f', (char)'\x5b', 
-(char)'\xd4', (char)'\x34', (char)'\xa8', (char)'\x6a', (char)'\x27', 
-(char)'\x84', (char)'\xfd', (char)'\x5f', (char)'\x50', (char)'\xd2', 
-(char)'\xa1', (char)'\xa8', (char)'\x9e', (char)'\x11', (char)'\xd4', 
-(char)'\x34', (char)'\xa8', (char)'\x6a', (char)'\x27', (char)'\x83', 
-(char)'\x38', (char)'\x29', (char)'\x20', (char)'\xa6', (char)'\x69', 
-(char)'\x4e', (char)'\x28', (char)'\x69', (char)'\x8c', (char)'\xda', 
-(char)'\x30', (char)'\x24', (char)'\x89', (char)'\xc2', (char)'\xe7', 
-(char)'\x2c', (char)'\x80', (char)'\x6a', (char)'\x68', (char)'\xd1', 
-(char)'\x90', (char)'\xa8', (char)'\x69', (char)'\x06', (char)'\x99', 
-(char)'\x4e', (char)'\x28', (char)'\x69', (char)'\x90', (char)'\x5c', 
-(char)'\x0e', (char)'\x60', (char)'\x69', (char)'\x25', (char)'\x08', 
-(char)'\xcc', (char)'\x72', (char)'\x43', (char)'\x4b', (char)'\x17', 
-(char)'\x51', (char)'\xa3', (char)'\x34', (char)'\x40', (char)'\xd1', 
-(char)'\xb9', (char)'\x83', (char)'\x7b', (char)'\xac', (char)'\x36', 
-(char)'\x21', (char)'\xa3', (char)'\x60', (char)'\x2e', (char)'\x35', 
-(char)'\xb8', (char)'\xc5', (char)'\x2a', (char)'\xdc', (char)'\xe8', 
-(char)'\x8c', (char)'\x97', (char)'\x78', (char)'\xc4', (char)'\xe9', 
-(char)'\x10', (char)'\x44', (char)'\x42', (char)'\xca', (char)'\x09', 
-(char)'\x81', (char)'\xbf', (char)'\x64', (char)'\x40', (char)'\x4c', 
-(char)'\x0d', (char)'\x20', (char)'\x24', (char)'\x86', (char)'\x90', 
-(char)'\x02', (char)'\x74', (char)'\x86', (char)'\x00', (char)'\xc8', 
-(char)'\xbe', (char)'\x94', (char)'\x23', (char)'\x3f', (char)'\xb2', 
-(char)'\x3f', (char)'\xa5', (char)'\x08', (char)'\xcf', (char)'\xec', 
-(char)'\x75', (char)'\xf6', (char)'\x42', (char)'\xf3', (char)'\xd0', 
-(char)'\x6f', (char)'\x2d', (char)'\xc6', (char)'\xfb', (char)'\x1f', 
-(char)'\xb0', (char)'\x21', (char)'\x7c', (char)'\xb7', (char)'\x1b', 
-(char)'\xec', (char)'\x88', (char)'\x3f', (char)'\x2d', (char)'\xbf', 
-(char)'\x64', (char)'\x4f', (char)'\x2d', (char)'\xbf', (char)'\x63', 
-(char)'\xf6', (char)'\x01', (char)'\xe9', (char)'\x0e', (char)'\xc2', 
-(char)'\x4a', (char)'\x40', (char)'\x31', (char)'\x08', (char)'\xd0', 
-(char)'\x30', (char)'\x85', (char)'\x43', (char)'\x5f', (char)'\x49', 
-(char)'\x95', (char)'\x0d', (char)'\x19', (char)'\x2e', (char)'\x4f', 
-(char)'\xa8', (char)'\xfb', (char)'\xff', (char)'\xba', (char)'\xfa', 
-(char)'\x94', (char)'\xac', (char)'\x12', (char)'\x9f', (char)'\x50', 
-(char)'\xd1', (char)'\x92', (char)'\xe9', (char)'\x65', (char)'\x17', 
-(char)'\x34', (char)'\x2d', (char)'\x0d', (char)'\x22', (char)'\x90', 
-(char)'\x66', (char)'\xba', (char)'\x24', (char)'\xe8', (char)'\x81', 
-(char)'\x22', (char)'\x1a', (char)'\x4e', (char)'\xa4', (char)'\x44', 
-(char)'\x42', (char)'\x4c', (char)'\x92', (char)'\x99', (char)'\x09', 
-(char)'\x72', (char)'\x09', (char)'\x73', (char)'\x77', (char)'\x8c', 
-(char)'\xc9', (char)'\xcb', (char)'\xd3', (char)'\x8a', (char)'\x1a', 
-(char)'\x63', (char)'\xc8', (char)'\x93', (char)'\xee', (char)'\x08', 
-(char)'\x08', (char)'\x9c', (char)'\xc4', (char)'\x9f', (char)'\x70', 
-(char)'\x40', (char)'\x44', (char)'\xd3', (char)'\x77', (char)'\x93', 
-(char)'\x27', (char)'\x35', (char)'\x73', (char)'\x77', (char)'\x91', 
-(char)'\x27', (char)'\x4b', (char)'\xd3', (char)'\x8a', (char)'\x1a', 
-(char)'\x65', (char)'\xcd', (char)'\xde', (char)'\xa4', (char)'\xc5', 
-(char)'\x2f', (char)'\x4e', (char)'\x28', (char)'\x69', (char)'\x9d', 
-(char)'\x22', (char)'\x4f', (char)'\xd4', (char)'\x98', (char)'\x8b', 
-(char)'\xea', (char)'\x2d', (char)'\x7d', (char)'\xc1', (char)'\x01', 
-(char)'\x15', (char)'\xc8', (char)'\x93', (char)'\xe9', (char)'\x68', 
-(char)'\xb5', (char)'\xf7', (char)'\x04', (char)'\x04', (char)'\x57', 
-(char)'\x22', (char)'\x4f', (char)'\xd4', (char)'\x98', (char)'\x99', 
-(char)'\xe7', (char)'\x36', (char)'\x67', (char)'\x44', (char)'\x89', 
-(char)'\x3e', (char)'\xb1', (char)'\xcd', (char)'\x99', (char)'\xd5', 
-(char)'\x22', (char)'\x4f', (char)'\xd4', (char)'\x98', (char)'\x87', 
-(char)'\xe0', (char)'\x4c', (char)'\x87', (char)'\x91', (char)'\x27', 
-(char)'\xd1', (char)'\x82', (char)'\x64', (char)'\x5c', (char)'\x89', 
-(char)'\x3f', (char)'\x52', (char)'\x62', (char)'\x3f', (char)'\x9d', 
-(char)'\x48', (char)'\xc9', (char)'\x12', (char)'\x24', (char)'\xfa', 
-(char)'\x77', (char)'\x52', (char)'\x32', (char)'\x6c', (char)'\x89', 
-(char)'\x3f', (char)'\x52', (char)'\x62', (char)'\x67', (char)'\x90', 
-(char)'\xda', (char)'\x4c', (char)'\x92', (char)'\x54', (char)'\x89', 
-(char)'\x3e', (char)'\xb1', (char)'\x0d', (char)'\xa4', (char)'\xc9', 
-(char)'\x26', (char)'\xc8', (char)'\x93', (char)'\xf5', (char)'\x26', 
-(char)'\x29', (char)'\x78', (char)'\x82', (char)'\x73', (char)'\x47', 
-(char)'\x25', (char)'\x48', (char)'\x93', (char)'\xec', (char)'\x88', 
-(char)'\x27', (char)'\x34', (char)'\x72', (char)'\x94', (char)'\x89', 
-(char)'\x3f', (char)'\x52', (char)'\x62', (char)'\x67', (char)'\x90', 
-(char)'\xb5', (char)'\xa2', (char)'\x44', (char)'\x13', (char)'\x9a', 
-(char)'\x39', (char)'\x3e', (char)'\x44', (char)'\x9f', (char)'\x58', 
-(char)'\x85', (char)'\xad', (char)'\x12', (char)'\x20', (char)'\x9c', 
-(char)'\xd1', (char)'\xc8', (char)'\xf2', (char)'\x24', (char)'\xfb', 
-(char)'\x34', (char)'\x30', (char)'\x91', (char)'\x31', (char)'\x27', 
-(char)'\xd9', (char)'\xa1', (char)'\x84', (char)'\xcb', (char)'\x9a', 
-(char)'\x4e', (char)'\xb8', (char)'\xa5', (char)'\x91', (char)'\x27', 
-(char)'\x23', (char)'\x12', (char)'\x7e', (char)'\xa4', (char)'\xc4', 
-(char)'\xcf', (char)'\x21', (char)'\x6b', (char)'\x44', (char)'\x88', 
-(char)'\x27', (char)'\x34', (char)'\x72', (char)'\x79', (char)'\x89', 
-(char)'\x3e', (char)'\xb1', (char)'\x0b', (char)'\x5a', (char)'\x24', 
-(char)'\x41', (char)'\x39', (char)'\xa3', (char)'\x93', (char)'\x4c', 
-(char)'\x49', (char)'\xfa', (char)'\x93', (char)'\x14', (char)'\xbc', 
-(char)'\x41', (char)'\x39', (char)'\xa3', (char)'\x92', (char)'\x8c', 
-(char)'\x49', (char)'\xf6', (char)'\x44', (char)'\x13', (char)'\x9a', 
-(char)'\x39', (char)'\x34', (char)'\xc4', (char)'\x9f', (char)'\xa9', 
-(char)'\x31', (char)'\x33', (char)'\xc8', (char)'\x6d', (char)'\x26', 
-(char)'\x49', (char)'\x28', (char)'\xc4', (char)'\x9f', (char)'\x58', 
-(char)'\x86', (char)'\xd2', (char)'\x64', (char)'\x92', (char)'\xcc', 
-(char)'\x49', (char)'\xfa', (char)'\x93', (char)'\x11', (char)'\xfc', 
-(char)'\xea', (char)'\x46', (char)'\x48', (char)'\x31', (char)'\x27', 
-(char)'\xd3', (char)'\xba', (char)'\x91', (char)'\x92', (char)'\x4c', 
-(char)'\x49', (char)'\xfa', (char)'\x93', (char)'\x10', (char)'\xfc', 
-(char)'\x0c', (char)'\x18', (char)'\xc4', (char)'\x9f', (char)'\x46', 
-(char)'\x0c', (char)'\x28', (char)'\xc4', (char)'\x9f', (char)'\xa9', 
-(char)'\x31', (char)'\x0f', (char)'\xc0', (char)'\x99', (char)'\x0e', 
-(char)'\x62', (char)'\x4f', (char)'\xa3', (char)'\x04', (char)'\xc8', 
-(char)'\xb3', (char)'\x12', (char)'\x7e', (char)'\xa4', (char)'\xc4', 
-(char)'\xcf', (char)'\x39', (char)'\xb3', (char)'\x3a', (char)'\x0c', 
-(char)'\x49', (char)'\xf5', (char)'\x8e', (char)'\x6c', (char)'\xce', 
-(char)'\xe3', (char)'\x12', (char)'\x7e', (char)'\xa4', (char)'\xc4', 
-(char)'\x5f', (char)'\x51', (char)'\x6b', (char)'\xee', (char)'\x08', 
-(char)'\x08', (char)'\xac', (char)'\xc4', (char)'\x9f', (char)'\x4b', 
-(char)'\x45', (char)'\xaf', (char)'\xb8', (char)'\x20', (char)'\x22', 
-(char)'\x73', (char)'\x12', (char)'\x7d', (char)'\x9a', (char)'\x18', 
-(char)'\x49', (char)'\x4d', (char)'\xdd', (char)'\x5b', (char)'\x84', 
-(char)'\x05', (char)'\x93', (char)'\xb3', (char)'\x43', (char)'\x09', 
-(char)'\xd9', (char)'\x4e', (char)'\x28', (char)'\x69', (char)'\xa5', 
-(char)'\x37', (char)'\x75', (char)'\x6e', (char)'\x10', (char)'\x16', 
-(char)'\x4e', (char)'\x8c', (char)'\x13', (char)'\x27', (char)'\x65', 
-(char)'\x38', (char)'\xa1', (char)'\xa6', (char)'\x64', (char)'\xdd', 
-(char)'\xd9', (char)'\xa1', (char)'\x84', (char)'\xec', (char)'\xa7', 
-(char)'\x14', (char)'\x34', (char)'\xcc', (char)'\x9b', (char)'\xba', 
-(char)'\x30', (char)'\x4c', (char)'\x9d', (char)'\x94', (char)'\xe2', 
-(char)'\x86', (char)'\x98', (char)'\x6d', (char)'\x75', (char)'\x87', 
-(char)'\xea', (char)'\x4c', (char)'\x45', (char)'\x78', (char)'\x23', 
-(char)'\x22', (char)'\x2e', (char)'\x6e', (char)'\xeb', (char)'\xe2', 
-(char)'\x41', (char)'\x22', (char)'\x48', (char)'\x73', (char)'\x5b', 
-(char)'\x37', (char)'\x74', (char)'\x97', (char)'\x7b', (char)'\x9a', 
-(char)'\x46', (char)'\xcd', (char)'\x00', (char)'\x59', (char)'\xe6', 
-(char)'\xee', (char)'\x95', (char)'\x17', (char)'\x20', (char)'\xe3', 
-(char)'\xe7', (char)'\xba', (char)'\x48', (char)'\x9a', (char)'\x2a', 
-(char)'\x4d', (char)'\x21', (char)'\xa5', (char)'\x43', (char)'\x51', 
-(char)'\x3c', (char)'\x47', (char)'\xcd', (char)'\x21', (char)'\x81', 
-(char)'\x34', (char)'\x54', (char)'\x9a', (char)'\x43', (char)'\x4a', 
-(char)'\x86', (char)'\xa2', (char)'\x78', (char)'\x1f', (char)'\x5a', 
-(char)'\x0e', (char)'\xb5', (char)'\x3e', (char)'\x62', (char)'\x1b', 
-(char)'\xaa', (char)'\x81', (char)'\x74', (char)'\x22', (char)'\x7c', 
-(char)'\xc0', (char)'\x5f', (char)'\x55', (char)'\x02', (char)'\xe8', 
-(char)'\x43', (char)'\x4a', (char)'\x81', (char)'\x94', (char)'\xe2', 
-(char)'\x49', (char)'\xc5', (char)'\x0c', (char)'\x8c', (char)'\xdd', 
-(char)'\xd5', (char)'\xb8', (char)'\x40', (char)'\x59', (char)'\x3b', 
-(char)'\x47', (char)'\xbc', (char)'\x91', (char)'\xe8', (char)'\x81', 
-(char)'\x22', (char)'\x2e', (char)'\x6e', (char)'\xed', (char)'\x1e', 
-(char)'\xf2', (char)'\x47', (char)'\xa2', (char)'\x04', (char)'\x89', 
-(char)'\x19', (char)'\xbb', (char)'\xab', (char)'\x70', (char)'\x80', 
-(char)'\xb2', (char)'\x75', (char)'\x6e', (char)'\xb1', (char)'\x23', 
-(char)'\xd1', (char)'\x02', (char)'\x44', (char)'\x5c', (char)'\xdd', 
-(char)'\xd5', (char)'\xba', (char)'\xc4', (char)'\x8f', (char)'\x44', 
-(char)'\x09', (char)'\x11', (char)'\x32', (char)'\xa0', (char)'\x65', 
-(char)'\x38', (char)'\xa1', (char)'\xa6', (char)'\x2c', (char)'\x9e', 
-(char)'\xb4', (char)'\x4c', (char)'\xd2', (char)'\x20', (char)'\x22', 
-(char)'\x23', (char)'\x9e', (char)'\x24', (char)'\x7a', (char)'\xc0', 
-(char)'\x22', (char)'\x15', (char)'\x80', (char)'\x98', (char)'\x8e', 
-(char)'\xd5', (char)'\xb8', (char)'\x40', (char)'\x59', (char)'\x3a', 
-(char)'\x27', (char)'\x31', (char)'\xe0', (char)'\x89', (char)'\x14', 
-(char)'\x23', (char)'\x82', (char)'\x3d', (char)'\x13', (char)'\x86', 
-(char)'\x4e', (char)'\x82', (char)'\x66', (char)'\x11', (char)'\xc1', 
-(char)'\x1e', (char)'\x82', (char)'\x6c', (char)'\x2c', (char)'\x5c', 
-(char)'\xce', (char)'\x88', (char)'\xe0', (char)'\x8f', (char)'\x44', 
-(char)'\xe1', (char)'\x91', (char)'\x71', (char)'\x20', (char)'\xe8', 
-(char)'\x22', (char)'\x76', (char)'\x28', (char)'\x31', (char)'\xe6', 
-(char)'\x68', (char)'\x90', (char)'\x74', (char)'\x11', (char)'\x0c', 
-(char)'\x54', (char)'\x2e', (char)'\x64', (char)'\x88', (char)'\xd8', 
-(char)'\x07', (char)'\x9c', (char)'\xae', (char)'\x8f', (char)'\x48', 
-(char)'\x01', (char)'\x1c', (char)'\x92', (char)'\x73', (char)'\x08', 
-(char)'\x52', (char)'\x54', (char)'\x91', (char)'\xc2', (char)'\xd6', 
-(char)'\x09', (char)'\x4f', (char)'\xa8', (char)'\x68', (char)'\xc9', 
-(char)'\x7e', (char)'\xb8', (char)'\xa7', (char)'\x43', (char)'\x46', 
-(char)'\x4b', (char)'\xf5', (char)'\xc5', (char)'\x3d', (char)'\x1b', 
-(char)'\x23', (char)'\xa0', (char)'\xb3', (char)'\x34', (char)'\x9e', 
-(char)'\xb4', (char)'\x08', (char)'\x84', (char)'\x93', (char)'\xa3', 
-(char)'\x32', (char)'\xc9', (char)'\x68', (char)'\x11', (char)'\x0b', 
-(char)'\x23', (char)'\xa0', (char)'\xb3', (char)'\x3c', (char)'\x49', 
-(char)'\x52', (char)'\x46', (char)'\x44', (char)'\x23', (char)'\xe9', 
-(char)'\x23', (char)'\x8d', (char)'\xee', (char)'\x79', (char)'\x12', 
-(char)'\xe4', (char)'\x34', (char)'\xc2', (char)'\x73', (char)'\x44', 
-(char)'\x09', (char)'\x9d', (char)'\x12', (char)'\xe8', (char)'\x23', 
-(char)'\x10', (char)'\x61', (char)'\x20', (char)'\x89', (char)'\xa8', 
-(char)'\xc2', (char)'\x36', (char)'\x72', (char)'\x30', (char)'\x80', 
-(char)'\xb5', (char)'\x92', (char)'\x24', (char)'\x0a', (char)'\x1a', 
-(char)'\x32', (char)'\x08', (char)'\x0b', (char)'\x59', (char)'\x40', 
-(char)'\xf7', (char)'\xaf', (char)'\x14', (char)'\x7c', (char)'\x5c', 
-(char)'\xf2', (char)'\x46', (char)'\x78', (char)'\xea', (char)'\x25', 
-(char)'\xd2', (char)'\x36', (char)'\x8c', (char)'\x24', (char)'\x40', 
-(char)'\x15', (char)'\x91', (char)'\xa8', (char)'\x97', (char)'\x5f', 
-(char)'\x17', (char)'\x4d', (char)'\xd3', (char)'\xc3', (char)'\xc9', 
-(char)'\xd7', (char)'\x15', (char)'\xc7', (char)'\x04', (char)'\xba', 
-(char)'\xeb', (char)'\x37', (char)'\xaf', (char)'\x8b', (char)'\x9e', 
-(char)'\x48', (char)'\xcf', (char)'\x07', (char)'\xa8', (char)'\x17', 
-(char)'\x42', (char)'\x75', (char)'\xc5', (char)'\x74', (char)'\xdd', 
-(char)'\xd5', (char)'\xb8', (char)'\x40', (char)'\x59', (char)'\x3b', 
-(char)'\x29', (char)'\xc5', (char)'\x0d', (char)'\x32', (char)'\x26', 
-(char)'\xee', (char)'\xca', (char)'\x71', (char)'\x43', (char)'\x4c', 
-(char)'\xb1', (char)'\x39', (char)'\xb2', (char)'\x9c', (char)'\x68', 
-(char)'\x29', (char)'\xba', (char)'\x2a', (char)'\x23', (char)'\x68', 
-(char)'\xc2', (char)'\x44', (char)'\x01', (char)'\x59', (char)'\x18', 
-(char)'\x27', (char)'\x34', (char)'\xa8', (char)'\x35', (char)'\x22', 
-(char)'\x00', (char)'\xac', (char)'\x88', (char)'\xb4', (char)'\x51', 
-(char)'\x30', (char)'\x05', (char)'\x64', (char)'\x2d', (char)'\x40', 
-(char)'\xba', (char)'\x10', (char)'\x8a', (char)'\x26', (char)'\x24', 
-(char)'\xc4', (char)'\x4b', (char)'\xa4', (char)'\xbc', (char)'\xc8', 
-(char)'\xd9', (char)'\x20', (char)'\x2b', (char)'\x22', (char)'\x11', 
-(char)'\x2e', (char)'\x96', (char)'\x2e', (char)'\xc9', (char)'\x1a', 
-(char)'\x84', (char)'\x4b', (char)'\xb2', (char)'\x20', (char)'\x16', 
-(char)'\x41', (char)'\xc5', (char)'\xf1', (char)'\x25', (char)'\x48', 
-(char)'\xd9', (char)'\xf4', (char)'\x97', (char)'\x99', (char)'\x1b', 
-(char)'\x24', (char)'\x39', (char)'\xb2', (char)'\x31', (char)'\x62', 
-(char)'\x42', (char)'\x64', (char)'\x84', (char)'\x91', (char)'\x00', 
-(char)'\xb8', (char)'\x0c', (char)'\x85', (char)'\x43', (char)'\x49', 
-(char)'\xd7', (char)'\xc5', (char)'\xcf', (char)'\x24', (char)'\x66', 
-(char)'\x82', (char)'\x49', (char)'\xc3', (char)'\x21', (char)'\x50', 
-(char)'\xd2', (char)'\x75', (char)'\xf1', (char)'\x73', (char)'\xc9', 
-(char)'\x19', (char)'\xe0', (char)'\xc2', (char)'\x89', (char)'\x01', 
-(char)'\x32', (char)'\x4c', (char)'\xc4', (char)'\x9f', (char)'\x5d', 
-(char)'\x66', (char)'\xf5', (char)'\xf1', (char)'\x73', (char)'\xc9', 
-(char)'\x19', (char)'\xe3', (char)'\xad', (char)'\x03', (char)'\x09', 
-(char)'\x2c', (char)'\x18', (char)'\x93', (char)'\xeb', (char)'\xac', 
-(char)'\xde', (char)'\xbe', (char)'\x2e', (char)'\x79', (char)'\x23', 
-(char)'\x3c', (char)'\x74', (char)'\x64', (char)'\x90', (char)'\xa2', 
-(char)'\x87', (char)'\xcd', (char)'\xd1', (char)'\x71', (char)'\x89', 
-(char)'\x3e', (char)'\xbe', (char)'\x2e', (char)'\x9b', (char)'\xa7', 
-(char)'\x87', (char)'\x93', (char)'\xae', (char)'\x2a', (char)'\x5f', 
-(char)'\x17', (char)'\x4d', (char)'\xd3', (char)'\xc3', (char)'\xc8', 
-(char)'\x65', (char)'\x91', (char)'\xa6', (char)'\x99', (char)'\xca', 
-(char)'\x05', (char)'\x92', (char)'\x33', (char)'\x2b', (char)'\xe2', 
-(char)'\x86', (char)'\xcd', (char)'\x14', (char)'\x69', (char)'\x24', 
-(char)'\x20', (char)'\x3c', (char)'\x86', (char)'\x24', (char)'\x84', 
-(char)'\x07', (char)'\x92', (char)'\x44', (char)'\x68', (char)'\x9c', 
-(char)'\x32', (char)'\x7a', (char)'\x91', (char)'\x40', (char)'\xbc', 
-(char)'\xe6', (char)'\x3d', (char)'\xcd', (char)'\x23', (char)'\x66', 
-(char)'\x92', (char)'\x34', (char)'\x4e', (char)'\x19', (char)'\x3d', 
-(char)'\x48', (char)'\xa2', (char)'\x43', (char)'\x20', (char)'\x9c', 
-(char)'\x32', (char)'\x7a', (char)'\x91', (char)'\x40', (char)'\xbc', 
-(char)'\xe6', (char)'\x3d', (char)'\xcd', (char)'\x23', (char)'\x66', 
-(char)'\x91', (char)'\x90', (char)'\x4e', (char)'\x19', (char)'\x3d', 
-(char)'\x48', (char)'\xa1', (char)'\x08', (char)'\x97', (char)'\x4a', 
-(char)'\x86', (char)'\xa2', (char)'\x64', (char)'\x2a', (char)'\x25', 
-(char)'\xd6', (char)'\x83', (char)'\xad', (char)'\x53', (char)'\xc1', 
-(char)'\x19', (char)'\x13', (char)'\xa5', (char)'\x5b', (char)'\x81', 
-(char)'\x34', (char)'\x3c', (char)'\x11', (char)'\x91', (char)'\x3a', 
-(char)'\x86', (char)'\xcc', (char)'\x84', (char)'\xa8', (char)'\x16', 
-(char)'\x8f', (char)'\x52', (char)'\x28', (char)'\x27', (char)'\xa3', 
-(char)'\x17', (char)'\x45', (char)'\x3d', (char)'\x9e', (char)'\x1e', 
-(char)'\x4e', (char)'\x92', (char)'\x31', (char)'\x74', (char)'\x57', 
-(char)'\xd9', (char)'\x61', (char)'\xb3', (char)'\x05', (char)'\xfa', 
-(char)'\x48', (char)'\xc5', (char)'\xd1', (char)'\x77', (char)'\x62', 
-(char)'\x42', (char)'\x92', (char)'\x24', (char)'\x68', (char)'\x89', 
-(char)'\xd2', (char)'\x46', (char)'\x2e', (char)'\x8a', (char)'\xbb', 
-(char)'\x10', (char)'\x34', (char)'\xc4', (char)'\xe9', (char)'\x23', 
-(char)'\x17', (char)'\x45', (char)'\x3d', (char)'\x25', (char)'\x40', 
-(char)'\xbe', (char)'\x92', (char)'\x31', (char)'\x74', (char)'\x4a', 
-(char)'\x18', (char)'\x90', (char)'\x0a', (char)'\x20', (char)'\x81', 
-(char)'\x22', (char)'\x14', (char)'\x40', (char)'\x98', (char)'\x8e', 
-(char)'\x81', (char)'\x39', (char)'\xb3', (char)'\x43', (char)'\x68', 
-(char)'\x44', (char)'\x0c', (char)'\x81', (char)'\xa1', (char)'\x8c', 
-(char)'\x48', (char)'\x9c', (char)'\x64', (char)'\x28', (char)'\x28', 
-(char)'\xb9', (char)'\x98', (char)'\x64', (char)'\x59', (char)'\x26', 
-(char)'\x41', (char)'\x0d', (char)'\xc4', (char)'\x22', (char)'\xe4', 
-(char)'\x43', (char)'\x95', (char)'\x0d', (char)'\x02', (char)'\xd7', 
-(char)'\x81', (char)'\x95', (char)'\xd1', (char)'\x41', (char)'\x68', 
-(char)'\xd1', (char)'\x4d', (char)'\x0e', (char)'\x68', (char)'\x90', 
-(char)'\x51', (char)'\x21', (char)'\xaa', (char)'\x43', (char)'\x65', 
-(char)'\x30', (char)'\x34', (char)'\x44', (char)'\x71', (char)'\x46', 
-(char)'\xd2', (char)'\x58', (char)'\xd1', (char)'\x24', (char)'\xe9', 
-(char)'\x16', (char)'\x9a', (char)'\x56', (char)'\x44', (char)'\xc4', 
-(char)'\x72', (char)'\x4c', (char)'\xe8', (char)'\x91', (char)'\x66', 
-(char)'\x78', (char)'\xba', (char)'\xc3', (char)'\x9c', (char)'\x70', 
-(char)'\x69', (char)'\xe1', (char)'\xe4', (char)'\x71', (char)'\x47', 
-(char)'\x50', (char)'\x44', (char)'\x95', (char)'\x72', (char)'\x06', 
-(char)'\x5b', (char)'\x1d', (char)'\x0b', (char)'\x21', (char)'\x2c', 
-(char)'\x89', (char)'\x9c', (char)'\xa2', (char)'\x58', (char)'\x25', 
-(char)'\x22', (char)'\x89', (char)'\xcd', (char)'\x94', (char)'\xc8', 
-(char)'\x46', (char)'\xd1', (char)'\x86', (char)'\x25', (char)'\xde', 
-(char)'\xe8', (char)'\xcc', (char)'\xe4', (char)'\xbc', (char)'\xc8', 
-(char)'\xd1', (char)'\xc8', (char)'\xc8', (char)'\x63', (char)'\xdd', 
-(char)'\x19', (char)'\x96', (char)'\x54', (char)'\x79', (char)'\x22', 
-(char)'\x46', (char)'\xd1', (char)'\x6b', (char)'\x24', (char)'\xe3', 
-(char)'\x42', (char)'\x14', (char)'\xa0', (char)'\x5c', (char)'\x88', 
-(char)'\x33', (char)'\x12', (char)'\x63', (char)'\x91', (char)'\x26', 
-(char)'\xa4', (char)'\x31', (char)'\xeb', (char)'\x23', (char)'\x08', 
-(char)'\xd9', (char)'\xc9', (char)'\x28', (char)'\x6c', (char)'\xc9', 
-(char)'\x12', (char)'\x80', (char)'\x44', (char)'\x1a', (char)'\xc9', 
-(char)'\x33', (char)'\xbc', (char)'\x02', (char)'\x50', (char)'\x0c', 
-(char)'\x43', (char)'\xbe', (char)'\x28', (char)'\xa8', (char)'\x26', 
-(char)'\x44', (char)'\xbe', (char)'\x2e', (char)'\x99', (char)'\x05', 
-(char)'\x32', (char)'\x0c', (char)'\xcf', (char)'\xa0', (char)'\x56', 
-(char)'\x81', (char)'\x1a', (char)'\x53', (char)'\x04', (char)'\xd0', 
-(char)'\x22', (char)'\xe1', (char)'\x04', (char)'\x58', (char)'\xc0', 
-};
+#ifdef DUK_USE_COMPUTED_NAN
+double duk_computed_nan;
+#endif
 
-/* to convert a heap stridx to a token number, subtract
- * DUK_STRIDX_START_RESERVED and add DUK_TOK_START_RESERVED.
- */
+#ifdef DUK_USE_COMPUTED_INFINITY
+double duk_computed_infinity;
+#endif
+
+#ifdef DUK_USE_REPL_FPCLASSIFY
+int duk_repl_fpclassify(double x) {
+	volatile duk_double_union u;
+	int exp;
+	int mzero;
+
+	u.d = x;
+	exp = (u.us[DUK_DBL_IDX_US0] & 0x7ff0);
+	if (exp > 0x0000 && exp < 0x7ff0) {
+		/* exp values [0x001,0x7fe] = normal */
+		return DUK_FP_NORMAL;
+	}
+
+	mzero = (u.ui[DUK_DBL_IDX_UI1] == 0 && (u.ui[DUK_DBL_IDX_UI0] & 0x000fffff) == 0);
+	if (exp == 0x0000) {
+		/* exp 0x000 is zero/subnormal */
+		if (mzero) {
+			return DUK_FP_ZERO;
+		} else {
+			return DUK_FP_SUBNORMAL;
+		}
+	} else {
+		/* exp 0xfff is infinite/nan */
+		if (mzero) {
+			return DUK_FP_INFINITE;
+		} else {
+			return DUK_FP_NAN;
+		}
+	}
+}
+#endif
+
+#ifdef DUK_USE_REPL_SIGNBIT
+int duk_repl_signbit(double x) {
+	volatile duk_double_union u;
+	u.d = x;
+	return u.uc[DUK_DBL_IDX_UC0] & 0x80;
+}
+#endif
+
+#ifdef DUK_USE_REPL_ISFINITE
+int duk_repl_isfinite(double x) {
+	int c = DUK_FPCLASSIFY(x);
+	if (c == DUK_FP_NAN || c == DUK_FP_INFINITE) {
+		return 0;
+	} else {
+		return 1;
+	}
+}
+#endif
+
+#ifdef DUK_USE_REPL_ISNAN
+int duk_repl_isnan(double x) {
+	int c = DUK_FPCLASSIFY(x);
+	return (c == DUK_FP_NAN);
+}
+#endif
+
 #line 1 "duk_unicode_support.c"
 /*
  *  Various Unicode help functions for character classification predicates,
@@ -54369,7 +60398,7 @@ static int case_transform_helper(duk_hthread *thr,
 	}
 
 	/* 1:1 or special conversions, but not locale/context specific: script generated rules */
-	memset(&bd_ctx, 0, sizeof(bd_ctx));
+	DUK_MEMSET(&bd_ctx, 0, sizeof(bd_ctx));
 	if (uppercase) {
 		bd_ctx.data = (duk_u8 *) duk_unicode_caseconv_uc;
 		bd_ctx.length = (duk_u32) sizeof(duk_unicode_caseconv_uc);
@@ -55651,10 +61680,13 @@ duk_u32 duk_util_get_hash_prime(duk_u32 size) {
 			break;
 		}
 
-		/* FIXME: portability: perhaps use double instead? */
-
-		/* prediction */
-		curr = (duk_u32) ((((unsigned long long) curr) * ((unsigned long long) HASH_SIZE_RATIO)) >> 10);
+		/* prediction: portable variant using doubles if 64-bit values not available */
+#ifdef DUK_USE_64BIT_OPS
+		curr = (duk_u32) ((((uint64_t) curr) * ((uint64_t) HASH_SIZE_RATIO)) >> 10);
+#else
+		/* 32-bit x 11-bit = 43-bit, fits accurately into a double */
+		curr = (duk_u32) floor(((double) curr) * ((double) HASH_SIZE_RATIO) / 1024.0);
+#endif
 
 		/* correction */
 		curr += t;
@@ -55675,9 +61707,11 @@ duk_u32 duk_util_get_hash_prime(duk_u32 size) {
 
 /* include removed: duk_internal.h */
 
-/* Lowercase digits for radix values 2 to 36.  Also doubles as lowercase
- * hex nybble table.
+/*
+ *  Lowercase digits for radix values 2 to 36.  Also doubles as lowercase
+ *  hex nybble table.
  */
+
 char duk_lc_digits[36] = { '0', '1', '2', '3', '4', '5', '6', '7',
                            '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
                            'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n',
@@ -55686,7 +61720,6 @@ char duk_lc_digits[36] = { '0', '1', '2', '3', '4', '5', '6', '7',
 
 char duk_uc_nybbles[16] = { '0', '1', '2', '3', '4', '5', '6', '7',
                             '8', '9', 'A', 'B', 'C', 'D', 'E', 'F' };
-
 #line 1 "duk_util_tinyrandom.c"
 /*
  *  A tiny random number generator.
