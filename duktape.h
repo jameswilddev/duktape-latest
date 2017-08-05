@@ -1,11 +1,11 @@
 /*
- *  Duktape public API for Duktape 1.3.2.
+ *  Duktape public API for Duktape 1.3.3.
  *  See the API reference for documentation on call semantics.
  *  The exposed API is inside the DUK_API_PUBLIC_H_INCLUDED
  *  include guard.  Other parts of the header are Duktape
  *  internal and related to platform/compiler/feature detection.
  *
- *  Git commit de7a41a2c0ffbb49d18f936e5ea5fd55a30a4366 (v1.3.2).
+ *  Git commit 56c991754e2f7043913a198418f3f3b5286c6e3f (v1.3.3).
  *
  *  See Duktape AUTHORS.rst and LICENSE.txt for copyright and
  *  licensing information.
@@ -19,7 +19,7 @@
  *  
  *  (http://opensource.org/licenses/MIT)
  *  
- *  Copyright (c) 2013-2015 by Duktape authors (see AUTHORS.rst)
+ *  Copyright (c) 2013-2016 by Duktape authors (see AUTHORS.rst)
  *  
  *  Permission is hereby granted, free of charge, to any person obtaining a copy
  *  of this software and associated documentation files (the "Software"), to deal
@@ -210,13 +210,13 @@ struct duk_number_list_entry {
  * have 99 for patch level (e.g. 0.10.99 would be a development version
  * after 0.10.0 but before the next official release).
  */
-#define DUK_VERSION                       10302L
+#define DUK_VERSION                       10303L
 
 /* Git describe for Duktape build.  Useful for non-official snapshot builds
  * so that application code can easily log which Duktape snapshot was used.
  * Not available in the Ecmascript environment.
  */
-#define DUK_GIT_DESCRIBE                  "v1.3.2"
+#define DUK_GIT_DESCRIBE                  "v1.3.3"
 
 /* Duktape debug protocol version used by this build. */
 #define DUK_DEBUG_PROTOCOL_VERSION        1
