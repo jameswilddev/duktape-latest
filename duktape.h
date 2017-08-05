@@ -1,13 +1,13 @@
 /*
- *  Duktape public API for Duktape 1.6.1.
+ *  Duktape public API for Duktape 1.7.0.
  *
  *  See the API reference for documentation on call semantics.
  *  The exposed API is inside the DUK_API_PUBLIC_H_INCLUDED
  *  include guard.  Other parts of the header are Duktape
  *  internal and related to platform/compiler/feature detection.
  *
- *  Git commit 34ac011501ccaa8b74684a6c45ed4eaca9e83517 (v1.6.1).
- *  Git branch v1.6-maintenance.
+ *  Git commit 2a454a23ab829e445b848957beb597720534999a (v1.7.0).
+ *  Git branch v1-maintenance.
  *
  *  See Duktape AUTHORS.rst and LICENSE.txt for copyright and
  *  licensing information.
@@ -228,16 +228,16 @@ struct duk_number_list_entry {
  * have 99 for patch level (e.g. 0.10.99 would be a development version
  * after 0.10.0 but before the next official release).
  */
-#define DUK_VERSION                       10601L
+#define DUK_VERSION                       10700L
 
 /* Git commit, describe, and branch for Duktape build.  Useful for
  * non-official snapshot builds so that application code can easily log
  * which Duktape snapshot was used.  Not available in the Ecmascript
  * environment.
  */
-#define DUK_GIT_COMMIT                    "34ac011501ccaa8b74684a6c45ed4eaca9e83517"
-#define DUK_GIT_DESCRIBE                  "v1.6.1"
-#define DUK_GIT_BRANCH                    "v1.6-maintenance"
+#define DUK_GIT_COMMIT                    "2a454a23ab829e445b848957beb597720534999a"
+#define DUK_GIT_DESCRIBE                  "v1.7.0"
+#define DUK_GIT_BRANCH                    "v1-maintenance"
 
 /* Duktape debug protocol version used by this build. */
 #define DUK_DEBUG_PROTOCOL_VERSION        1
@@ -638,6 +638,7 @@ DUK_EXTERNAL_DECL duk_bool_t duk_is_nan(duk_context *ctx, duk_idx_t index);
 DUK_EXTERNAL_DECL duk_bool_t duk_is_string(duk_context *ctx, duk_idx_t index);
 DUK_EXTERNAL_DECL duk_bool_t duk_is_object(duk_context *ctx, duk_idx_t index);
 DUK_EXTERNAL_DECL duk_bool_t duk_is_buffer(duk_context *ctx, duk_idx_t index);
+DUK_EXTERNAL_DECL duk_bool_t duk_is_buffer_data(duk_context *ctx, duk_idx_t idx);
 DUK_EXTERNAL_DECL duk_bool_t duk_is_pointer(duk_context *ctx, duk_idx_t index);
 DUK_EXTERNAL_DECL duk_bool_t duk_is_lightfunc(duk_context *ctx, duk_idx_t index);
 
